@@ -1,4 +1,4 @@
-; Declare VGA consts
+; Declare VGA color consts
 VGA_COLOR_BLACK  equ 0
 VGA_COLOR_BLUE  equ 1
 VGA_COLOR_GREEN  equ 2
@@ -16,4 +16,6 @@ VGA_COLOR_LIGHT_MAGENTA  equ 13
 VGA_COLOR_LIGHT_BROWN  equ 14
 VGA_COLOR_WHITE equ 15
 
-
+VGA_XSIZE equ 80
+VGA_YSIZE equ 25
+VGA_BUFFER_LOC equ 0xB8000
