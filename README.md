@@ -1,3 +1,4 @@
 # govinDOS
 
-Currently based on the osdev barebones tutorial. 
+# Multiboot2 Doesnt Work (for now) 
+
