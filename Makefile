@@ -1,6 +1,8 @@
-NAME=myos
+NAME=govinDOS
 ROOT=$(shell pwd)
+
 BUILD_DIR=$(ROOT)/build
+SRC_DIR=$(ROOT)/src
 
 .PHONY: all clean src iso run
 
@@ -11,7 +13,7 @@ clean:
 
 src: clean
 	mkdir -p $(BUILD_DIR)/boot
-	$(MAKE) -C src BUILD_DIR=$(BUILD_DIR) ROOT=$(ROOT)
+	$(MAKE) -C src SRC_DIR=$(SRC_DIR) BUILD_DIR=$(BUILD_DIR) ROOT=$(ROOT)
 
 
 iso: src
