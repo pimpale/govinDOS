@@ -1,79 +1,21 @@
-%include 'ccall.mac'
-%include 'vga_text.mac'
+; Declare VGA color consts
+VGA_COLOR_BLACK  equ 0
+VGA_COLOR_BLUE  equ 1
+VGA_COLOR_GREEN  equ 2
+VGA_COLOR_CYAN  equ 3
+VGA_COLOR_RED  equ 4
+VGA_COLOR_MAGENTA  equ 5
+VGA_COLOR_BROWN  equ 6
+VGA_COLOR_LIGHT_GREY  equ 7
+VGA_COLOR_DARK_GREY  equ 8
+VGA_COLOR_LIGHT_BLUE  equ 9
+VGA_COLOR_LIGHT_GREEN  equ 10
+VGA_COLOR_LIGHT_CYAN  equ 11
+VGA_COLOR_LIGHT_RED  equ 12
+VGA_COLOR_LIGHT_MAGENTA  equ 13
+VGA_COLOR_LIGHT_BROWN  equ 14
+VGA_COLOR_WHITE equ 15
 
-; get vga color from foreground (arg0) and background (arg1)
-_vga_color: proc
-  mov eax, [arg(0)] ; fg
-  mov ecx, [arg(1)] ; bg
-  shl ecx, 4 
-  or  eax, ecx ; fg | bg << 4
-endproc
-
-; create vga entry from character (arg0) and vga_color (arg1)
-_vga_entry: proc
-  mov eax, [arg(0)] ; character
-  mov ecx, [arg(1)] ; vga_color
-  shl ecx, 8 ; color << 8
-  or eax, ecx ; character | color
-endproc
-
-; calculate offset using x (arg0) and y (arg1)
-global _vga_text_offset
-_vga_text_offset: proc
-  mov eax, [arg(1)] ; y
-  mov edx, VGA_XSIZE ; multiply by xsize
-  mul edx
-  add eax, [arg(0)] ; add x
-endproc 
-
-; write using vga_entry (arg0) to buffer at offset (arg1)
-global _vga_put_entry
-_vga_put_entry: proc
-  mov eax, [arg(0)]
-  add eax, eax ; double it to translate it into byte offset
-  add eax, VGA_BUFFER_LOC ; add the location
-  mov ecx, [arg(1)] ; load from args
-  mov [eax], ecx ; set mem
-endproc
-
-; Initializes vga text terminal
-global _vga_text_init
-_vga_text_init: proc
-
-  ; save ebx
-  push ebx
-
-  ; Get the text color
-  ccall _vga_color, VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK
-  ; Get the vga entry
-  ccall _vga_entry, ' ', eax
-  ; store in ebx
-  mov ebx, eax
-  
-  ; loop through all values
-  mov ecx, VGA_XSIZE ; x
-  _vga_text_init_loop_x:
-    dec ecx ; x--
-    mov edx, VGA_YSIZE ; y
-    _vga_text_init_loop_y:
-      dec edx ; y--
-      ; TODO bug where i need some more registers (stack begone)
-      ccall _vga_text_offset, ecx, edx ; get offset
-      ccall _vga_put_entry, ebx, eax
-      cmp edx, 0
-      jne _vga_text_init_loop_y
-    cmp ecx, 0
-    jne _vga_text_init_loop_x 
-
-  pop ebx ; restore ebx
-endproc
-
-      
-
-      
-      
-      
-
-    
-
- 
+VGA_XSIZE equ 80
+VGA_YSIZE equ 25
+VGA_BUFFER_LOC equ 0xB8000
