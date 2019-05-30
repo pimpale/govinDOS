@@ -5,7 +5,9 @@ NASMFLAGS=-felf32
 .PHONY: all
 
 all:
-	$(NASM) $(NASMFLAGS) boot.asm -o $(BUILD_DIR)/boot.o
+	$(NASM) $(NASMFLAGS) multiboot.asm -o $(BUILD_DIR)/multiboot.o
+	$(NASM) $(NASMFLAGS) start.asm -o $(BUILD_DIR)/start.o
 	$(CC) -T linker.ld -o $(BUILD_DIR)/boot/kernel.bin \
 	-ffreestanding -shared -O2 -nostdlib \
-	$(BUILD_DIR)/boot.o
+	$(BUILD_DIR)/multiboot.o \
+	$(BUILD_DIR)/start.o
