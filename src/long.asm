@@ -29,7 +29,7 @@ check_cpuid_support_32: proc
   ; Compare EAX and ECX. If they are equal then that means the bit wasn't
   ; flipped, and CPUID isn't supported.
   cmp eax, ecx
-  je check_cpuid_support_no:
+  je check_cpuid_support_no
 
   check_cpuid_support_yes:
   mov eax, 1
@@ -62,7 +62,3 @@ endproc
 
 
 
-
-
-
-  
