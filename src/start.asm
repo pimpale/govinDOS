@@ -1,3 +1,4 @@
+bits 32
 ; The multiboot standard does not define the value of the stack pointer register
 ; (esp) and it is up to the kernel to provide a stack. This allocates room for a
 ; small stack by creating a symbol at the bottom of it, then allocating 16384

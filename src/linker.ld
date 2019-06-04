@@ -1,26 +1,28 @@
 ENTRY(start)
-phys = 0x00100000;
+phys_addr = 0x00100000;
 SECTIONS
 {
-  .text phys : AT(phys) {
-    mboot = .;
+  .text phys_addr : AT(phys_addr) 
+  {
+    header_addr = .;
     *(.multiboot)
-    code = .;
+    load_addr = .;
     *(.text)
+    load_end_addr = .;
     *(.rodata)
     . = ALIGN(4096);
   }
-  .data : AT(phys + (data - code))
+  .data : AT(phys_addr + (data_addr - load_end_addr))
   {
-    data = .;
+    data_addr = .;
     *(.data)
     . = ALIGN(4096);
   }
-  .bss : AT(phys + (bss - code))
+  .bss : AT(phys_addr + (bss_addr - load_addr))
   {
-    bss = .;
+    bss_addr = .;
     *(.bss)
     . = ALIGN(4096);
   }
-  bssend = .;
+  bss_end_addr = .;
 }
