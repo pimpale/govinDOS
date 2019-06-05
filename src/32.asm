@@ -19,11 +19,38 @@ extern VGA_COLOR_WHITE
 extern VGA_COLOR_RED
 extern VGA_XSIZE
 extern VGA_YSIZE
+extern VGA_BUFFER_LEN
 extern VGA_BUFFER_ADDR
+extern VGA_BUFFER_END_ADDR
 
 
 bits 32
 section .text 
+
+; This function prints an error (arg0) to the screen and then halts forever
+global halt_with_error32
+halt_with_error32: proc32
+  ; Clear Screen
+  call vga_clear_screen32
+  ; Call print with first arg
+  mov eax, arg(0)
+  push eax
+  call vga_print32
+  add esp, DWORD_SIZE ; pop stack
+  ; Now halt
+  call halt32
+endproc32
+
+  
+
+
+; This function hangs the cpu forever
+global halt32
+halt32: proc32
+  .hang:	hlt
+	  jmp .hang
+endproc32
+
 
 ; This method will check if the cpu supports CPUID (1 if yes, 0 if no)
 ; No Args
@@ -52,13 +79,10 @@ check_cpuid_support32: proc32
   ; Compare EAX and ECX. If they are equal then that means the bit wasn't
   ; flipped, and CPUID isn't supported.
   cmp eax, ecx
-  je .check_cpuid_support_no
-
-  .check_cpuid_support_yes: ; returns 1
-    mov eax, 1
-
-  .check_cpuid_support_no:  ; returns 0
-    mov eax, 0
+  mov eax, 0
+  je .check_cpuid_support_end ; If they are equal tho, we can jump right to the end
+  mov eax, 1 ; If it doesnt jump, we set it to 1
+ .check_cpuid_support_end:
 endproc32
 
 ; This will check if the cpu supports long mode (1 if yes, 0 if no) Make sure to check for cpuid 
@@ -119,20 +143,7 @@ vga_clear_screen32: proc32
   call vga_entry32
   add esp, DWORD_SIZE*2 ; Pop stack 
 
-  mov ecx, eax ; Store value safely
-
-  ; Finally multiply eax and edx to get size
-  mov eax, VGA_XSIZE 
-  mov edx, VGA_YSIZE
-  mul edx 
-
-  ; Prep for fill
-
-  ; eax is the size of screen
-  ; ecx is value to fill is the vga_entry
-  xchg eax, ecx ; we need to swap to be correct
-
-  dec ecx 
+  mov ecx, VGA_BUFFER_LEN ; ecx is counter
 
   push edi ; Preserve this register
 
@@ -146,8 +157,8 @@ vga_clear_screen32: proc32
 endproc32
 
 ; Print vga chars to beginning, overwriting what is there, using pointer to null terminated string (arg0)
-global vga_print_error32
-vga_print_error32: proc32
+global vga_print32
+vga_print32: proc32
 
   push ebx ; We will be using ebx, save that
 
@@ -161,13 +172,13 @@ vga_print_error32: proc32
   mov ebx, arg(0) ; ebx is current pointer to string
   mov ecx, 0 ; ecx is the counter
 
-  .vga_print_error32_loop: 
+  .vga_print32_loop: 
 
     mov dl, [ebx + ecx] ; load byte of string counter away
 
     ; If null byte, exit
     cmp dl, 0
-    je .vga_print_error32_end
+    je .vga_print32_end
 
     ; Save sratch regs
     push eax ; save color
@@ -182,15 +193,15 @@ vga_print_error32: proc32
 
     pop ecx ; Restore  counter
 
-    mov [VGA_BUFFER_ADDR+ecx*2], word ax ; Move vga entry to correct buffer addr
+    mov [VGA_BUFFER_ADDR+ecx*2], dword ax ; Move vga entry to correct buffer addr
 
     pop ebx ; Restore string pointer
     pop eax ; restore color
 
     inc ecx ; increment counter
-    jmp .vga_print_error32_loop
+    jmp .vga_print32_loop
 
 
-  .vga_print_error32_end:
+  .vga_print32_end:
     pop ebx ; restore ebx
 endproc32

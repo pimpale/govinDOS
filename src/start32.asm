@@ -1,6 +1,14 @@
 bits 32
 
 
+extern halt_with_error32
+extern vga_clear_screen32
+extern vga_print32
+extern check_cpuid_support32
+extern check_long_mode_support32
+
+
+
 ; Stack must be 16 byte aligned
 section .bss
 align 16
@@ -12,35 +20,42 @@ stack_top:
 section .text
 global start
 start:
+  ; We haven't set up an IDT yet, so we'll disable interrupts for now
+	cli
 
 	; To set up a stack, we set the esp register to point to the top of our
 	; stack (as it grows downwards on x86 systems).
 	mov esp, stack_top
- 
-  
-  ; mov [0xB8030], dword 50000
 
-	extern vga_clear_screen32
+  ; First clear screen
 	call vga_clear_screen32
 
-  extern vga_print_error32
-  push hello
-  call vga_print_error32
+  
+  call check_cpuid_support32
+  cmp eax, 0 
+  jne .has_cpuid ; If its not zero
+  ; However, if no cpuid, return error messge and halt
+  push no_cpuid_error_message
+  call halt_with_error32
+
+  ; If it does have cpuid we gotta check for long mode
+ .has_cpuid:
+  call check_long_mode_support32
+  cmp eax, 0
+  jne .has_long_mode
+  ; However, if no long mode, return error messge and halt
+  push no_long_mode_error_message
+  call halt_with_error32
+
+  .has_long_mode
+  ; Success
+  push success_error_message
+  call halt_with_error32
+
  
-	; If the system has nothing more to do, put the computer into an
-	; infinite loop. To do that:
-	; 1) Disable interrupts with cli (clear interrupt enable in eflags).
-	;    They are already disabled by the bootloader, so this is not needed.
-	;    Mind that you might later enable interrupts and return from
-	;    kernel_main (which is sort of nonsensical to do).
-	; 2) Wait for the next interrupt to arrive with hlt (halt instruction).
-	;    Since they are disabled, this will lock up the computer.
-	; 3) Jump to the hlt instruction if it ever wakes up due to a
-	;    non-maskable interrupt occurring or due to system management mode.
-	cli
-.hang:	hlt
-	jmp .hang
-.end:
+
 
 section .rodata
-hello: db 'abcdefghijklmnopqurstuvwxyz',0
+no_cpuid_error_message: db 'Error: No CPUID support. Halting.',0
+no_long_mode_error_message: db 'Error: No support for long mode (64 bit). Halting.',0
+success_error_message: db 'Error: Success. Halting.',0
