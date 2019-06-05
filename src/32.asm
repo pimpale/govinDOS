@@ -166,7 +166,7 @@ vga_print_error32: proc32
     mov dl, [ebx + ecx] ; load byte of string counter away
 
     ; If null byte, exit
-    cmp edx, 0
+    cmp dl, 0
     je .vga_print_error32_end
 
     ; Save sratch regs
@@ -182,14 +182,15 @@ vga_print_error32: proc32
 
     pop ecx ; Restore  counter
 
-    mov [VGA_BUFFER_ADDR+ecx], ax ; Move vga entry to buffer
+    mov [VGA_BUFFER_ADDR+ecx*2], word ax ; Move vga entry to correct buffer addr
+
     pop ebx ; Restore string pointer
     pop eax ; restore color
-    ; increment counter
-    inc ecx
+
+    inc ecx ; increment counter
     jmp .vga_print_error32_loop
 
 
   .vga_print_error32_end:
-    pop ebx
+    pop ebx ; restore ebx
 endproc32
