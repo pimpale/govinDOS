@@ -18,6 +18,7 @@ start:
 	mov esp, stack_top
  
   
+  ; mov [0xB8030], dword 50000
 
 	extern vga_clear_screen32
 	call vga_clear_screen32

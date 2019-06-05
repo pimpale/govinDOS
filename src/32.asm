@@ -94,7 +94,6 @@ endproc32
 
 ; create vga entry from character (arg0) and vga_color (arg1)
 vga_entry32: proc32
-  mov [0xB8030], dword 50000
   mov eax, arg(0) ; character
   mov ecx, arg(1) ; vga_color
   shl ecx, 8 ; color << 8
@@ -105,7 +104,6 @@ endproc32
 global vga_clear_screen32
 vga_clear_screen32: proc32
 
-  mov [0xB8330], dword 59000
   ; First get vga color for space white foreground black background
   push VGA_COLOR_BLACK
   push VGA_COLOR_WHITE
@@ -140,12 +138,21 @@ vga_clear_screen32: proc32
 
   ; Fill in buffer with value
   rep stosw
-  pop edi
+  pop edi ; Restore 
 endproc32
 
-
+; Print vga chars to beginning, overwriting what is there, using pointer to null terminated string (arg0)
 global vga_print_error32
 vga_print_error32: proc32
+  ; First get vga color for space white foreground black background
+  push VGA_COLOR_BLACK
+  push VGA_COLOR_WHITE
+  call vga_color32
+  add esp, DWORD_SIZE*2 ; Pop args
+  
+
+
+
 
 endproc32
 
