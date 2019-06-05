@@ -6,10 +6,13 @@ NASMFLAGS=-felf32
 
 all:
 	$(NASM) $(NASMFLAGS) multiboot.asm -o $(BUILD_DIR)/multiboot.o
-	$(NASM) $(NASMFLAGS) start.asm -o $(BUILD_DIR)/start.o
-	$(NASM) $(NASMFLAGS) long.asm -o $(BUILD_DIR)/long.o
+	$(NASM) $(NASMFLAGS) vga.asm -o $(BUILD_DIR)/vga.o
+	$(NASM) $(NASMFLAGS) start32.asm -o $(BUILD_DIR)/start32.o
+	$(NASM) $(NASMFLAGS) 32.asm -o $(BUILD_DIR)/32.o
 	$(CC) -T linker.ld -o $(BUILD_DIR)/boot/kernel.bin \
 	-ffreestanding -shared -O2 -nostdlib \
 	$(BUILD_DIR)/multiboot.o \
-	$(BUILD_DIR)/long.o \
-	$(BUILD_DIR)/start.o
+	$(BUILD_DIR)/vga.o \
+	$(BUILD_DIR)/start32.o \
+	$(BUILD_DIR)/32.o \
+
