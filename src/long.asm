@@ -1,5 +1,6 @@
 %include "ccall.mac"
 
+
 bits 32
 section .text 
 
@@ -29,13 +30,13 @@ check_cpuid_support_32: proc
   ; Compare EAX and ECX. If they are equal then that means the bit wasn't
   ; flipped, and CPUID isn't supported.
   cmp eax, ecx
-  je check_cpuid_support_no
+  je .check_cpuid_support_no
 
-  check_cpuid_support_yes:
-  mov eax, 1
+  .check_cpuid_support_yes: ; returns 1
+    mov eax, 1
 
-  check_cpuid_support_no:
-  mov eax, 0
+  .check_cpuid_support_no:  ; returns 0
+    mov eax, 0
 endproc
 
 ; This will check if the cpu supports long mode (1 if yes, 0 if no) Make sure to check for cpuid 
