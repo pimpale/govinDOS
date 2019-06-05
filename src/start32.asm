@@ -22,6 +22,10 @@ start:
 
 	extern vga_clear_screen32
 	call vga_clear_screen32
+
+  ;extern vga_print_error32
+  ;push hello
+  ;call vga_print_error32
  
 	; If the system has nothing more to do, put the computer into an
 	; infinite loop. To do that:
@@ -37,3 +41,6 @@ start:
 .hang:	hlt
 	jmp .hang
 .end:
+
+section .rodata
+hello: db 'aaaaa',0

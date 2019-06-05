@@ -16,6 +16,7 @@ DWORD_SIZE equ 4
 
 extern VGA_COLOR_BLACK
 extern VGA_COLOR_WHITE
+extern VGA_COLOR_RED
 extern VGA_XSIZE
 extern VGA_YSIZE
 extern VGA_BUFFER_ADDR
@@ -105,30 +106,33 @@ global vga_clear_screen32
 vga_clear_screen32: proc32
 
   ; First get vga color for space white foreground black background
-  push VGA_COLOR_BLACK
-  push VGA_COLOR_WHITE
+  push VGA_COLOR_BLACK ; Background
+  push VGA_COLOR_WHITE ; Foreground
   call vga_color32
   add esp, DWORD_SIZE*2 ; Pop stack
   
   ; push args for next proc
   push eax
-  push dword ' '
+  push ' ' ; Char to clear screen with
 
   ; Then get vga entry
-  call near vga_entry32
+  call vga_entry32
   add esp, DWORD_SIZE*2 ; Pop stack 
 
-  mov edx, eax ; Store value safely
+  mov ecx, eax ; Store value safely
 
-  ; Finally multiply eax and ecx
+  ; Finally multiply eax and edx to get size
   mov eax, VGA_XSIZE 
-  mov ecx, VGA_YSIZE
-  mul ecx 
+  mov edx, VGA_YSIZE
+  mul edx 
 
   ; Prep for fill
 
-  mov ecx, eax ; Reps is the size of screen
-  mov eax, edx ; Value to fill is the vga_entry
+  ; eax is the size of screen
+  ; ecx is value to fill is the vga_entry
+  xchg eax, ecx ; we need to swap to be correct
+
+  dec ecx 
 
   push edi ; Preserve this register
 
@@ -144,15 +148,48 @@ endproc32
 ; Print vga chars to beginning, overwriting what is there, using pointer to null terminated string (arg0)
 global vga_print_error32
 vga_print_error32: proc32
+
+  push ebx ; We will be using ebx, save that
+
   ; First get vga color for space white foreground black background
   push VGA_COLOR_BLACK
   push VGA_COLOR_WHITE
   call vga_color32
   add esp, DWORD_SIZE*2 ; Pop args
+  ; eax is the color
   
+  mov ebx, arg(0) ; ebx is current pointer to string
+  mov ecx, 0 ; ecx is the counter
+
+  .vga_print_error32_loop: 
+
+    mov dl, [ebx + ecx] ; load byte of string counter away
+
+    ; If null byte, exit
+    cmp edx, 0
+    je .vga_print_error32_end
+
+    ; Save sratch regs
+    push eax ; save color
+    push ebx ; save pointer
+    push ecx ; save counter
+
+    ; Get vga entry
+    push eax ; push color
+    push edx ; push char
+    call vga_entry32 
+    add esp, DWORD_SIZE*2 ; Pop stack 
+
+    pop ecx ; Restore  counter
+
+    mov [VGA_BUFFER_ADDR+ecx], ax ; Move vga entry to buffer
+    pop ebx ; Restore string pointer
+    pop eax ; restore color
+    ; increment counter
+    inc ecx
+    jmp .vga_print_error32_loop
 
 
-
-
+  .vga_print_error32_end:
+    pop ebx
 endproc32
-
