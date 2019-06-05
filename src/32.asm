@@ -30,8 +30,6 @@ section .text
 ; This function prints an error (arg0) to the screen and then halts forever
 global halt_with_error32
 halt_with_error32: proc32
-  ; Clear Screen
-  call vga_clear_screen32
   ; Call print with first arg
   mov eax, arg(0)
   push eax
@@ -135,11 +133,10 @@ vga_clear_screen32: proc32
   call vga_color32
   add esp, DWORD_SIZE*2 ; Pop stack
   
+  ; Then get vga entry
   ; push args for next proc
   push eax
   push ' ' ; Char to clear screen with
-
-  ; Then get vga entry
   call vga_entry32
   add esp, DWORD_SIZE*2 ; Pop stack 
 
@@ -153,55 +150,26 @@ vga_clear_screen32: proc32
 
   ; Fill in buffer with value
   rep stosw
-  pop edi ; Restore 
+  pop edi ; Restore edi 
 endproc32
 
 ; Print vga chars to beginning, overwriting what is there, using pointer to null terminated string (arg0)
-global vga_print32
-vga_print32: proc32
+global vga_print32:
+ vga_print32: proc32
+  mov edx, arg(0) ; Move the arg0 here
+  mov ecx, 0 ; this register will serve as the counter
+  .vga_print32_loop:
+    mov al, [edx+ecx] ; Get a char from the string
 
-  push ebx ; We will be using ebx, save that
-
-  ; First get vga color for space white foreground black background
-  push VGA_COLOR_BLACK
-  push VGA_COLOR_WHITE
-  call vga_color32
-  add esp, DWORD_SIZE*2 ; Pop args
-  ; eax is the color
-  
-  mov ebx, arg(0) ; ebx is current pointer to string
-  mov ecx, 0 ; ecx is the counter
-
-  .vga_print32_loop: 
-
-    mov dl, [ebx + ecx] ; load byte of string counter away
-
-    ; If null byte, exit
-    cmp dl, 0
+    ; exit if null
+    cmp al, 0
     je .vga_print32_end
+    ; exit if we are going to exceed the limit 
+    cmp ecx, VGA_BUFFER_LEN
+    jge .vga_print32_end
 
-    ; Save sratch regs
-    push eax ; save color
-    push ebx ; save pointer
-    push ecx ; save counter
-
-    ; Get vga entry
-    push eax ; push color
-    push edx ; push char
-    call vga_entry32 
-    add esp, DWORD_SIZE*2 ; Pop stack 
-
-    pop ecx ; Restore  counter
-
-    mov [VGA_BUFFER_ADDR+ecx*2], dword ax ; Move vga entry to correct buffer addr
-
-    pop ebx ; Restore string pointer
-    pop eax ; restore color
-
-    inc ecx ; increment counter
+    mov [VGA_BUFFER_ADDR+ecx*2], byte al ; move cha to buffer
+    inc ecx
     jmp .vga_print32_loop
-
-
   .vga_print32_end:
-    pop ebx ; restore ebx
 endproc32
