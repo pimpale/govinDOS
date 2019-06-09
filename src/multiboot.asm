@@ -10,7 +10,7 @@ extern start
 MULTIBOOT_PAGE_ALIGN		equ 1<<0 ; All boot modules loaded along with the operating system must be aligned on page (4KB) boundaries.
 MULTIBOOT_MEMORY_INFO		equ 1<<1 ; Let the bootloader fill in the mem_ fields.
 MULTIBOOT_HEADER_MAGIC		equ 0x1BADB002
-MULTIBOOT_HEADER_FLAGS		equ MULTIBOOT_PAGE_ALIGN | MULTIBOOT_MEMORY_INFO | MULTIBOOT_AOUT_KLUDGE
+MULTIBOOT_HEADER_FLAGS		equ MULTIBOOT_PAGE_ALIGN | MULTIBOOT_MEMORY_INFO 
 MULTIBOOT_HEADER_CHECKSUM	equ -(MULTIBOOT_HEADER_MAGIC + MULTIBOOT_HEADER_FLAGS)
  
 ; Declare a multiboot header that marks the program as a kernel. These are magic

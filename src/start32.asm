@@ -48,14 +48,15 @@ start:
   call halt_with_error32
 
   .has_long_mode:
+
+  
+
   ; Success
   push success_error_message
   call halt_with_error32
 
  
-
-
-section .rodata
+section .data
 no_cpuid_error_message: db 'Error: No CPUID support. Halting.',0
 no_long_mode_error_message: db 'Error: No support for long mode (64 bit). Halting.',0
 success_error_message: db 'Error: Success. Halting.',0
