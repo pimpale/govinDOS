@@ -21,6 +21,8 @@ iso: src
 	cp grub.cfg $(BUILD_DIR)/boot/grub/grub.cfg
 	grub-mkrescue -o $(BUILD_DIR)/$(NAME).iso $(BUILD_DIR)
 
-run: iso
+run-kernel: src
 	qemu-system-x86_64 -monitor stdio -no-shutdown -no-reboot -d int -kernel $(BUILD_DIR)/boot/kernel.bin
-	#qemu-system-i386 -cdrom $(BUILD_DIR)/$(NAME).iso
+
+run-iso: iso
+	qemu-system-x86_64 -monitor stdio -no-shutdown -no-reboot -d int -cdrom $(BUILD_DIR)/$(NAME).iso

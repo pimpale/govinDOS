@@ -9,7 +9,6 @@ extern start
 ; Declare constants for the multiboot header.
 MULTIBOOT_PAGE_ALIGN		equ 1<<0 ; All boot modules loaded along with the operating system must be aligned on page (4KB) boundaries.
 MULTIBOOT_MEMORY_INFO		equ 1<<1 ; Let the bootloader fill in the mem_ fields.
-MULTIBOOT_AOUT_KLUDGE		equ 0<<16 ; Let it boot non elf too 
 MULTIBOOT_HEADER_MAGIC		equ 0x1BADB002
 MULTIBOOT_HEADER_FLAGS		equ MULTIBOOT_PAGE_ALIGN | MULTIBOOT_MEMORY_INFO | MULTIBOOT_AOUT_KLUDGE
 MULTIBOOT_HEADER_CHECKSUM	equ -(MULTIBOOT_HEADER_MAGIC + MULTIBOOT_HEADER_FLAGS)
@@ -26,11 +25,3 @@ align 4
 	dd MULTIBOOT_HEADER_FLAGS
 	dd MULTIBOOT_HEADER_CHECKSUM
 
-  ; AOUT kludge
-
- dd header_addr ; point to multiboot header
- dd load_addr ;state of kernel .text (code) section
- dd load_end_addr ; start of bss section
- dd bss_end_addr ; end of bss section
- dd start ; kernel entry point (initial EIP)
- 
