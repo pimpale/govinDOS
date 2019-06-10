@@ -10,14 +10,14 @@ extern check_long_mode_support32
 
 
 ; Stack must be 16 byte aligned
-section .bss
+section .boot.data
 align 16
 stack_bottom:
-resb 16384 ; 16 KiB
+times 0x10000 db 0; 16 KiB
 stack_top:
  
 ; Start location, linker will start execution here
-section .text
+section .boot.text
 global start
 start:
   ; We haven't set up an IDT yet, so we'll disable interrupts for now
@@ -56,8 +56,7 @@ start:
   call halt_with_error32
 
  
-section .data
+section .boot.data
 no_cpuid_error_message: db 'Error: No CPUID support. Halting.',0
 no_long_mode_error_message: db 'Error: No support for long mode (64 bit). Halting.',0
 success_error_message: db 'Error: Success. Halting.',0
-
