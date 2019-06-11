@@ -14,21 +14,22 @@ DWORD_SIZE equ 4
   ret
 %endmacro
 
-extern VGA_COLOR_BLACK
-extern VGA_COLOR_WHITE
-extern VGA_COLOR_RED
-extern VGA_XSIZE
-extern VGA_YSIZE
-extern VGA_BUFFER_LEN
-extern VGA_BUFFER_ADDR
-extern VGA_BUFFER_END_ADDR
+
+[EXTERN VGA_COLOR_BLACK]
+[EXTERN VGA_COLOR_WHITE]
+[EXTERN VGA_COLOR_RED]
+[EXTERN VGA_XSIZE]
+[EXTERN VGA_YSIZE]
+[EXTERN VGA_BUFFER_LEN]
+[EXTERN VGA_BUFFER_ADDR]
+[EXTERN VGA_BUFFER_END_ADDR]
 
 
-bits 32
-section .text 
+[BITS 32]
+[SECTION .text] 
 
 ; This function prints an error (arg0) to the screen and then halts forever
-global halt_with_error32
+[GLOBAL halt_with_error32]
 halt_with_error32: proc32
   ; Call print with first arg
   mov eax, arg(0)
@@ -43,7 +44,7 @@ endproc32
 
 
 ; This function hangs the cpu forever
-global halt32
+[GLOBAL halt32]
 halt32: proc32
   .hang:	hlt
 	  jmp .hang
@@ -52,7 +53,7 @@ endproc32
 
 ; This method will check if the cpu supports CPUID (1 if yes, 0 if no)
 ; No Args
-global check_cpuid_support32
+[GLOBAL check_cpuid_support32]
 check_cpuid_support32: proc32
   ; Check if CPUID is supported by attempting to flip the ID bit (bit 21) in
   ; the FLAGS register. If we can flip it, CPUID is available.
@@ -85,7 +86,7 @@ endproc32
 
 ; This will check if the cpu supports long mode (1 if yes, 0 if no) Make sure to check for cpuid 
 ; No Args
-global check_long_mode_support32
+[GLOBAL check_long_mode_support32]
 check_long_mode_support32: proc32
   mov eax, 0x80000000    ; Set the A-register to 0x80000000.
   cpuid                  ; CPU identification.
@@ -124,7 +125,7 @@ vga_entry32: proc32
 endproc32
 
 ; This clears the screen to black
-global vga_clear_screen32
+[GLOBAL vga_clear_screen32]
 vga_clear_screen32: proc32
 
   ; First get vga color for space white foreground black background
@@ -154,8 +155,8 @@ vga_clear_screen32: proc32
 endproc32
 
 ; Print vga chars to beginning, overwriting what is there, using pointer to null terminated string (arg0)
-global vga_print32:
- vga_print32: proc32
+[GLOBAL vga_print32:]
+vga_print32: proc32
   mov edx, arg(0) ; Move the arg0 here
   mov ecx, 0 ; this register will serve as the counter
   .vga_print32_loop:
