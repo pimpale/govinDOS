@@ -14,9 +14,9 @@ SECTIONS
   /* All 32 bit code uses cdecl and has no paging nor heap whatsoever. */
   .32text :
   {
+    BOOT_LOAD_ADDR = .;
     BOOT_HEADER_ADDR = .;
     *32.o (.header)
-    BOOT_LOAD_ADDR = .;
     *32.o (.text)
   }
 
