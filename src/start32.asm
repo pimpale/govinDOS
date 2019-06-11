@@ -8,7 +8,6 @@
 [EXTERN check_long_mode_support32]
 
 
-
 ; Stack must be 16 byte aligned
 [SECTION .bss]
 align 16
@@ -37,6 +36,7 @@ start32:
   ; However, if no cpuid, return error messge and halt
   push no_cpuid_error_message
   call halt_with_error32
+  ; no return, so no need to clean up stack
 
   ; If it does have cpuid we gotta check for long mode
  .has_cpuid:
@@ -56,7 +56,8 @@ start32:
   call halt_with_error32
 
  
-section .data
+[SECTION .data]
+
 no_cpuid_error_message: db 'Error: No CPUID support. Halting.',0
 no_long_mode_error_message: db 'Error: No support for long mode (64 bit). Halting.',0
 success_error_message: db 'Error: Success. Halting.',0

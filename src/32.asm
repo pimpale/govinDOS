@@ -40,8 +40,6 @@ halt_with_error32: proc32
   call halt32
 endproc32
 
-  
-
 
 ; This function hangs the cpu forever
 [GLOBAL halt32]

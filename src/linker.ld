@@ -15,7 +15,7 @@ SECTIONS
   .32text :
   {
     BOOT_HEADER_ADDR = .;
-    *32.o (.boot.header)
+    *32.o (.header)
     BOOT_LOAD_ADDR = .;
     *32.o (.text)
   }
