@@ -1,25 +1,25 @@
-bits 32
+[BITS 32]
 
 
-extern halt_with_error32
-extern vga_clear_screen32
-extern vga_print32
-extern check_cpuid_support32
-extern check_long_mode_support32
+[EXTERN halt_with_error32]
+[EXTERN vga_clear_screen32]
+[EXTERN vga_print32]
+[EXTERN check_cpuid_support32]
+[EXTERN check_long_mode_support32]
 
 
 
 ; Stack must be 16 byte aligned
-section .boot.data
+[SECTION .bss]
 align 16
 stack_bottom:
-times 0x10000 db 0; 16 KiB
+resb 0x10000 ; 16 KiB
 stack_top:
  
 ; Start location, linker will start execution here
-section .boot.text
-global start
-start:
+[SECTION .text]
+[GLOBAL start32]
+start32:
   ; We haven't set up an IDT yet, so we'll disable interrupts for now
 	cli
 
@@ -56,7 +56,7 @@ start:
   call halt_with_error32
 
  
-section .boot.data
+section .data
 no_cpuid_error_message: db 'Error: No CPUID support. Halting.',0
 no_long_mode_error_message: db 'Error: No support for long mode (64 bit). Halting.',0
 success_error_message: db 'Error: Success. Halting.',0

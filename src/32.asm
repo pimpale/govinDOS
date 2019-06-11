@@ -25,7 +25,7 @@ extern VGA_BUFFER_END_ADDR
 
 
 bits 32
-section .boot.text 
+section .text 
 
 ; This function prints an error (arg0) to the screen and then halts forever
 global halt_with_error32
