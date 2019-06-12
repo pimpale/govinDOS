@@ -1,7 +1,11 @@
 [BITS 32]
-DWORD_SIZE equ 4
 
-%define arg(x) [ebp + (x+2)*DWORD_SIZE]
+; macros
+
+%define DWORD_SIZE 4
+
+%define argaddr(x) ebp + (x+2)*DWORD_SIZE
+%define arg(x) [argaddr(x)]
 
 ; Preserves base pointer and sets it
 %macro proc32 0
@@ -15,7 +19,8 @@ DWORD_SIZE equ 4
   ret
 %endmacro
 
-
+; constants
+[EXTERN MULTIBOOT_HEADER_MAGIC]
 [EXTERN VGA_COLOR_BLACK]
 [EXTERN VGA_COLOR_WHITE]
 [EXTERN VGA_COLOR_RED]
@@ -25,12 +30,25 @@ DWORD_SIZE equ 4
 [EXTERN VGA_BUFFER_ADDR]
 [EXTERN VGA_BUFFER_END_ADDR]
 
- 
-; Start location, linker will start execution here
+PAGE_SIZE equ 0x1000            ; 4096 bytes 
+STACK_SIZE equ 0x4000           ; 16384 bytes (16 kb) for stack
+
+; This is all executable code
 [SECTION .text] 
 
 ; This function prints an error (arg0) to the screen and then halts forever
 halt_with_error32: proc32
+  ; First get vga color for space white foreground black background
+  push VGA_COLOR_BLACK ; Background
+  push VGA_COLOR_WHITE ; Foreground
+  call vga_color32
+  add esp, DWORD_SIZE*2 ; Pop stack
+
+  ; push the resultant color
+  push eax
+  ; clear screen using this color
+  call vga_clear_screen32
+
   ; Call print with first arg
   mov eax, arg(0)
   push eax
@@ -43,13 +61,13 @@ endproc32
 
 ; This function hangs the cpu forever
 halt32: proc32
-  .hang:	hlt
-	  jmp .hang
+  .hang:  hlt
+    jmp .hang
 endproc32
 
 
 ; This method will check if the cpu supports CPUID (1 if yes, 0 if no)
-; No Args
+; No args
 check_cpuid_support32: proc32
   ; Check if CPUID is supported by attempting to flip the ID bit (bit 21) in
   ; the FLAGS register. If we can flip it, CPUID is available.
@@ -82,7 +100,7 @@ endproc32
 
 ; This will check if the cpu supports long mode (1 if yes, 0 if no) Make 
 ; sure to check for cpuid 
-; No Args
+; No args
 check_long_mode_support32: proc32
   mov eax, 0x80000000    ; Set the A-register to 0x80000000.
   cpuid                  ; CPU identification.
@@ -105,6 +123,8 @@ endproc32
 
 
 ; get vga color from foreground (arg0) and background (arg1)
+; arg0: foreground color, as defined in vga.asm
+; arg1: background color, as defined in vga.as,
 vga_color32: proc32
   mov eax, arg(0) ; fg
   mov ecx, arg(1) ; bg
@@ -113,6 +133,8 @@ vga_color32: proc32
 endproc32
 
 ; create vga entry from character (arg0) and vga_color (arg1)
+; arg0: 8 bit character
+; arg1: vga_color created by vga_color32
 vga_entry32: proc32
   mov eax, arg(0) ; character
   mov ecx, arg(1) ; vga_color
@@ -120,16 +142,13 @@ vga_entry32: proc32
   or eax, ecx ; character | color
 endproc32
 
-; This clears the screen to black
+; This clears the screen with space characters with the given color arg0
+; arg0: the color to clear the screen with
 vga_clear_screen32: proc32
 
-  ; First get vga color for space white foreground black background
-  push VGA_COLOR_BLACK ; Background
-  push VGA_COLOR_WHITE ; Foreground
-  call vga_color32
-  add esp, DWORD_SIZE*2 ; Pop stack
-  
-  ; Then get vga entry
+  mov eax, arg(0) ; arg0 is the color
+
+  ; get vga entry using provided color
   ; push args for next proc
   push eax
   push ' ' ; Char to clear screen with
@@ -162,34 +181,66 @@ vga_print32: proc32
     ; exit if we are going to exceed the limit 
     cmp ecx, VGA_BUFFER_LEN
     jge .vga_print32_end
-
-    mov [VGA_BUFFER_ADDR+ecx*2], byte al ; move cha to buffer
+    ; move char to buffer
+    mov [VGA_BUFFER_ADDR+ecx*2], byte al 
     inc ecx
     jmp .vga_print32_loop
   .vga_print32_end:
 endproc32
 
 
+; Enables long mode compatibility mode using page table pointed to by arg0 
+; It is still necessary to load a gdt after this to enter true 64 bit mode
+; arg0 is a pointer to the p4 paging table
+long_mode_compat_enable32: proc32
+  ; move page table address to cr3
+  mov eax, arg(0) ; arg0 is the p4 table
+  mov cr3, eax
+
+  ; enable PAE
+  mov eax, cr4
+  or eax, 1 << 5 ; physical address extension bit on cr4
+  mov cr4, eax
+
+  ; set the long mode bit
+  mov ecx, 0xC0000080
+  rdmsr
+  or eax, 1 << 8 ; Enables long mode on model specific register
+  wrmsr
+
+  ; enable paging
+  mov eax, cr0
+  or eax, 1 << 31 ; set paging bit
+  or eax, 1 << 16 ; set write protect bit
+  mov cr0, eax
+
+endproc32
+
+; Start location, linker will start execution here
 [GLOBAL start32]
 start32:
   ; We haven't set up an IDT yet, so we'll disable interrupts for now
-	cli
+  cli
 
-	; To set up a stack, we set the esp register to point to the top of our
-	; stack (as it grows downwards on x86 systems).
-	mov esp, stack_top
+  ; To set up a stack, we set the esp register to point to the top of our
+  ; stack (as it grows downwards on x86 systems).
+  mov esp, stack_top
 
-  ; First clear screen
-	call vga_clear_screen32
+  cmp eax, MULTIBOOT_HEADER_MAGIC
+  jne .has_multiboot ; If it was booted with multiboot
+  ; this is if it does not match
+  push errors.no_multiboot
+  call halt_with_error32
+  ; no return, so no need to clean up stack
 
   
+  .has_multiboot:
   call check_cpuid_support32
   cmp eax, 0 
   jne .has_cpuid ; If its not zero
   ; However, if no cpuid, return error messge and halt
-  push no_cpuid_error_message
+  push errors.no_cpuid
   call halt_with_error32
-  ; no return, so no need to clean up stack
 
   ; If it does have cpuid we gotta check for long mode
  .has_cpuid:
@@ -197,23 +248,64 @@ start32:
   cmp eax, 0
   jne .has_long_mode
   ; However, if no long mode, return error messge and halt
-  push no_long_mode_error_message
+  push errors.no_long_mode
   call halt_with_error32
 
   .has_long_mode:
 
   
 
-  ; Success
-  push success_error_message
+  ; Kernel finished
+  push errors.kernel_finished
   call halt_with_error32
 
  
 [SECTION .data]
 
-no_cpuid_error_message: db 'Error: No CPUID support. Halting.',0
-no_long_mode_error_message: db 'Error: No support for long mode (64 bit). Halting.',0
-success_error_message: db 'Error: Success. Halting.',0
+errors:
+.no_multiboot: db 'Error: Kernel not booted with multiboot. Halting.',0
+.no_cpuid: db 'Error: No CPUID support. Halting.',0
+.no_long_mode: db 'Error: No support for long mode (64 bit). Halting.',0
+.kernel_finished: db 'Error: Kernel exited. Halting.',0
+
+; TODO this is another potential gdt that is a lot more opaque
+;gdt64:
+;    dq 0 ; zero entry
+;.code: equ $ - gdt64
+;    dq (1<<44) | (1<<47) | (1<<41) | (1<<43) | (1<<53) ; code segment
+;.data: equ $ - gdt64
+;    dq (1<<44) | (1<<47) | (1<<41) ; data segment
+;.pointer:
+;    dw $ - gdt64 - 1
+;    dq gdt64
+
+; From here
+; https://wiki.osdev.org/Setting_Up_Long_Mode
+gdt64:                           ; Global Descriptor Table (64-bit).
+  .null: equ $ - gdt64           ; The null descriptor.
+    dw 0xFFFF                    ; Limit (low).
+    dw 0                         ; Base (low).
+    db 0                         ; Base (middle)
+    db 0                         ; Access.
+    db 1                         ; Granularity.
+    db 0                         ; Base (high).
+  .code: equ $ - gdt64           ; The code descriptor.
+    dw 0                         ; Limit (low).
+    dw 0                         ; Base (low).
+    db 0                         ; Base (middle)
+    db 10011010b                 ; Access (exec/read).
+    db 10101111b                 ; Granularity, 64 bits flag, limit19:16.
+    db 0                         ; Base (high).
+  .data: equ $ - gdt64           ; The data descriptor.
+    dw 0                         ; Limit (low).
+    dw 0                         ; Base (low).
+    db 0                         ; Base (middle)
+    db 10010010b                 ; Access (read/write).
+    db 00000000b                 ; Granularity.
+    db 0                         ; Base (high).
+  .pointer:                      ; The gdt-pointer.
+    dw $ - gdt64 - 1             ; Limit.
+    dq gdt64                     ; Base.
 
 ; The bss section is uninitialized data
 [SECTION .bss]
@@ -221,5 +313,13 @@ success_error_message: db 'Error: Success. Halting.',0
 ; Stack must be 16 byte aligned
 align 16
 stack_bottom:
-resb 0x10000 ; 16 KiB
+resb STACK_SIZE ; 16 KiB
 stack_top:
+
+align PAGE_SIZE
+p4_table:
+    resb PAGE_SIZE
+p3_table:
+    resb PAGE_SIZE
+p2_table:
+    resb PAGE_SIZE

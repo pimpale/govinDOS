@@ -35,7 +35,6 @@ SECTIONS
   }
 
 
-
   /* The rest of the stuff will have to be mapped before we can access it */
   . += KERNEL_VIRT_ADDR;
 

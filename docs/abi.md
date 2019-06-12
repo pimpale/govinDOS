@@ -138,16 +138,20 @@ printf:
   ; check if argc is 0
   cmp rax, 0
   jne .validargs
+
+  ; the following runs if error
   mov rax, INVALID_ARGS
   jmp .end
 
   .validargs:
+  ; everything under here will run if no error
 
   ; Do printf stuff
 
   mov rax, NO_ERROR
 
   .end:
+  ; destroy stack frame
   pop rbp
   ret
 
@@ -159,11 +163,14 @@ foo:
   push rbp
   mov rbp, rsp
 
-  mov rax, 2
-  mov rbx, HELLO_WORLD_MSG
-  mov rcx, 5
+  ; Move the arguments into place
+
+  mov rax, 2 ; the total number of args to follow (always required)
+  mov rbx, HELLO_WORLD_MSG ; The format string
+  mov rcx, 5 ; the value to sub in
   call printf
   
+  ; Destroy stack frame
   pop rbp
   ret
 
