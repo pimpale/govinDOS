@@ -6,8 +6,6 @@
 [EXTERN BOOT_BSS_END_ADDR]
 [EXTERN start32]
 
-[GLOBAL MULTIBOOT_HEADER_MAGIC]
-
 ; Declare constants for the multiboot header.
 MULTIBOOT_PAGE_ALIGN		equ 1<<0 ; All boot modules loaded along with the operating system must be aligned on page (4KB) boundaries.
 MULTIBOOT_MEMORY_INFO		equ 1<<1 ; Let the bootloader fill in the mem_ fields.

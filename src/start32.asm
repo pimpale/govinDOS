@@ -124,7 +124,7 @@ endproc32
 
 ; get vga color from foreground (arg0) and background (arg1)
 ; arg0: foreground color, as defined in vga.asm
-; arg1: background color, as defined in vga.as,
+; arg1: background color, as defined in vga.asm
 vga_color32: proc32
   mov eax, arg(0) ; fg
   mov ecx, arg(1) ; bg
@@ -205,7 +205,7 @@ long_mode_compat_enable32: proc32
   ; set the long mode bit
   mov ecx, 0xC0000080
   rdmsr
-  or eax, 1 << 8 ; Enables long mode on model specific register
+  or eax, 1 << 8 ; Enables long mode on model specific register (msr)
   wrmsr
 
   ; enable paging
@@ -226,13 +226,12 @@ start32:
   ; stack (as it grows downwards on x86 systems).
   mov esp, stack_top
 
-  cmp eax, MULTIBOOT_HEADER_MAGIC
-  jne .has_multiboot ; If it was booted with multiboot
+  cmp eax, 0x2BADB002 ; multiboot1 magic value
+  je .has_multiboot ; If it was booted with multiboot
   ; this is if it does not match
   push errors.no_multiboot
   call halt_with_error32
   ; no return, so no need to clean up stack
-
   
   .has_multiboot:
   call check_cpuid_support32
