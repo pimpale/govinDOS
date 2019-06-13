@@ -6,6 +6,7 @@ NASMFLAGS = -f elf64
 .PHONY: all
 
 all:
+	$(NASM) $(NASMFLAGS) multiboot.asm -o $(BUILD_DIR)/multiboot.o
 	$(NASM) $(NASMFLAGS) header32.asm -o $(BUILD_DIR)/header32.o
 	$(NASM) $(NASMFLAGS) vga.asm -o $(BUILD_DIR)/vga.o
 	$(NASM) $(NASMFLAGS) start32.asm -o $(BUILD_DIR)/start32.o

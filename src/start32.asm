@@ -20,7 +20,8 @@
 %endmacro
 
 ; constants
-[EXTERN MULTIBOOT_HEADER_MAGIC]
+[EXTERN MULTIBOOT_BOOT_REGISTER_MAGIC]
+
 [EXTERN VGA_COLOR_BLACK]
 [EXTERN VGA_COLOR_WHITE]
 [EXTERN VGA_COLOR_RED]
@@ -199,7 +200,7 @@ long_mode_compat_enable32: proc32
 
   ; enable PAE
   mov eax, cr4
-  or eax, 1 << 5 ; physical address extension bit on cr4
+  or eax, CR4_PAE ; physical address extension bit on cr4
   mov cr4, eax
 
   ; set the long mode bit
@@ -210,9 +211,52 @@ long_mode_compat_enable32: proc32
 
   ; enable paging
   mov eax, cr0
-  or eax, 1 << 31 ; set paging bit
-  or eax, 1 << 16 ; set write protect bit
+  or eax, CR0_PG ; set paging bit
+  or eax, CR0_WP ; set write protect bit
   mov cr0, eax
+
+endproc32
+
+; Initializes a page table identity mapping the first 2 MiB with huge pages
+;
+; This table is necessary to enter long mode, and should be replaced
+; by the 64bit kernel. Since we are mapping only a tiny amount of 
+; space for the initial kernel, all we really need is a few MiB.
+; Hence, we only accept 1 of each level. 
+;
+; arg0 pointer to uninitialized memory for page table level 1
+; arg1 pointer to uninitialized memory for page table level 2
+; arg2 pointer to uninitialized memory for page table level 3
+; arg3 pointer to uninitialized memory for page table level 4
+; returns nothing
+init_early_table32: proc32
+  ; TODO less hacks, need to remove magic numbers. 
+
+  ; Point the first entry of the level 4 page table to the first entry in the
+  ; p3 table
+  mov eax, arg(2) ;p3_table
+  or eax, 11b ; 
+  mov ecx, arg(3) ; p4_table
+  mov dword [ecx + 0], eax
+
+  ; Point the first entry of the level 3 page table to the first entry in the
+  ; p2 table
+  mov eax, arg(1) ;p2_table
+  or eax, 11b
+  mov ecx, arg(2) ; p3_table
+  mov dword [ecx + 0], eax
+
+  ; point each page table level two entry to a page
+  mov ecx, 0         ; counter variable
+  .map_p2_table:
+    mov eax, 0x200000  ; 2MiB
+    mul ecx
+    or eax, 10000011b
+    mov [p2_table + ecx * 8], eax
+
+    inc ecx
+    cmp ecx, 512
+    jne .map_p2_table
 
 endproc32
 
@@ -226,7 +270,7 @@ start32:
   ; stack (as it grows downwards on x86 systems).
   mov esp, stack_top
 
-  cmp eax, 0x2BADB002 ; multiboot1 magic value
+  cmp eax, MULTIBOOT_BOOT_REGISTER_MAGIC ; multiboot1 magic value
   je .has_multiboot ; If it was booted with multiboot
   ; this is if it does not match
   push errors.no_multiboot
@@ -253,6 +297,7 @@ start32:
   .has_long_mode:
 
   
+  
 
   ; Kernel finished
   push errors.kernel_finished
@@ -262,10 +307,14 @@ start32:
 [SECTION .data]
 
 errors:
-.no_multiboot: db 'Error: Kernel not booted with multiboot. Halting.',0
-.no_cpuid: db 'Error: No CPUID support. Halting.',0
-.no_long_mode: db 'Error: No support for long mode (64 bit). Halting.',0
-.kernel_finished: db 'Error: Kernel exited. Halting.',0
+  .no_multiboot: 
+    db 'Error: Kernel not booted with multiboot. Halting.',0
+  .no_cpuid: 
+    db 'Error: No CPUID support. Halting.',0
+  .no_long_mode: 
+    db 'Error: No support for long mode (64 bit). Halting.',0
+  .kernel_finished: 
+    db 'Error: Kernel exited. Halting.',0
 
 ; TODO this is another potential gdt that is a lot more opaque
 ;gdt64:
@@ -278,8 +327,7 @@ errors:
 ;    dw $ - gdt64 - 1
 ;    dq gdt64
 
-; From here
-; https://wiki.osdev.org/Setting_Up_Long_Mode
+; From https://wiki.osdev.org/Setting_Up_Long_Mode
 gdt64:                           ; Global Descriptor Table (64-bit).
   .null: equ $ - gdt64           ; The null descriptor.
     dw 0xFFFF                    ; Limit (low).
