@@ -108,9 +108,9 @@ check_long_mode_support32: proc32
   cmp eax, 0x80000001    ; Compare the A-register with 0x80000001.
   jb .check_long_mode_support32_nolong ; It is less, there is no long mode.
 
-  mov eax, 0x80000001    ; Set the A-register to 0x80000001.
-  cpuid                  ; CPU identification.
-  test edx, 1 << 29      ; Test if the LM-bit, (bit 29), is set in edx
+  mov eax, 0x80000001       ; Set the A-register to 0x80000001.
+  cpuid                     ; CPU identification.
+  test edx, 1 << 29         ; Test if the LM-bit, (bit 29), is set in edx
   jz .check_long_mode_support32_nolong  ; They aren't, there is no long mode.
 
   mov eax, 1 ; Yes, it is supported
