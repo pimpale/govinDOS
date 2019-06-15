@@ -1,3 +1,7 @@
+[GLOBAL CPUID_GET_FEAT]
+[GLOBAL CPUID_GET_EXT_FUNC]         
+[GLOBAL CPUID_GET_EXT_PROC_INFO]
+
 [GLOBAL CPUID_FEAT_EDX_FPU]
 [GLOBAL CPUID_FEAT_EDX_VME]
 [GLOBAL CPUID_FEAT_EDX_DE]
@@ -61,9 +65,65 @@
 [GLOBAL CPUID_FEAT_ECX_HYPERVISOR]
 
 
+[GLOBAL CPUID_EXT_FEAT_EDX_FPU]
+[GLOBAL CPUID_EXT_FEAT_EDX_VME]
+[GLOBAL CPUID_EXT_FEAT_EDX_DE]
+[GLOBAL CPUID_EXT_FEAT_EDX_PSE]
+[GLOBAL CPUID_EXT_FEAT_EDX_TSC]
+[GLOBAL CPUID_EXT_FEAT_EDX_MSR]
+[GLOBAL CPUID_EXT_FEAT_EDX_PAE]
+[GLOBAL CPUID_EXT_FEAT_EDX_MCE]
+[GLOBAL CPUID_EXT_FEAT_EDX_CX8]
+[GLOBAL CPUID_EXT_FEAT_EDX_APIC]
+[GLOBAL CPUID_EXT_FEAT_EDX_SYSCALL]
+[GLOBAL CPUID_EXT_FEAT_EDX_MTRR]
+[GLOBAL CPUID_EXT_FEAT_EDX_PGE]
+[GLOBAL CPUID_EXT_FEAT_EDX_MCA]
+[GLOBAL CPUID_EXT_FEAT_EDX_CMOV]
+[GLOBAL CPUID_EXT_FEAT_EDX_PAT]
+[GLOBAL CPUID_EXT_FEAT_EDX_PSE36]
+[GLOBAL CPUID_EXT_FEAT_EDX_MP]
+[GLOBAL CPUID_EXT_FEAT_EDX_NX]
+[GLOBAL CPUID_EXT_FEAT_EDX_MMXEXT]
+[GLOBAL CPUID_EXT_FEAT_EDX_MMX]
+[GLOBAL CPUID_EXT_FEAT_EDX_FXSR]
+[GLOBAL CPUID_EXT_FEAT_EDX_FXSR_OPT]
+[GLOBAL CPUID_EXT_FEAT_EDX_PDPE1GB]
+[GLOBAL CPUID_EXT_FEAT_EDX_RDTSCP]
+[GLOBAL CPUID_EXT_FEAT_EDX_LM]
+[GLOBAL CPUID_EXT_FEAT_EDX_3DNOWEXT]
+[GLOBAL CPUID_EXT_FEAT_EDX_3DNOW]
+[GLOBAL CPUID_EXT_FEAT_ECX_LAHF_LM]
+[GLOBAL CPUID_EXT_FEAT_ECX_CMP_LEGACY]
+[GLOBAL CPUID_EXT_FEAT_ECX_SVM]
+[GLOBAL CPUID_EXT_FEAT_ECX_EXTAPIC]
+[GLOBAL CPUID_EXT_FEAT_ECX_CR8_LEGACY]
+[GLOBAL CPUID_EXT_FEAT_ECX_ABM]
+[GLOBAL CPUID_EXT_FEAT_ECX_SSE4A]
+[GLOBAL CPUID_EXT_FEAT_ECX_MISALIGNSSE]
+[GLOBAL CPUID_EXT_FEAT_ECX_3DNOWPREFETCH]
+[GLOBAL CPUID_EXT_FEAT_ECX_OSVW]
+[GLOBAL CPUID_EXT_FEAT_ECX_IBS]
+[GLOBAL CPUID_EXT_FEAT_ECX_XOP]
+[GLOBAL CPUID_EXT_FEAT_ECX_SKINIT]
+[GLOBAL CPUID_EXT_FEAT_ECX_WDT]
+[GLOBAL CPUID_EXT_FEAT_ECX_LWP]
+[GLOBAL CPUID_EXT_FEAT_ECX_FMA4]
+[GLOBAL CPUID_EXT_FEAT_ECX_TCE]
+[GLOBAL CPUID_EXT_FEAT_ECX_NODEID_MSR]
+[GLOBAL CPUID_EXT_FEAT_ECX_TBM]
+[GLOBAL CPUID_EXT_FEAT_ECX_TOPOEXT]
+[GLOBAL CPUID_EXT_FEAT_ECX_PERFCTR_CORE]
+[GLOBAL CPUID_EXT_FEAT_ECX_PERFCTR_NB]
+[GLOBAL CPUID_EXT_FEAT_ECX_DBX]
+[GLOBAL CPUID_EXT_FEAT_ECX_PERFTSC]
+[GLOBAL CPUID_EXT_FEAT_ECX_PCX_L2I]
+
+
+
 CPUID_GET_FEAT              equ 0x1 ; eax value to retrieve features to edx and ecx
 CPUID_GET_EXT_FUNC          equ 0x80000000 ; eax value to get highest extended function implemented in eax
-CPUID_GET_EXT_PROC_INFO     equ 0x80000001 ; eax value that returns extended feature flags in edx and ecx. 
+CPUID_GET_EXT_PROC_INFO     equ 0x80000001 ; eax value that returns extended feature flags in edx and ecx.
 
 
 CPUID_FEAT_EDX_FPU          equ 1 << 0   ; Onboard x87 FPU
@@ -131,43 +191,43 @@ CPUID_FEAT_ECX_HYPERVISOR   equ 1 << 31  ; Hypervisor present
 
 CPUID_EXT_FEAT_EDX_FPU           equ 1 << 0   ; Onboard x87 FPU
 CPUID_EXT_FEAT_EDX_VME           equ 1 << 1   ; Virtual mode extensions (VIF)
-CPUID_EXT_FEAT_EDX_DE            equ 1 << 2  ; Debugging extensions (CR4 bit 3)
-CPUID_EXT_FEAT_EDX_PSE           equ 1 << 3  ; Page Size Extension
-CPUID_EXT_FEAT_EDX_TSC           equ 1 <<  4 ; Time Stamp Counter
-CPUID_EXT_FEAT_EDX_MSR           equ 1 <<   5; Model Specific Registers
-CPUID_EXT_FEAT_EDX_PAE           equ 1 <<6   ; Physical Address Extension
-CPUID_EXT_FEAT_EDX_MCE           equ 1 << 7  ; Machine Check Exception
-CPUID_EXT_FEAT_EDX_CX8           equ 1 <<  8 ; CMPXCHG8 (compare and swap) instruction
-CPUID_EXT_FEAT_EDX_APIC          equ 1 <<   9; Onboard Advanced Programmable Interrupt Controller
-CPUID_EXT_FEAT_EDX_SYSCALL       equ 1 <<11    ; SYSCALL and SYSRET instructions
-CPUID_EXT_FEAT_EDX_MTRR          equ 1 <<12  ; Memory Type Range Resgisters
-CPUID_EXT_FEAT_EDX_PGE           equ 1 <<13  ; Page Global Enable bit in CR4
-CPUID_EXT_FEAT_EDX_MCA           equ 1 <<14  ; Machine check architecture
-CPUID_EXT_FEAT_EDX_CMOV          equ 1 <<15  ; Conditional move and FCMOV instructions
-CPUID_EXT_FEAT_EDX_PAT           equ 1 <<17  ; Page Attribute Table
-CPUID_EXT_FEAT_EDX_PSE36         equ 1 <<18  ; 36-bit page size extension
-CPUID_EXT_FEAT_EDX_MP            equ 1 <<19  ; Multiprocessor Capable
-CPUID_EXT_FEAT_EDX_NX            equ 1 <<20  ; No Execute bit
-CPUID_EXT_FEAT_EDX_MMXEXT        equ 1 <<22  ; Extended MMX
-CPUID_EXT_FEAT_EDX_MMX           equ 1 <<23  ; MMX instructions
-CPUID_EXT_FEAT_EDX_FXSR          equ 1 <<24  ; FXSAVE, FXRSTOR instructions, CR4 bit 9
-CPUID_EXT_FEAT_EDX_FXSR_OPT      equ 1 <<25  ; FXSAVE/FXRSTOR optimizations
-CPUID_EXT_FEAT_EDX_PDPE1GB       equ 1 <<26  ; Gibibyte pages
-CPUID_EXT_FEAT_EDX_RDTSCP        equ 1 <<27  ; RDTSCP instruction
-CPUID_EXT_FEAT_EDX_LM            equ 1 <<29  ; Long mode
-CPUID_EXT_FEAT_EDX_3DNOWEXT      equ 1 <<30  ; Extended 3DNow
-CPUID_EXT_FEAT_EDX_3DNOW         equ 1 <<31  ; 3DNow
-CPUID_EXT_FEAT_ECX_LAHF_LM       equ 1 <<0  ; LAHF/SAHF in long mode
-CPUID_EXT_FEAT_ECX_CMP_LEGACY    equ 1 <<1   ; Hyperthreading not valid
-CPUID_EXT_FEAT_ECX_SVM           equ 1 <<2   ; Secure Virtual Machine
-CPUID_EXT_FEAT_ECX_EXTAPIC       equ 1 <<3   ; Extended APIC space
-CPUID_EXT_FEAT_ECX_CR8_LEGACY    equ 1 <<4   ; CR8 in 32-bit mode
-CPUID_EXT_FEAT_ECX_ABM           equ 1 <<5   ; Advanced bit manipulation (lzcnt and popcnt)
-CPUID_EXT_FEAT_ECX_SSE4A         equ 1 <<6   ; SSSE4a
-CPUID_EXT_FEAT_ECX_MISALIGNSSE   equ 1 <<7   ; Misaligned SSE mode
-CPUID_EXT_FEAT_ECX_3DNOWPREFETCH equ 1 <<8   ; PREFETCH and PREFETCHW instructions
-CPUID_EXT_FEAT_ECX_OSVW          equ 1 <<9   ; OS Visible Workaround
-CPUID_EXT_FEAT_ECX_IBS           equ 1 <<10   ; Instruction Based Sampling
+CPUID_EXT_FEAT_EDX_DE            equ 1 << 2   ; Debugging extensions (CR4 bit 3)
+CPUID_EXT_FEAT_EDX_PSE           equ 1 << 3   ; Page Size Extension
+CPUID_EXT_FEAT_EDX_TSC           equ 1 << 4   ; Time Stamp Counter
+CPUID_EXT_FEAT_EDX_MSR           equ 1 << 5   ; Model Specific Registers
+CPUID_EXT_FEAT_EDX_PAE           equ 1 << 6   ; Physical Address Extension
+CPUID_EXT_FEAT_EDX_MCE           equ 1 << 7   ; Machine Check Exception
+CPUID_EXT_FEAT_EDX_CX8           equ 1 << 8   ; CMPXCHG8 (compare and swap) instruction
+CPUID_EXT_FEAT_EDX_APIC          equ 1 << 9   ; Onboard Advanced Programmable Interrupt Controller
+CPUID_EXT_FEAT_EDX_SYSCALL       equ 1 << 11  ; SYSCALL and SYSRET instructions
+CPUID_EXT_FEAT_EDX_MTRR          equ 1 << 12  ; Memory Type Range Resgisters
+CPUID_EXT_FEAT_EDX_PGE           equ 1 << 13  ; Page Global Enable bit in CR4
+CPUID_EXT_FEAT_EDX_MCA           equ 1 << 14  ; Machine check architecture
+CPUID_EXT_FEAT_EDX_CMOV          equ 1 << 15  ; Conditional move and FCMOV instructions
+CPUID_EXT_FEAT_EDX_PAT           equ 1 << 17  ; Page Attribute Table
+CPUID_EXT_FEAT_EDX_PSE36         equ 1 << 18  ; 36-bit page size extension
+CPUID_EXT_FEAT_EDX_MP            equ 1 << 19  ; Multiprocessor Capable
+CPUID_EXT_FEAT_EDX_NX            equ 1 << 20  ; No Execute bit
+CPUID_EXT_FEAT_EDX_MMXEXT        equ 1 << 22  ; Extended MMX
+CPUID_EXT_FEAT_EDX_MMX           equ 1 << 23  ; MMX instructions
+CPUID_EXT_FEAT_EDX_FXSR          equ 1 << 24  ; FXSAVE, FXRSTOR instructions, CR4 bit 9
+CPUID_EXT_FEAT_EDX_FXSR_OPT      equ 1 << 25  ; FXSAVE/FXRSTOR optimizations
+CPUID_EXT_FEAT_EDX_PDPE1GB       equ 1 << 26  ; Gibibyte pages
+CPUID_EXT_FEAT_EDX_RDTSCP        equ 1 << 27  ; RDTSCP instruction
+CPUID_EXT_FEAT_EDX_LM            equ 1 << 29  ; Long mode
+CPUID_EXT_FEAT_EDX_3DNOWEXT      equ 1 << 30  ; Extended 3DNow
+CPUID_EXT_FEAT_EDX_3DNOW         equ 1 << 31  ; 3DNow
+CPUID_EXT_FEAT_ECX_LAHF_LM       equ 1 << 0   ; LAHF/SAHF in long mode
+CPUID_EXT_FEAT_ECX_CMP_LEGACY    equ 1 << 1   ; Hyperthreading not valid
+CPUID_EXT_FEAT_ECX_SVM           equ 1 << 2   ; Secure Virtual Machine
+CPUID_EXT_FEAT_ECX_EXTAPIC       equ 1 << 3   ; Extended APIC space
+CPUID_EXT_FEAT_ECX_CR8_LEGACY    equ 1 << 4   ; CR8 in 32-bit mode
+CPUID_EXT_FEAT_ECX_ABM           equ 1 << 5   ; Advanced bit manipulation (lzcnt and popcnt)
+CPUID_EXT_FEAT_ECX_SSE4A         equ 1 << 6   ; SSE4a
+CPUID_EXT_FEAT_ECX_MISALIGNSSE   equ 1 << 7   ; Misaligned SSE mode
+CPUID_EXT_FEAT_ECX_3DNOWPREFETCH equ 1 << 8   ; PREFETCH and PREFETCHW instructions
+CPUID_EXT_FEAT_ECX_OSVW          equ 1 << 9   ; OS Visible Workaround
+CPUID_EXT_FEAT_ECX_IBS           equ 1 << 10  ; Instruction Based Sampling
 CPUID_EXT_FEAT_ECX_XOP           equ 1 << 11  ; XOP instruction set
 CPUID_EXT_FEAT_ECX_SKINIT        equ 1 << 12  ; SKINIT/STGI instructions
 CPUID_EXT_FEAT_ECX_WDT           equ 1 << 13  ; Watchdog timer
@@ -178,81 +238,7 @@ CPUID_EXT_FEAT_ECX_NODEID_MSR    equ 1 << 19  ; ModeID MSR
 CPUID_EXT_FEAT_ECX_TBM           equ 1 << 21  ; Trailing Bit Manipulation
 CPUID_EXT_FEAT_ECX_TOPOEXT       equ 1 << 22  ; Topology Extensions
 CPUID_EXT_FEAT_ECX_PERFCTR_CORE  equ 1 << 23  ; Core performance counter extensions
-CPUID_EXT_FEAT_ECX_PERFCTR_NB    equ 1 << 24   ; NB performance counter extensions
-CPUID_EXT_FEAT_ECX_DBX           equ 1 << 26   ; Data breakpoint extensions
-CPUID_EXT_FEAT_ECX_PERFTSC       equ 1 << 27   ; Performance TSC
-CPUID_EXT_FEAT_ECX_PCX_L2I       equ 1 << 28   ; L2I perf counter extensions
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-; Onboard x87 FPU
-; Virtual mode extensions (VIF)
-; Debugging extensions (CR4 bit 3)
-; Page Size Extension
-; Time Stamp Counter
-; Model Specific Registers
-; Physical Address Extension
-; Machine Check Exception
-; CMPXCHG8 (compare and swap) instruction
-; Onboard Advanced Programmable Interrupt Controller
-; SYSCALL and SYSRET instructions
-; Memory Type Range Resgisters
-; Page Global Enable bit in CR4
-; Machine check architecture
-; Conditional move and FCMOV instructions
-; Page Attribute Table
-; 36-bit page size extension
-; Multiprocessor Capable
-; No Execute bit
-; Extended MMX
-; MMX instructions
-; FXSAVE, FXRSTOR instructions, CR4 bit 9
-; FXSAVE/FXRSTOR optimizations
-; Gibibyte pages
-; RDTSCP instruction
-; Long mode
-; Extended 3DNow
-; 3DNow
-; LAHF/SAHF in long mode
-; Hyperthreading not valid
-; Secure Virtual Machine
-; Extended APIC space
-; CR8 in 32-bit mode
-; Advanced bit manipulation (lzcnt and popcnt)
-; SSSE4a
-; Misaligned SSE mode
-; PREFETCH and PREFETCHW instructions
-; OS Visible Workaround
-; Instruction Based Sampling
-; XOP instruction set
-; SKINIT/STGI instructions
-; Watchdog timer
-; Light Weight Profiling
-; 4 operands fused multiply-add
-; Translation Cache Extension
-; ModeID MSR
-; Trailing Bit Manipulation
-; Topology Extensions
-; Core performance counter extensions
-; NB performance counter extensions
-; Data breakpoint extensions
-; Performance TSC
-; L2I perf counter extensions                               
+CPUID_EXT_FEAT_ECX_PERFCTR_NB    equ 1 << 24  ; NB performance counter extensions
+CPUID_EXT_FEAT_ECX_DBX           equ 1 << 26  ; Data breakpoint extensions
+CPUID_EXT_FEAT_ECX_PERFTSC       equ 1 << 27  ; Performance TSC
+CPUID_EXT_FEAT_ECX_PCX_L2I       equ 1 << 28  ; L2I perf counter extensions
