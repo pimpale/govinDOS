@@ -22,6 +22,10 @@
 ; constants
 [EXTERN MULTIBOOT_BOOT_REGISTER_MAGIC]
 
+[EXTERN CPUID_GET_EXT_FUNC]
+[EXTERN CPUID_GET_EXT_PROC_INFO]
+[EXTERN CPUID_EXT_FEAT_LM]
+
 [EXTERN VGA_COLOR_BLACK]
 [EXTERN VGA_COLOR_WHITE]
 [EXTERN VGA_COLOR_RED]
@@ -103,15 +107,15 @@ endproc32
 ; sure to check for cpuid 
 ; No args
 check_long_mode_support32: proc32
-  mov eax, 0x80000000    ; Set the A-register to 0x80000000.
-  cpuid                  ; CPU identification.
-  cmp eax, 0x80000001    ; Compare the A-register with 0x80000001.
+  mov eax, CPUID_GET_EXT_FUNC          ; Set the A-register to 0x80000000.
+  cpuid                                ; CPU identification.
+  cmp eax, CPUID_GET_EXT_PROC_INFO     ; Compare the A-register with 0x80000001.
   jb .check_long_mode_support32_nolong ; It is less, there is no long mode.
 
-  mov eax, 0x80000001       ; Set the A-register to 0x80000001.
-  cpuid                     ; CPU identification.
-  test edx, 1 << 29         ; Test if the LM-bit, (bit 29), is set in edx
-  jz .check_long_mode_support32_nolong  ; They aren't, there is no long mode.
+  mov eax, CPUID_GET_EXT_PROC_INFO     ; Set the A-register to 0x80000001.
+  cpuid                                ; CPU identification.
+  test edx, CPUID_EXT_FEAT_LM          ; Test if the LM-bit, (bit 29), is set in edx
+  jz .check_long_mode_support32_nolong ; They aren't, there is no long mode.
 
   mov eax, 1 ; Yes, it is supported
   jmp .check_long_mode_support32_end
