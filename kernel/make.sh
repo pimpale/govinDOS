@@ -8,31 +8,52 @@
 
 #This script will only work from within the kernel dir 
 
+set -e
+
+INSTALL_DIR="../bin/sysroot/boot"
+
 # One arg, assembles it and places it inside the build dir
 assemble() {
-  nasm -f elf64 $SRC_DIR/$1 -o $BUILD_DIR/obj/$1.o
+  mkdir -p bin
+  nasm -i inc -f elf64 src/$1 -o bin/$1.o
 }
 
 # No args, links all objects everything into kernel.bin
-link_all() {
+link() {
   gcc -mcmodel=large -ffreestanding -nostdlib -T linker.ld \
-    -o $BUILD_DIR/obj/kernel.bin $BUILD_DIR/*.o
+    -o bin/kernel.bin bin/*.o
 }
 
 # No arguments, cleans the build directory
 clean() {
-  rm -rf $BUILD_DIR
+  rm -rf bin
 }
 
-# No arguments, makes folders and things
-src() {
-  clean
-  mkdir -p $BUILD_DIR
-  mkdir $BUILD_DIR/obj # store objects binaries
+# No args. installs in install dir
+install() {
+  mkdir -p $INSTALL_DIR
+  cp bin/kernel.bin $INSTALL_DIR
+}
+
+# No arguments, makes everything, printing out the path of the finished product
+make() {
   assemble header32.asm
   assemble start32.asm
-  link_all
+  link
 }
 
-
-
+if [ $# -eq 0 ]; then
+  make
+else
+  for cmd in $@; do
+    case "$cmd" in
+      make|clean|link|install)
+        $cmd
+        ;;
+      *)
+        echo "Error: subcommand not found" >&2
+        exit 1
+        ;;
+    esac
+  done
+fi

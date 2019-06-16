@@ -20,20 +20,10 @@
 %endmacro
 
 ; constants
-[EXTERN MULTIBOOT_BOOT_REGISTER_MAGIC]
-
-[EXTERN CPUID_GET_EXT_FUNC]
-[EXTERN CPUID_GET_EXT_PROC_INFO]
-[EXTERN CPUID_EXT_FEAT_LM]
-
-[EXTERN VGA_COLOR_BLACK]
-[EXTERN VGA_COLOR_WHITE]
-[EXTERN VGA_COLOR_RED]
-[EXTERN VGA_XSIZE]
-[EXTERN VGA_YSIZE]
-[EXTERN VGA_BUFFER_LEN]
-[EXTERN VGA_BUFFER_ADDR]
-[EXTERN VGA_BUFFER_END_ADDR]
+%include "vga.mac"
+%include "cr.mac"
+%include "cpuid.mac"
+%include "multiboot.mac"
 
 PAGE_SIZE equ 0x1000            ; 4096 bytes 
 STACK_SIZE equ 0x4000           ; 16384 bytes (16 kb) for stack
@@ -98,9 +88,9 @@ check_cpuid_support32: proc32
   ; flipped, and CPUID isn't supported.
   cmp eax, ecx
   mov eax, 0
-  je .check_cpuid_support_end ; If they are equal tho, we can jump right to the end
+  je .end ; If they are equal tho, we can jump right to the end
   mov eax, 1 ; If it doesnt jump, we set it to 1
- .check_cpuid_support_end:
+ .end:
 endproc32
 
 ; This will check if the cpu supports long mode (1 if yes, 0 if no) Make 
@@ -110,20 +100,20 @@ check_long_mode_support32: proc32
   mov eax, CPUID_GET_EXT_FUNC          ; Set the A-register to 0x80000000.
   cpuid                                ; CPU identification.
   cmp eax, CPUID_GET_EXT_PROC_INFO     ; Compare the A-register with 0x80000001.
-  jb .check_long_mode_support32_nolong ; It is less, there is no long mode.
+  jb .nolong ; It is less, there is no long mode.
 
   mov eax, CPUID_GET_EXT_PROC_INFO     ; Set the A-register to 0x80000001.
   cpuid                                ; CPU identification.
-  test edx, CPUID_EXT_FEAT_LM          ; Test if the LM-bit, (bit 29), is set in edx
-  jz .check_long_mode_support32_nolong ; They aren't, there is no long mode.
+  test edx, CPUID_EXT_FEAT_EDX_LM      ; Test if the LM-bit, (bit 29), is set in edx
+  jz .nolong ; They aren't, there is no long mode.
 
   mov eax, 1 ; Yes, it is supported
-  jmp .check_long_mode_support32_end
+  jmp .end
   
-  .check_long_mode_support32_nolong:
+  .nolong:
     mov eax, 0 ; No, it's not supported
     
-  .check_long_mode_support32_end:
+  .end:
 endproc32
 
 
@@ -177,20 +167,20 @@ endproc32
 vga_print32: proc32
   mov edx, arg(0) ; Move the arg0 here
   mov ecx, 0 ; this register will serve as the counter
-  .vga_print32_loop:
+  .loop:
     mov al, [edx+ecx] ; Get a char from the string
 
     ; exit if null
     cmp al, 0
-    je .vga_print32_end
+    je .end
     ; exit if we are going to exceed the limit 
     cmp ecx, VGA_BUFFER_LEN
-    jge .vga_print32_end
+    jge .end
     ; move char to buffer
     mov [VGA_BUFFER_ADDR+ecx*2], byte al 
     inc ecx
-    jmp .vga_print32_loop
-  .vga_print32_end:
+    jmp .loop
+  .end:
 endproc32
 
 
