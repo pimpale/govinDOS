@@ -37,8 +37,9 @@ install() {
 
 # No arguments, makes everything, printing out the path of the finished product
 make() {
-  assemble header32.asm
-  assemble start32.asm
+  assemble header.asm
+  assemble early_init.asm
+  assemble init.asm
   link
 }
 

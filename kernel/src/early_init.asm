@@ -25,8 +25,10 @@
 %include "cpuid.mac"
 %include "multiboot.mac"
 
-PAGE_SIZE equ 0x1000            ; 4096 bytes 
-STACK_SIZE equ 0x4000           ; 16384 bytes (16 kb) for stack
+%define PAGE_SIZE  0x1000           ; 4096 bytes 
+%define STACK_SIZE 0x4000           ; 16384 bytes (16 kb) for stack
+
+[EXTERN kmain]
 
 ; This is all executable code
 [SECTION .text] 
@@ -73,7 +75,7 @@ check_cpuid_support32: proc32
   ; Copy to ECX as well for comparing later on
   mov ecx, eax
   ; Flip the ID bit
-  xor eax, 1 << 21
+  xor eax, 1 << 21 ; TODO export this to another flags file
   ; Copy EAX to FLAGS via the stack
   push eax
   popfd
@@ -197,6 +199,7 @@ long_mode_compat_enable32: proc32
   or eax, CR4_PAE ; physical address extension bit on cr4
   mov cr4, eax
 
+  ; TODO pls export this to a file so we dont have magic numbers
   ; set the long mode bit
   mov ecx, 0xC0000080
   rdmsr
@@ -218,26 +221,25 @@ endproc32
 ; space for the initial kernel, all we really need is a few MiB.
 ; Hence, we only accept 1 of each level. 
 ;
-; arg0 pointer to uninitialized memory for page table level 1
-; arg1 pointer to uninitialized memory for page table level 2
-; arg2 pointer to uninitialized memory for page table level 3
-; arg3 pointer to uninitialized memory for page table level 4
+; arg0 pointer to uninitialized memory for page table level 2
+; arg1 pointer to uninitialized memory for page table level 3
+; arg2 pointer to uninitialized memory for page table level 4
 ; returns nothing
 init_early_table32: proc32
   ; TODO less hacks, need to remove magic numbers. 
 
   ; Point the first entry of the level 4 page table to the first entry in the
   ; p3 table
-  mov eax, arg(2) ;p3_table
+  mov eax, arg(1) ;p3_table
   or eax, 11b ; 
-  mov ecx, arg(3) ; p4_table
+  mov ecx, arg(2) ; p4_table
   mov dword [ecx + 0], eax
 
   ; Point the first entry of the level 3 page table to the first entry in the
   ; p2 table
-  mov eax, arg(1) ;p2_table
+  mov eax, arg(0) ;p2_table
   or eax, 11b
-  mov ecx, arg(2) ; p3_table
+  mov ecx, arg(1) ; p3_table
   mov dword [ecx + 0], eax
 
   ; point each page table level two entry to a page
@@ -269,7 +271,9 @@ start32:
   ; this is if it does not match
   push errors.no_multiboot
   call halt_with_error32
-  ; no return, so no need to clean up stack
+  ; clean stack (wont be run, but is good practice regardless)
+  add esp, DWORD_SIZE
+
   
   .has_multiboot:
   call check_cpuid_support32
@@ -278,6 +282,7 @@ start32:
   ; However, if no cpuid, return error messge and halt
   push errors.no_cpuid
   call halt_with_error32
+  add esp, DWORD_SIZE
 
   ; If it does have cpuid we gotta check for long mode
  .has_cpuid:
@@ -287,11 +292,32 @@ start32:
   ; However, if no long mode, return error messge and halt
   push errors.no_long_mode
   call halt_with_error32
+  add esp, DWORD_SIZE
 
   .has_long_mode:
+  ; then proceed to set up identity paging of the tables
+
+  ; Initialize tables
+  push p4_table
+  push p3_table
+  push p2_table
+  call init_early_table32
+  add esp, DWORD_SIZE*3
+  
+  ; Now initialize compat mode
+  push p4_table
+  call long_mode_compat_enable32
+  add esp, DWORD_SIZE
 
   
-  
+  lgdt [gdt64.pointer]
+  ; update selectors
+  mov ax, gdt64.data
+  mov ss, ax
+  mov ds, ax
+  mov es, ax
+
+  jmp gdt64.code:kmain
 
   ; Kernel finished
   push errors.kernel_finished
@@ -309,17 +335,6 @@ errors:
     db 'Error: No support for long mode (64 bit). Halting.',0
   .kernel_finished: 
     db 'Error: Kernel exited. Halting.',0
-
-; TODO this is another potential gdt that is a lot more opaque
-;gdt64:
-;    dq 0 ; zero entry
-;.code: equ $ - gdt64
-;    dq (1<<44) | (1<<47) | (1<<41) | (1<<43) | (1<<53) ; code segment
-;.data: equ $ - gdt64
-;    dq (1<<44) | (1<<47) | (1<<41) ; data segment
-;.pointer:
-;    dw $ - gdt64 - 1
-;    dq gdt64
 
 ; From https://wiki.osdev.org/Setting_Up_Long_Mode
 gdt64:                           ; Global Descriptor Table (64-bit).
