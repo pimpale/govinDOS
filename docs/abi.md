@@ -5,11 +5,10 @@ GovinDOS is an only 64 bit operating system. While there are some 32 bit functio
 * Scratch registers are rax, rbx, rcx, rdx, rsi, rdi, r8, r9
 * Preserved registers are rbp, rsp, r10, r11, r12, r13, r13, r14, r15
 * The first 8 Integer arguments (char, short, int, long) are placed in the scratch registers in the order rax, rbx, rcx, rdx, rsi, rdi, r8, r9. The rest are placed onto the stack (Right to left)
-* Return values are passed in the scratch registers, in the above order. This allows returning multiple values from a function. However, this is only up to 8. It is not possible to return more than 8 values from a function.
-* TODO how do we return structs? 
+* Return values are passed in the scratch registers, in the above order. This allows returning multiple values from a function. However, this is only up to 8. Beyond that, the caller must allocate space for the return arguments in the stack, above the arguments.  It is not possible to return a variable amount of values from a function.
+* Structs shall be broken down into their respective 
 
 In addition, for variadic functions, the first argument shall be the number of values provided (not including this first argument)
-Similarily, for variadic returns, the first return value shall be the number of values returned (not including this first return). 
 
 ### Examples
 
@@ -32,7 +31,7 @@ The foo function calls malloc and handles a potential error.
 ; }
 
 malloc:
-  ; Preserve the old base pointer and then set it
+  ; Preserve the old frame pointer and then set it
   ; This also aligns the stack since RIP has been pushed. 
   ; Pushing rbp allows it to be once more 16 byte aligned
   push rbp
@@ -121,7 +120,7 @@ The following example shows an example of a variadic function. The function prin
 
 ```nasm
 ; /* printf: Prints formatted arguments */
-; Error printf(U64 argc, Void** argv){
+; U64 printf(U64 argc, Void** argv){
 ;   if(argc == 0) {
 ;     return(INVALID_ARGS);
 ;   }
@@ -179,4 +178,166 @@ HELLO_WORLD_MSG: db "hello world, %d",0
 
 ```
 
+#### Many arguments and return values
+The following example shows an example of a function utilizing structs, demonstrating the correct way to handle them The struct overflows the registers and must be partially stored in the stack. Each field of the struct is stored in a register. Function increment accepts a large struct, performs an operation on a struct, and then proceeds to return it. increment is called by the function foo.
 
+
+```nasm
+
+; /* A struct containing 10 values */
+; typedef struct {
+;   U64 var1;
+;   U64 var2;
+;   U64 var3;
+;   U64 var4;
+;   U64 var5;
+;   U64 var6;
+;   U64 var7;
+;   U64 var8;
+;   U64 var9;
+;   U64 var10;
+; } Dectet;
+; 
+; /* Foolish mechanism to increment every field on a struct */
+; Dectet increment(Dectet src) {
+;   src.var1++;
+;   src.var2++;
+;   src.var3++;
+;   src.var4++;
+;   src.var5++;
+;   src.var6++;
+;   src.var7++;
+;   src.var8++;
+;   src.var9++;
+;   src.var10++;
+;   return src;
+; }
+
+increment:
+  ; We preserve the old frame pointer and create a new frame
+  push rbp
+  mov rbp, rsp
+
+  ; increment everything held on the registers
+  inc rax
+  inc rbx
+  inc rcx
+  inc rdx
+  inc rsi
+  inc rdi
+  inc r8
+  inc r9
+  
+  ; We'll need to save the value of a register or two so we can use 
+  ; it to do other stuff
+  push r10
+
+  ; save src.var9 in r10
+  ; In the govinDOS ABI the stack arguments will start at the base pointer 
+  ; plus some space for RIP and RBP (that is why we have the +2) Since 
+  ; each of these values is a qword, that gives us 16 bytes of offset
+  mov r10, [rbp + (0+2)*8]
+  inc r10
+
+  ; Now we must put this into the space reserved for the return arguments 
+  ; by the caller. The caller knows that 2 qwords of stack space is reserved 
+  ; for the remainder of this massive struct. But above this is space for the
+  ; two qwords of the struct that don't fit on the return stack.
+  ; We will copy the value to that location. This location is 4 qwords away
+  ; 2 for rip and rbp, and 2 for the arguments
+
+  mov [rbp + (0+4)*8], r10 ; var9
+
+  ; repeat the process for the second arg
+
+  mov r10, [rbp + (1+2)*8] ; var10
+  inc r10
+  mov [rbp + (1+4)*8], r10
+
+  ; now we can restore r10
+  pop r10
+
+  ; Destroy stack frame
+  pop rbp
+  ret
+
+
+; /* 
+;  * Foo initializes the Dectet to 0, and then makes a call to increment.
+;  * Why memset was not used, we may never know.
+;  */
+; Void foo() {
+;   Dectet d = { 0 };
+;   d = increment(d);
+;   d = increment(d);
+;   /* alternatively
+;    * d.increment().increment();
+;    * in this C variant
+;    */
+; }
+foo:
+  ; Create stack frame
+  push rbp
+  mov rbp, rsp
+
+  ; free a few registers to work with
+  push r10
+  push r11
+
+  ; we need to create space for the function's return
+  ; We give enough space for 2 qwords, 16 bytes. This is var9 and var10
+  
+  sub rsp, 2*8
+
+  ; zero rax
+  mov rax, 0 ; var1
+
+  ; now zero all other registers
+  mov rbx, rax ; var2
+  mov rcx, rax ; var3
+  mov rdx, rax ; var4
+  mov rsi, rax ; var5
+  mov rdi, rax ; var6
+  mov r8, rax  ; var7
+  mov r9, rax  ; var8
+
+  ; Since there are two more args, we need to push them onto the stack
+  push rax ; var10
+  push rax ; var9
+
+  ; Now we can finally call increment
+  call increment
+  ; drop old args
+  add rsp, 2*8
+  
+  ; we can reuse the space we used for the return args of this function 
+  ; for the next function call's return space. however, we do need to push 
+  ; the the args, which are the returns of the just called func
+
+  ; we've already saved r10 and r11
+
+  pop r10 ; var9
+  pop r11 ; var10
+
+  ; save space for returns
+  sub rsp, 2*8
+
+  ; push args
+  push r11 ; var10
+  push r10 ; var0
+
+  ; call increment again
+  call increment
+
+  ; we can discard this return because we wont be using it for anything
+  ; drop args and return values
+  add rsp, 4*8
+
+  ; restore r10 and r11
+  pop r11
+  pop r10
+
+  ; destroy stack frame and exit procedure
+  pop rbp
+  ret
+```
