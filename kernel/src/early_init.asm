@@ -1,25 +1,7 @@
 [BITS 32]
 
-; macros
-
-%define DWORD_SIZE 4
-
-%define argaddr(x) ebp + (x+2)*DWORD_SIZE
-%define arg(x) [argaddr(x)]
-
-; Preserves base pointer and sets it
-%macro proc32 0
-  push ebp 
-  mov ebp, esp 
-%endmacro
-
-; Ends procedure and returns
-%macro endproc32 0
-  pop ebp ; restore base pointer
-  ret
-%endmacro
-
 ; constants
+%include "call.mac"
 %include "vga.mac"
 %include "cr.mac"
 %include "cpuid.mac"
@@ -29,6 +11,7 @@
 %define STACK_SIZE 0x4000           ; 16384 bytes (16 kb) for stack
 
 [EXTERN kmain]
+[EXTERN kinit]
 
 ; This is all executable code
 [SECTION .text] 
@@ -47,7 +30,7 @@ halt_with_error32: proc32
   call vga_clear_screen32
 
   ; Call print with first arg
-  mov eax, arg(0)
+  mov eax, arg32(0)
   push eax
   call vga_print32
   add esp, DWORD_SIZE ; pop stack
@@ -123,8 +106,8 @@ endproc32
 ; arg0: foreground color, as defined in vga.asm
 ; arg1: background color, as defined in vga.asm
 vga_color32: proc32
-  mov eax, arg(0) ; fg
-  mov ecx, arg(1) ; bg
+  mov eax, arg32(0) ; fg
+  mov ecx, arg32(1) ; bg
   shl ecx, 4 
   or  eax, ecx ; fg | bg << 4
 endproc32
@@ -133,8 +116,8 @@ endproc32
 ; arg0: 8 bit character
 ; arg1: vga_color created by vga_color32
 vga_entry32: proc32
-  mov eax, arg(0) ; character
-  mov ecx, arg(1) ; vga_color
+  mov eax, arg32(0) ; character
+  mov ecx, arg32(1) ; vga_color
   shl ecx, 8 ; color << 8
   or eax, ecx ; character | color
 endproc32
@@ -143,7 +126,7 @@ endproc32
 ; arg0: the color to clear the screen with
 vga_clear_screen32: proc32
 
-  mov eax, arg(0) ; arg0 is the color
+  mov eax, arg32(0) ; arg0 is the color
 
   ; get vga entry using provided color
   ; push args for next proc
@@ -167,7 +150,7 @@ endproc32
 
 ; Print vga chars to beginning, overwriting what is there, using pointer to null terminated string (arg0)
 vga_print32: proc32
-  mov edx, arg(0) ; Move the arg0 here
+  mov edx, arg32(0) ; Move the arg0 here
   mov ecx, 0 ; this register will serve as the counter
   .loop:
     mov al, [edx+ecx] ; Get a char from the string
@@ -191,7 +174,7 @@ endproc32
 ; arg0 is a pointer to the p4 paging table
 long_mode_compat_enable32: proc32
   ; move page table address to cr3
-  mov eax, arg(0) ; arg0 is the p4 table
+  mov eax, arg32(0) ; arg0 is the p4 table
   mov cr3, eax
 
   ; enable PAE
@@ -230,16 +213,16 @@ init_early_table32: proc32
 
   ; Point the first entry of the level 4 page table to the first entry in the
   ; p3 table
-  mov eax, arg(1) ;p3_table
+  mov eax, arg32(1) ;p3_table
   or eax, 11b ; 
-  mov ecx, arg(2) ; p4_table
+  mov ecx, arg32(2) ; p4_table
   mov dword [ecx + 0], eax
 
   ; Point the first entry of the level 3 page table to the first entry in the
   ; p2 table
-  mov eax, arg(0) ;p2_table
+  mov eax, arg32(0) ;p2_table
   or eax, 11b
-  mov ecx, arg(1) ; p3_table
+  mov ecx, arg32(1) ; p3_table
   mov dword [ecx + 0], eax
 
   ; point each page table level two entry to a page
@@ -317,7 +300,7 @@ start32:
   mov ds, ax
   mov es, ax
 
-  jmp gdt64.code:kmain
+  jmp gdt64.code:kinit
 
   ; Kernel finished
   push errors.kernel_finished

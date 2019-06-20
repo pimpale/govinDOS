@@ -40,6 +40,7 @@ make() {
   assemble header.asm
   assemble early_init.asm
   assemble init.asm
+  assemble vga.asm
   link
 }
 
