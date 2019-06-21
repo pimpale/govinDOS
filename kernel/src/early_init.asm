@@ -150,6 +150,9 @@ endproc32
 
 ; Print vga chars to beginning, overwriting what is there, using pointer to null terminated string (arg0)
 vga_print32: proc32
+  ; save ebx
+  push ebx
+
   mov edx, arg32(0) ; Move the arg0 here
   mov ecx, 0 ; this register will serve as the counter
   .loop:
@@ -166,6 +169,8 @@ vga_print32: proc32
     inc ecx
     jmp .loop
   .end:
+  ; restore ebx
+  pop ebx
 endproc32
 
 

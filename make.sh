@@ -49,7 +49,10 @@ runiso() {
 
 runkernel() {
   make
-	qemu-system-x86_64 -monitor stdio -no-shutdown -no-reboot -d int \
+	qemu-system-x86_64 \
+    -no-shutdown \
+    -no-reboot -d int \
+    -debugcon stdio \
     -kernel bin/sysroot/boot/kernel.bin
 } 
 

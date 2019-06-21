@@ -12,5 +12,7 @@ kinit:
   call kmain
 
 kmain: proc
+  mov eax, 'X'
+  out 0xe9, eax
   hlt
 endproc

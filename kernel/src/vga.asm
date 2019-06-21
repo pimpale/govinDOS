@@ -7,8 +7,9 @@
 [SECTION .text] 
 
 ; get vga color from foreground (arg0) and background (arg1)
-; arg0: foreground color, as defined in vga.asm
-; arg1: background color, as defined in vga.asm
+; arg0: foreground color, as defined in vga.mac
+; arg1: background color, as defined in vga.mac
+; ret0: vga_color, a combination of background and foreground
 vga_color: proc
   shl rbx, 4 
   or  rax, rbx ; fg | bg << 4
@@ -31,7 +32,7 @@ vga_clear_screen: proc
   mov rbx, rax
   mov rax, ' ' ; Char to clear screen with
   call vga_entry32
-  ;  is now stored in rax
+  ; vga_entry  is now stored in rax
 
   mov rcx, VGA_BUFFER_LEN ; ecx is counter
   mov rdi, VGA_BUFFER_ADDR ; Location to write to
@@ -41,22 +42,30 @@ vga_clear_screen: proc
   rep stosw
 endproc
 
-; Print vga chars to beginning, overwriting what is there, using pointer to null terminated string (arg0)
+; Print vga chars to beginning, overwriting what is there, using pointer to string (arg0) and length of string
+; arg0: pointer to string
+; arg1: length of string
+; returns error if 
 vga_print: proc
-  mov edx, arg(0) ; Move the arg0 here
-  mov ecx, 0 ; this register will serve as the counter
+  ; rax contains string pointer
+  ; rbx contains the length of a string
+  ; rcx contains the counter 
+  
+  mov rcx, 0 ; this register will serve as the counter
   .loop:
-    mov al, [edx+ecx] ; Get a char from the string
+    mov al, [rax+rcx] ; Get a char from the string
 
-    ; exit if null
-    cmp al, 0
-    je .end
+    ; exit if we are going to exceed the string length
+    cmp rcx, rbx
+    jge .end
+
     ; exit if we are going to exceed the limit 
     cmp ecx, VGA_BUFFER_LEN
     jge .end
     ; move char to buffer
     mov [VGA_BUFFER_ADDR+ecx*2], byte al 
     inc ecx
+    dec rbx
     jmp .loop
   .end:
 endproc
