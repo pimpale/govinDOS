@@ -12,7 +12,17 @@ kinit:
   call kmain
 
 kmain: proc
-  mov eax, 'X'
-  out 0xe9, eax
+  mov rax, message
+  mov rbx, 5
+  call vga_print
+
+  mov rax, 'X'
+  out 0xe9, rax
   hlt
 endproc
+
+
+[SECTION .data]
+message: db "hello"
+
+

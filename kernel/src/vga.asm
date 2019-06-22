@@ -42,6 +42,15 @@ vga_clear_screen: proc
   rep stosw
 endproc
 
+; Places specified vga_char (arg0) at location x (arg1) and y (arg2)
+; arg0: vga_char 
+; arg1: x location (x values greater than VGA_XSIZE will be ignored)
+; arg2: y location (y values greater than VGA_YSIZE will be ignored)
+; no return
+vga_putchar: proc
+
+endproc
+
 ; Print vga chars to beginning, overwriting what is there, using pointer to string (arg0) and length of string
 ; arg0: pointer to string
 ; arg1: length of string
