@@ -18,23 +18,17 @@ endproc
 ; create vga entry from character (arg0) and vga_color (arg1)
 ; arg0: 8 bit character
 ; arg1: vga_color created by vga_color32
-vga_entry32: proc
+vga_entry: proc
   shl rbx, 8 ; color << 8
   or rax, rbx ; character | color
 endproc
 
 ; This clears the screen with space characters with the given color arg0
-; arg0: the color to clear the screen with
-vga_clear_screen: proc
-
-  ; get vga entry using provided color
-  ; move color to 2nd arg
-  mov rbx, rax
-  mov rax, ' ' ; Char to clear screen with
-  call vga_entry32
+; arg0: the vga_entry to clear the screen with
+vga_fill_screen: proc
   ; vga_entry  is now stored in rax
 
-  mov rcx, VGA_BUFFER_LEN ; ecx is counter
+  mov rcx, VGA_BUFFER_LEN  ; ecx is counter
   mov rdi, VGA_BUFFER_ADDR ; Location to write to
   cld ; Copy forwards
 
@@ -48,34 +42,24 @@ endproc
 ; arg2: y location (y values greater than VGA_YSIZE will be ignored)
 ; no return
 vga_putchar: proc
+  ; ensure there are no out of bound mem writes
+  cmp rbx, VGA_XSIZE 
+  jae .end
+  cmp rcx, VGA_YSIZE 
+  jae .end
 
-endproc
+  ; preserve vga char and move xsize to accumulator
+  mov rsi, rax
+  mov rax, rbx
 
-; Print vga chars to beginning, overwriting what is there, using pointer to string (arg0) and length of string
-; arg0: pointer to string
-; arg1: length of string
-; returns error if 
-vga_print: proc
-  ; rax contains string pointer
-  ; rbx contains the length of a string
-  ; rcx contains the counter 
+  ; find buffer index to write to
+  mul rcx
+  add rax, rbx
   
-  mov rcx, 0 ; this register will serve as the counter
-  .loop:
-    mov al, [rax+rcx] ; Get a char from the string
+  ; rax now contains the index to write to
+  ; write to location
+  mov [VGA_BUFFER_ADDR+rax*2], word si
 
-    ; exit if we are going to exceed the string length
-    cmp rcx, rbx
-    jge .end
-
-    ; exit if we are going to exceed the limit 
-    cmp ecx, VGA_BUFFER_LEN
-    jge .end
-    ; move char to buffer
-    mov [VGA_BUFFER_ADDR+ecx*2], byte al 
-    inc ecx
-    dec rbx
-    jmp .loop
-  .end:
+  .end
 endproc
 
