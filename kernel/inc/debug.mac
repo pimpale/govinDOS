@@ -1,0 +1,4 @@
+%define DBG_SERIAL 1         ; Determines if should print to serial
+%define DBG_SERIAL_PORT 0xe9 ; Port to print messages to
+%define DBG_RING_BUF_LEN 0x10000 ; 16 kb ring buffer
+%define DBG_MSG_SIZE 0x40 ; 64
