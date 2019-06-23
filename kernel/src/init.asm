@@ -1,24 +1,24 @@
 [BITS 64]
 
 %include "call.mac"
+%include "debug.mac"
 
-[GLOBAL kinit]
-[GLOBAL kmain]
+[EXTERN dbg_serial_put]
+
 
 [SECTION .text]
 
-; this isn't actually a function, but it does call the real kmain
+; Not actual method, just starting point for 64 bit kernel
+[GLOBAL kinit]
 kinit:
   call kmain
-
-kmain: proc
-  mov rax, message
-  mov rbx, 5
-  call vga_print
-
-  mov rax, 'X'
-  out 0xe9, rax
   hlt
+
+[GLOBAL kmain]
+kmain: proc
+  mov rax, 1
+  mov rbx, message
+  call dbg_serial_put
 endproc
 
 

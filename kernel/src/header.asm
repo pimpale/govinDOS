@@ -1,5 +1,5 @@
 [BITS 32]
-; Include externs
+; Include and externs
 
 %include "multiboot.mac"
 
@@ -7,7 +7,7 @@
 [EXTERN BOOT_LOAD_ADDR]
 [EXTERN BOOT_LOAD_END_ADDR]
 [EXTERN BOOT_BSS_END_ADDR]
-[EXTERN start32]
+[EXTERN early_init]
 
 MULTIBOOT_HEADER_FLAGS		equ MULTIBOOT_PAGE_ALIGN | MULTIBOOT_MEMORY_INFO | MULTIBOOT_AOUT_KLUDGE		
 MULTIBOOT_HEADER_CHECKSUM	equ -(MULTIBOOT_HEADER_MAGIC + MULTIBOOT_HEADER_FLAGS)
@@ -27,4 +27,4 @@ align 4
   dd BOOT_LOAD_ADDR ;state of kernel .text (code) section
   dd BOOT_LOAD_END_ADDR ; start of bss section
   dd BOOT_BSS_END_ADDR ; end of bss section
-  dd start32 ; kernel entry point (initial EIP)
+  dd early_init ; kernel entry point (initial EIP)

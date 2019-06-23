@@ -1,5 +1,5 @@
 OUTPUT_FORMAT("binary")
-ENTRY(start32)
+ENTRY(early_init)
 SECTIONS
 {
   /* Where the kernel physically is in memory */

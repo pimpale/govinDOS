@@ -1,8 +1,0 @@
-%define ERROR_SUCCESS 0
-%define ERROR_NOSPACE 1
-
-
-
-%define ERROR_SUCCESS_MSG "Success"
-%define ERROR_SUCCESS_MSG ""
-
