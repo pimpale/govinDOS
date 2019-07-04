@@ -29,7 +29,7 @@ vga_fill_screen: proc
   ; vga_entry  is now stored in rax
 
   mov rcx, VGA_BUF_LEN  ; ecx is counter
-  mov rdi, VGA_BUF_ADDR ; Location to write to
+  mov rdi, VGA_BUF_PTR ; Location to write to
   cld ; Copy forwards
 
   ; Fill in buffer with value in ax 
@@ -58,7 +58,7 @@ vga_putchar: proc
   
   ; rax now contains the index to write to
   ; write to location
-  mov [VGA_BUF_ADDR+rax*2], word si
+  mov [VGA_BUF_PTR+rax*2], word si
   .end:
 endproc
 

@@ -106,7 +106,7 @@ early_vga_clear_screen: proc32
 
   push edi ; Preserve this register
 
-  mov edi, VGA_BUF_ADDR ; Location to write to
+  mov edi, VGA_BUF_PTR ; Location to write to
 
   cld ; Copy forwards
 
@@ -129,7 +129,7 @@ early_vga_print: proc32
     cmp ecx, VGA_BUF_LEN
     jge .end
     ; move char to buffer
-    mov [VGA_BUF_ADDR+ecx*2], byte al
+    mov [VGA_BUF_PTR+ecx*2], byte al
     inc ecx
     jmp .loop
   .end:
@@ -140,13 +140,13 @@ endproc32
 ; It is still necessary to load a gdt after this to enter true 64 bit mode
 ; arg0 is a pointer to the p4 paging table
 early_long_mode_compat_enable: proc32
-  ; move page table address to cr3
+  ; move page table ptress to cr3
   mov eax, arg32(0) ; arg0 is the p4 table
   mov cr3, eax
 
   ; enable PAE
   mov eax, cr4
-  or eax, CR4_PAE ; physical address extension bit on cr4
+  or eax, CR4_PAE ; physical ptress extension bit on cr4
   mov cr4, eax
 
   ; TODO pls export this to a file so we dont have magic numbers
@@ -213,7 +213,7 @@ early_init:
 
   ; To set up a stack, we set the esp register to point to the top of our
   ; stack (as it grows downwards on x86 systems).
-  mov esp, stack_top
+  mov esp, stack_top_ptr
 
   cmp eax, MULTIBOOT_BOOT_REGISTER_MAGIC ; multiboot1 magic value
   je .has_multiboot ; If it was booted with multiboot
@@ -300,9 +300,9 @@ gdt64:                           ; Global Descriptor Table (64-bit).
 
 ; Stack must be 16 byte aligned
 align 16
-stack_bottom:
+stack_bottom_ptr:
 resb STACK_SIZE ; 16 KiB
-stack_top:
+stack_top_ptr:
 
 align PAGE_SIZE
 p4_table:

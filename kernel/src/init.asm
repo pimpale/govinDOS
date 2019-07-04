@@ -19,9 +19,10 @@ kinit:
 
 [GLOBAL kmain]
 kmain: proc
+  call log_init
   mov rax, 5
   mov rbx, message
-  call debug_write
+  call log_write
 endproc
 
 

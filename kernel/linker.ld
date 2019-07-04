@@ -3,33 +3,33 @@ ENTRY(early_init)
 SECTIONS
 {
   /* Where the kernel physically is in memory */
-  KERNEL_PHYS_ADDR = 0x10000;
+  KERNEL_PHYS_PTR = 0x10000;
 
   /* We start 1M away */
-  . += KERNEL_PHYS_ADDR;
+  . += KERNEL_PHYS_PTR;
 
   .text :
   {
-    BOOT_LOAD_ADDR = .;
-    BOOT_HEADER_ADDR = .;
+    BOOT_LOAD_PTR = .;
+    BOOT_HEADER_PTR = .;
     *(.header);
     *(.text*);
     . = ALIGN(4K);
   }
 
-  .data : 
+  .data :
   {
     *(.data*);
-    BOOT_LOAD_END_ADDR = .;
+    BOOT_LOAD_END_PTR = .;
     . = ALIGN(4K);
   }
 
-  .bss : 
+  .bss :
   {
-    BOOT_BSS_ADDR = .;
+    BOOT_BSS_PTR = .;
     *(.bss*);
     *(COMMON);
-    BOOT_BSS_END_ADDR = .;
+    BOOT_BSS_END_PTR = .;
     . = ALIGN(4K);
   }
 }
