@@ -1,0 +1,1 @@
+%define DBG_LOG_BUF_LEN 0x10000 ; 16 kb ring buffer

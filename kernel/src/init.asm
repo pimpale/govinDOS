@@ -3,7 +3,7 @@
 %include "call.mac"
 %include "debug.mac"
 
-[EXTERN dbg_serial_put]
+[EXTERN dbg_log_init]
 
 
 [SECTION .text]
@@ -16,6 +16,7 @@ kinit:
 
 [GLOBAL kmain]
 kmain: proc
+  call db_log_init
   mov rax, 1
   mov rbx, message
   call dbg_serial_put
