@@ -3,22 +3,17 @@
 [BITS 64]
 [SECTION .text]
 
-; LogEntry:
-;   priority: U64
-;   time: U64
-;   text: U8[0x30]
-
-; Initializes debug log ring buffer. Must be called before debug log put
+; Initializes log ring buffer. Must be called before debug log put
 ; no args
 ; returns void
-[GLOBAL dbg_log_init]
-dbg_log_init: proc
+[GLOBAL log_init]
+log_init: proc
   ; TODO get lock on ring
 
   ; fills ring buffer with zero
   mov rax, 0
   mov rcx, DBG_LOG_BUF_LEN
-  rep stosb 
+  rep stosb
 
   ; initialize ring write head
   mov rax, ring_buffer
@@ -28,85 +23,46 @@ dbg_log_init: proc
 
 endproc
 
-
-; Places log message in ring log and prints it out to the serial port
-; arg0 priority
-; arg1 pointer to string message
-[GLOBAL dbg_put]
-dbg_put: proc
-  ; save args
-  push rax
-  push rbx
-  ; print to serial out
-  call dbg_serial_put
-
-  ; restore args
-  pop rbx
-  pop rax
-
-  ; put it in log
-  call dbg_log_put
-  
-endproc 
-
-; Places debug message in serial port
-; arg0 priority
-; arg1 pointer to string message 
-; returns void
-[GLOBAL dbg_serial_put]
-dbg_serial_put: proc
-  mov rdx, DBG_SERIAL_PORT ; print to correct port
-  mov rsi, rbx             ; move arg1 to source
-  mov rcx, DBG_MSG_SIZE    ; print out fixed num of bytes
-  cld                      ; copy forward
-  rep outsb                ; output bytes
-endproc
-
-
-; Places debug messge in ring log with priority (arg0) 
-; arg0 priority
+; Places message (arg1) with length (arg0) onto the debug log
+; arg0 string len
 ; arg1 pointer to string message
 ; returns void
-[GLOBAL dbg_log_put]
-dbg_log_put: proc 
+[GLOBAL log_write]
+log_write: proc
   ; TODO get lock on ring
 
-  mov rdi, [ring_write_head]
-  mov [rdi], rax ; write priority
+  mov rsi, rbx             ; set string source
+  mov rdi, ring_write_head ; set string destination
+  mov rcx, rax             ; set size of message
   
-  ; rdi points at slot for priority
-  add rdi, QWORD_SIZE
-  ; write time
-  ; TODO get time, write it
-  ; mov [rdi], rax
-  
-  ; rdi points at slot for message 
-  add rdi, QWORD_SIZE
+  .loop:
+    ; check if we've hit the end
+    test rcx
+    jz .end
 
-  ; set the source to the string message pointer
-  ; rdi already contains source
-  mov rsi, rbx
+    ; if there's going to be an overflow move to the end
+    cmp rdi, log_buf_end_addr
+    jb .no_overflow
 
-  mov rcx, DBG_MSG_SIZE      ; set size of message
-  cld                        ; copy forward
-  rep movsb                  ; write message
+    sub rdi, DBG_LOG_BUF_LEN ; if there is an overflow,
 
-  ; move the pointer back to if it's too large
-  cmp rdi, DBG_LOG_BUF_LEN
-  jb .no_overflow 
-  sub rdi, DBG_LOG_BUF_LEN
+    .no_overflow:
+    ; now move it
+    movsb
+    jmp .loop
 
-  .no_overflow:
+  .end:
   mov [ring_write_head], rdi ; update write_head
-  
   ; TODO release lock
 endproc
 
 [SECTION .data]
-ring_lock: dq 0
-ring_write_head: dq 0
+log_lock: dq 0
+log_write_head_addr: dq 0
 
 
-; This reserves 16 kb of space for the kernel ring buffer
+; This reserves 16 kb of space for the log ring buffer
 [SECTION .bss]
-ring_buffer: resb DBG_LOG_BUF_LEN
+log_buf_addr:
+resb DBG_LOG_BUF_LEN
+log_buf_end_addr:
