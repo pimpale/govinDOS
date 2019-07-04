@@ -9,9 +9,9 @@
 [EXTERN BOOT_BSS_END_PTR]
 [EXTERN early_init]
 
-MULTIBOOT_HEADER_FLAGS		equ MULTIBOOT_PAGE_ALIGN | MULTIBOOT_MEMORY_INFO | MULTIBOOT_AOUT_KLUDGE		
-MULTIBOOT_HEADER_CHECKSUM	equ -(MULTIBOOT_HEADER_MAGIC + MULTIBOOT_HEADER_FLAGS)
- 
+MULTIBOOT_HEADER_FLAGS    equ MULTIBOOT_PAGE_ALIGN | MULTIBOOT_MEMORY_INFO | MULTIBOOT_AOUT_KLUDGE
+MULTIBOOT_HEADER_CHECKSUM equ -(MULTIBOOT_HEADER_MAGIC + MULTIBOOT_HEADER_FLAGS)
+
 ; Declare a multiboot header that marks the program as a kernel. These are magic
 ; values that are documented in the multiboot standard. The bootloader will
 ; search for this signature in the first 8 KiB of the kernel file, aligned at a
