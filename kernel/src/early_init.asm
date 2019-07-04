@@ -7,14 +7,14 @@
 %include "cpuid.mac"
 %include "multiboot.mac"
 
-%define PAGE_SIZE  0x1000           ; 4096 bytes 
+%define PAGE_SIZE  0x1000           ; 4096 bytes
 %define STACK_SIZE 0x4000           ; 16384 bytes (16 kb) for stack
 
 [EXTERN kinit]
 [EXTERN kmain]
 
 ; This is all executable code
-[SECTION .text] 
+[SECTION .text]
 
 ; This function prints an error (arg0) to the screen and then halts forever
 early_halt_with_error: proc32
@@ -45,8 +45,8 @@ early_halt: proc32
     jmp .hang
 endproc32
 
-; This will check if the cpu supports long mode (1 if yes, 0 if no) Make 
-; sure to check for cpuid 
+; This will check if the cpu supports long mode (1 if yes, 0 if no) Make
+; sure to check for cpuid
 ; No args
 early_check_long_mode_support: proc32
   mov eax, CPUID_GET_EXT_FUNC          ; Set the A-register to 0x80000000.
@@ -61,10 +61,10 @@ early_check_long_mode_support: proc32
 
   mov eax, 1 ; Yes, it is supported
   jmp .end
-  
+
   .nolong:
     mov eax, 0 ; No, it's not supported
-    
+
   .end:
 endproc32
 
@@ -75,7 +75,7 @@ endproc32
 early_vga_color: proc32
   mov eax, arg32(0) ; fg
   mov ecx, arg32(1) ; bg
-  shl ecx, 4 
+  shl ecx, 4
   or  eax, ecx ; fg | bg << 4
 endproc32
 
@@ -100,7 +100,7 @@ early_vga_clear_screen: proc32
   push eax
   push ' ' ; Char to clear screen with
   call early_vga_entry
-  add esp, DWORD_SIZE*2 ; Pop stack 
+  add esp, DWORD_SIZE*2 ; Pop stack
 
   mov ecx, VGA_BUF_LEN ; ecx is counter
 
@@ -112,7 +112,7 @@ early_vga_clear_screen: proc32
 
   ; Fill in buffer with value
   rep stosw
-  pop edi ; Restore edi 
+  pop edi ; Restore edi
 endproc32
 
 ; Print vga chars to beginning, overwriting what is there, using pointer to null terminated string (arg0)
@@ -125,18 +125,18 @@ early_vga_print: proc32
     ; exit if null
     cmp al, 0
     je .end
-    ; exit if we are going to exceed the limit 
+    ; exit if we are going to exceed the limit
     cmp ecx, VGA_BUF_LEN
     jge .end
     ; move char to buffer
-    mov [VGA_BUF_ADDR+ecx*2], byte al 
+    mov [VGA_BUF_ADDR+ecx*2], byte al
     inc ecx
     jmp .loop
   .end:
 endproc32
 
 
-; Enables long mode compatibility mode using page table pointed to by arg0 
+; Enables long mode compatibility mode using page table pointed to by arg0
 ; It is still necessary to load a gdt after this to enter true 64 bit mode
 ; arg0 is a pointer to the p4 paging table
 early_long_mode_compat_enable: proc32
@@ -166,21 +166,21 @@ endproc32
 ; Initializes a page table identity mapping the first 2 MiB with huge pages
 ;
 ; This table is necessary to enter long mode, and should be replaced
-; by the 64bit kernel. Since we are mapping only a tiny amount of 
+; by the 64bit kernel. Since we are mapping only a tiny amount of
 ; space for the initial kernel, all we really need is a few MiB.
-; Hence, we only accept 1 of each level. 
+; Hence, we only accept 1 of each level.
 ;
 ; arg0 pointer to uninitialized memory for page table level 2
 ; arg1 pointer to uninitialized memory for page table level 3
 ; arg2 pointer to uninitialized memory for page table level 4
 ; returns nothing
 early_init_early_table: proc32
-  ; TODO less hacks, need to remove magic numbers. 
+  ; TODO less hacks, need to remove magic numbers.
 
   ; Point the first entry of the level 4 page table to the first entry in the
   ; p3 table
   mov eax, arg32(1) ;p3_table
-  or eax, 11b ; 
+  or eax, 11b ;
   mov ecx, arg32(2) ; p4_table
   mov dword [ecx + 0], eax
 
@@ -243,13 +243,13 @@ early_init:
   push p2_table
   call early_init_early_table
   add esp, DWORD_SIZE*3
-  
+
   ; Now initialize compat mode
   push p4_table
   call early_long_mode_compat_enable
   add esp, DWORD_SIZE
 
-  
+
   lgdt [gdt64.pointer]
   ; update selectors
   mov ax, gdt64.data
@@ -259,13 +259,13 @@ early_init:
 
   jmp gdt64.code:kinit
 
- 
+
 [SECTION .data]
 
 errors:
-  .no_multiboot: 
+  .no_multiboot:
     db 'Error: Kernel not booted with multiboot. Halting.',0
-  .no_long_mode: 
+  .no_long_mode:
     db 'Error: No support for long mode (64 bit). Halting.',0
 
 ; From https://wiki.osdev.org/Setting_Up_Long_Mode

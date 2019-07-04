@@ -5,7 +5,7 @@
 %define QWORD_SIZE 8
 
 ; For args above 7, returns the address of an argument on the stack
-; argoff represents the arg number on the stack 
+; argoff represents the arg number on the stack
 ; for example arg8 would be argoff 0, because its first arg on the stack
 %define argaddr(argoff) rbp + (argoff+2)*QWORD_SIZE
 %define arg(argoff) [argaddr(argoff)]
@@ -29,11 +29,11 @@
 %define arg32(arg) [argaddr32(arg)]
 
 %macro proc32 0
-  push ebp 
-  mov ebp, esp 
+  push ebp
+  mov ebp, esp
 %endmacro
 
 %macro endproc32 0
-  pop ebp 
+  pop ebp
   ret
 %endmacro

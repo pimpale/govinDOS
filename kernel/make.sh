@@ -38,6 +38,7 @@ install() {
 # No arguments, makes everything, printing out the path of the finished product
 make() {
   assemble debug.asm
+  assemble log.asm
   assemble early_init.asm
   assemble header.asm
   assemble init.asm

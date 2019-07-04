@@ -19,7 +19,7 @@ kinit:
 
 [GLOBAL kmain]
 kmain: proc
-  mov rax, message_len
+  mov rax, 5
   mov rbx, message
   call debug_write
 endproc
@@ -27,6 +27,5 @@ endproc
 
 [SECTION .data]
 message: db "hello"
-message_len: db 5
 
 

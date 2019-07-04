@@ -5,7 +5,7 @@
 
 ; arg0 number of bytes to print
 ; arg1 pointer to string message
-; returns void
+; returns nothing
 [GLOBAL debug_write]
 debug_write: proc
   mov rdx, DBG_SERIAL_PORT ; print to correct port
