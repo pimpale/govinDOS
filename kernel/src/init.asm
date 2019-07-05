@@ -20,17 +20,17 @@ kinit:
 [GLOBAL kmain]
 kmain: proc
   call log_init
-  mov rax, 5
+  mov rax, 26
   mov rbx, message
   call log_write
 
-  mov rax, 5
+  mov rax, 26
   mov rbx, message
   call debug_write
 endproc
 
 
 [SECTION .data]
-message: db "hello"
+message: db "abcdefghijklmnopqrstuv"
 
 

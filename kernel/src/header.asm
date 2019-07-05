@@ -3,10 +3,10 @@
 
 %include "multiboot.mac"
 
-[EXTERN BOOT_HEADER_PTR]
-[EXTERN BOOT_LOAD_PTR]
-[EXTERN BOOT_LOAD_END_PTR]
-[EXTERN BOOT_BSS_END_PTR]
+[EXTERN BOOT_HEADER]
+[EXTERN BOOT_LOAD]
+[EXTERN BOOT_LOAD_END]
+[EXTERN BOOT_BSS_END]
 [EXTERN early_init]
 
 MULTIBOOT_HEADER_FLAGS    equ MULTIBOOT_PAGE_ALIGN | MULTIBOOT_MEMORY_INFO | MULTIBOOT_AOUT_KLUDGE
@@ -23,8 +23,8 @@ align 4
   dd MULTIBOOT_HEADER_FLAGS
   dd MULTIBOOT_HEADER_CHECKSUM
   ; AOUT kludge
-  dd BOOT_HEADER_PTR ; point to multiboot header
-  dd BOOT_LOAD_PTR ;state of kernel .text (code) section
-  dd BOOT_LOAD_END_PTR ; start of bss section
-  dd BOOT_BSS_END_PTR ; end of bss section
+  dd BOOT_HEADER ; point to multiboot header
+  dd BOOT_LOAD ;state of kernel .text (code) section
+  dd BOOT_LOAD_END ; start of bss section
+  dd BOOT_BSS_END ; end of bss section
   dd early_init ; kernel entry point (initial EIP)

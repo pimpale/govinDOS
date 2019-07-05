@@ -19,6 +19,6 @@
 ; Dimensions and properties of buffer
 %define VGA_XSIZE 80
 %define VGA_YSIZE 25
-%define VGA_BUF_PTR 0xb8000
+%define VGA_BUF 0xb8000
 %define VGA_BUF_LEN VGA_XSIZE * VGA_YSIZE * 2
-%define VGA_BUF_END_PTR VGA_BUF_PTR + VGA_BUF_LEN
+%define VGA_BUF_END VGA_BUF + VGA_BUF_LEN

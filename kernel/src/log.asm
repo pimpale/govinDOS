@@ -16,8 +16,8 @@ log_init: proc
   rep stosb
 
   ; initialize ring write head
-  mov rax, log_buf_ptr
-  mov [log_write_head_ptr_ptr], rax
+  mov rax, log_buf
+  mov [log_write_head_ptr], rax
 
   ; TODO release lock on ring
 
@@ -32,10 +32,10 @@ log_write: proc
   ; TODO get lock on ring
 
   mov rsi, rbx                       ; set string source
-  mov rdi, [log_write_head_ptr_ptr]  ; set string destination
+  mov rdi, [log_write_head_ptr]  ; set string destination
   mov rcx, rax                       ; set size of message
 
-  mov eax, log_buf_ptr
+  mov eax, log_buf
 
   cld
 
@@ -45,7 +45,7 @@ log_write: proc
     jz .end
 
     ; if there's going to be an overflow move to the end
-    cmp rdi, log_buf_end_ptr
+    cmp rdi, log_buf_end
     jb .no_overflow
 
     sub rdi, LOG_BUF_LEN ; if there is an overflow,
@@ -57,18 +57,18 @@ log_write: proc
     jmp .loop
 
   .end:
-  mov [log_write_head_ptr_ptr], rdi ; update write_head
+  mov [log_write_head_ptr], rdi ; update write_head
   ; TODO release lock
 
 endproc
 
 [SECTION .data]
-log_lock_ptr: dq 0
-log_write_head_ptr_ptr: dq 0
+log_lock: dq 0
+log_write_head_ptr: dq 0
 
 
 ; This reserves space for the log ring buffer
 [SECTION .bss]
-log_buf_ptr:
+log_buf:
 resb LOG_BUF_LEN
-log_buf_end_ptr:
+log_buf_end:

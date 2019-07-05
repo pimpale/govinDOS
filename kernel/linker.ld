@@ -3,15 +3,15 @@ ENTRY(early_init)
 SECTIONS
 {
   /* Where the kernel physically is in memory */
-  KERNEL_PHYS_PTR = 0x10000;
+  KERNEL_PHYS = 0x10000;
 
   /* We start 1M away */
-  . += KERNEL_PHYS_PTR;
+  . += KERNEL_PHYS;
 
   .text :
   {
-    BOOT_LOAD_PTR = .;
-    BOOT_HEADER_PTR = .;
+    BOOT_LOAD = .;
+    BOOT_HEADER = .;
     *(.header);
     *(.text*);
     . = ALIGN(4K);
@@ -20,16 +20,16 @@ SECTIONS
   .data :
   {
     *(.data*);
-    BOOT_LOAD_END_PTR = .;
+    BOOT_LOAD_END = .;
     . = ALIGN(4K);
   }
 
   .bss :
   {
-    BOOT_BSS_PTR = .;
+    BOOT_BSS = .;
     *(.bss*);
     *(COMMON);
-    BOOT_BSS_END_PTR = .;
+    BOOT_BSS_END = .;
     . = ALIGN(4K);
   }
 }
