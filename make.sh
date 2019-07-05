@@ -1,6 +1,6 @@
 #!/bin/sh
 
-# A make script to build the system 
+# A make script to build the system
 
 #This script will only work when executed within the root dir of project
 
@@ -33,7 +33,7 @@ make() {
 
 # No arguments, cleans the build directory
 clean() {
-  rm -rf bin 
+  rm -rf bin
 }
 
 cleanall() {
@@ -43,18 +43,18 @@ cleanall() {
 
 runiso() {
   make
-	qemu-system-x86_64 -monitor stdio -no-shutdown -no-reboot -d int \
+  qemu-system-x86_64 -monitor stdio -no-shutdown -no-reboot -d int \
     -cdrom bin/$ISO_NAME
 }
 
 runkernel() {
   make
-	qemu-system-x86_64 \
+  qemu-system-x86_64 \
     -no-shutdown \
+    -monitor stdio \
     -no-reboot -d int \
-    -debugcon stdio \
     -kernel bin/sysroot/boot/kernel.bin
-} 
+}
 
 if [ $# -eq 0 ]; then
   make

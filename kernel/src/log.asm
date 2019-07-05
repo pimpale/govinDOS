@@ -35,6 +35,10 @@ log_write: proc
   mov rdi, [log_write_head_ptr_ptr]  ; set string destination
   mov rcx, rax                       ; set size of message
 
+  mov eax, log_buf_ptr
+
+  cld
+
   .loop:
     ; check if we've hit the end
     cmp rcx, 0
@@ -49,11 +53,13 @@ log_write: proc
     .no_overflow:
     ; now move it
     movsb
+    dec rcx
     jmp .loop
 
   .end:
   mov [log_write_head_ptr_ptr], rdi ; update write_head
   ; TODO release lock
+
 endproc
 
 [SECTION .data]
@@ -61,7 +67,7 @@ log_lock_ptr: dq 0
 log_write_head_ptr_ptr: dq 0
 
 
-; This reserves 16 kb of space for the log ring buffer
+; This reserves space for the log ring buffer
 [SECTION .bss]
 log_buf_ptr:
 resb LOG_BUF_LEN

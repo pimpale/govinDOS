@@ -23,6 +23,10 @@ kmain: proc
   mov rax, 5
   mov rbx, message
   call log_write
+
+  mov rax, 5
+  mov rbx, message
+  call debug_write
 endproc
 
 
