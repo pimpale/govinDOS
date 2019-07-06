@@ -19,13 +19,21 @@
 ;     theGate->reserved = 0;
 ; }
 
-; initializes a trap gate located 
+; initializes a trap gate handling interrupt arg0 
 
-
+idt_set_int_gate:
+  
 
 
 
 [SECTION .data]
+
+idtr
+
+[SECTION .bss]
+idt:
+resb 8*256
+
 
 ; struct Gate {
 ;     unsigned short offsetlo;    //   : 16;
