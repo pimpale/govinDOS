@@ -43,6 +43,7 @@ make() {
   assemble header.asm
   assemble init.asm
   assemble vga.asm
+  assemble gdt.asm
   link
 }
 

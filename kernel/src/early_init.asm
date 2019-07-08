@@ -10,8 +10,8 @@
 %define PAGE_SIZE  0x1000           ; 4096 bytes
 %define STACK_SIZE 0x4000           ; 16384 bytes (16 kb) for stack
 
-[EXTERN kinit]
-[EXTERN kmain]
+[EXTERN init]
+[EXTERN main]
 
 [EXTERN gdt]
 [EXTERN gdt.code]
