@@ -13,3 +13,70 @@
 %define IDT_GATE_DPL_1 1 ; unused
 %define IDT_GATE_DPL_2 2 ; unused
 %define IDT_GATE_DPL_3 3 ; user mode
+
+%macro pushscratch 0
+  push rax
+  push rbx
+  push rcx
+  push rdx
+  push rsi
+  push rdi
+  push r8
+  push r9
+%endmacro
+
+%macro popscratch 0
+  pop r9
+  pop r8
+  pop rdi
+  pop rsi
+  pop rdx
+  pop rcx
+  pop rbx
+  pop rax
+%endmacro
+
+%macro pushsaved 0
+  push rbp
+  push rsp
+  push r10
+  push r11
+  push r12
+  push r13
+  push r14
+  push r15
+%endmacro
+
+%macro popsaved 0
+  pop r15
+  pop r14
+  pop r13
+  pop r12
+  pop r11
+  pop r10
+  pop rsp
+  pop rbp
+%endmacro
+
+%macro pushall 0
+  pushscratch
+  pushsaved
+%endmacro
+
+%macro popall 0
+  popsaved
+  popscratch
+%endmacro
+
+%macro proc_interrupt 0
+  pushall
+
+
+%endmacro
+
+%macro endintproc 0
+
+%endmacro endintproc
+
+
+

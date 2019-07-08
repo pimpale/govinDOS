@@ -24,7 +24,6 @@
   pop rbp ; restore base pointer
   ret
 %endmacro
-
 %define argaddr32(arg) ebp + (arg+2)*DWORD_SIZE
 %define arg32(arg) [argaddr32(arg)]
 

@@ -3,13 +3,16 @@
 %include "call.mac"
 %include "interrupt.mac"
 
+interrupt_default_handler: proc_interrupt
+  
+
 ; sets a gate handling the arg0'th idt entry with the interrupt handler arg1
 ; arg0 the entry number
 ; arg1 the address of the handler
 ; arg2 the DPL, protects hardware and CPU interrupts from being called out of userspace.
 ; arg3 the type, as defined in interrupt.mac
 ; no returns
-idt_set_gate_addr: proc
+idt_set_gate: proc
   ; r8 contains pointer to idt struct
   lea r8, [rax*IDT_SIZE+idt]
   ; rax shall now be our tmp register
@@ -50,6 +53,19 @@ endproc
 
 
 idt_init: proc
+  ; we first initialize all idt entries
+  ; the entry has the default interrupt handler
+  ; it can only be called from the kernel
+  ; it is an interupt
+  mov rax, 0
+  mov rbx, interrupt_default_handler
+  mov rcx, IDT_GATE_DPL_0
+  mov rdx, IDT_GATE_TYPE_INT32
+  .initialidtloop:
+    call idt_set_gate
+    inc rax
+    cmp rax, IDT_MAX_COUNT
+    jb .initialidtloop
   
 endproc
 
