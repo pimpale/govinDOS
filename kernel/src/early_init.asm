@@ -13,6 +13,11 @@
 [EXTERN kinit]
 [EXTERN kmain]
 
+[EXTERN gdt]
+[EXTERN gdt.code]
+[EXTERN gdt.data]
+[EXTERN gdt.pointer]
+
 ; This is all executable code
 [SECTION .text]
 
@@ -250,14 +255,14 @@ early_init:
   add esp, DWORD_SIZE
 
 
-  lgdt [gdt64.pointer]
+  lgdt [gdt.pointer]
   ; update selectors
-  mov ax, gdt64.data
+  mov ax, gdt.data
   mov ss, ax
   mov ds, ax
   mov es, ax
 
-  jmp gdt64.code:kinit
+  jmp gdt.code:init
 
 
 [SECTION .data]
@@ -267,33 +272,6 @@ errors:
     db 'Error: Kernel not booted with multiboot. Halting.',0
   .no_long_mode:
     db 'Error: No support for long mode (64 bit). Halting.',0
-
-; From https://wiki.osdev.org/Setting_Up_Long_Mode
-gdt64:                           ; Global Descriptor Table (64-bit).
-  .null: equ $ - gdt64           ; The null descriptor.
-    dw 0xFFFF                    ; Limit (low).
-    dw 0                         ; Base (low).
-    db 0                         ; Base (middle)
-    db 0                         ; Access.
-    db 1                         ; Granularity.
-    db 0                         ; Base (high).
-  .code: equ $ - gdt64           ; The code descriptor.
-    dw 0                         ; Limit (low).
-    dw 0                         ; Base (low).
-    db 0                         ; Base (middle)
-    db 10011010b                 ; Access (exec/read).
-    db 10101111b                 ; Granularity, 64 bits flag, limit19:16.
-    db 0                         ; Base (high).
-  .data: equ $ - gdt64           ; The data descriptor.
-    dw 0                         ; Limit (low).
-    dw 0                         ; Base (low).
-    db 0                         ; Base (middle)
-    db 10010010b                 ; Access (read/write).
-    db 00000000b                 ; Granularity.
-    db 0                         ; Base (high).
-  .pointer:                      ; The gdt-pointer.
-    dw $ - gdt64 - 1             ; Limit.
-    dq gdt64                     ; Base.
 
 ; The bss section is uninitialized data
 [SECTION .bss]

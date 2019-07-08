@@ -12,13 +12,12 @@
 [SECTION .text]
 
 ; Not actual method, just starting point for 64 bit kernel
-[GLOBAL kinit]
-kinit:
-  call kmain
+[GLOBAL init]
+init:
+  call main
   hlt
 
-[GLOBAL kmain]
-kmain: proc
+main: proc
   call log_init
   mov rax, 26
   mov rbx, message
