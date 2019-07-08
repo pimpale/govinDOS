@@ -1,0 +1,15 @@
+%define IDT_SIZE 8
+%define IDT_MAX_COUNT 256
+
+%define IDT_GATE_TYPE_TASK32 0x5 ; 32 bit task gate
+%define IDT_GATE_TYPE_INT16  0x6 ; 16-bit interrupt gate
+%define IDT_GATE_TYPE_TRAP16 0x7 ; 16-bit trap gate
+%define IDT_GATE_TYPE_INT32  0xE ; 32-bit interrupt gate
+%define IDT_GATE_TYPE_TRAP32 0xF ; 32-bit trap gate
+
+%define IDT_GATE_PRESENT 1 ; present bit for gate
+
+%define IDT_GATE_DPL_0 0 ; kernel mode
+%define IDT_GATE_DPL_1 1 ; unused
+%define IDT_GATE_DPL_2 2 ; unused
+%define IDT_GATE_DPL_3 3 ; user mode
