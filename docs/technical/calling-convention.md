@@ -1,12 +1,12 @@
 # Application Binary Interface
 
-GovinDOS is an only 64 bit operating system. While there are some 32 bit functions in the code, they are confined only to the start32 and 32 assembly files in the kernel. These files use the cdecl calling convention. However, excepting these few functions in the early stage kernel, everything else follows the GovinDOS Application Binary Interface. For the most part, the ABI x86_64 GovinDOS is identical to the System V ABI with a few exceptions: 
+GovinDOS is an only 64 bit operating system. While there are some 32 bit functions in the code, they are confined only to the start32 and 32 assembly files in the kernel. These files use the cdecl calling convention. However, excepting these few functions in the early stage kernel, everything else follows the GovinDOS Application Binary Interface. For the most part, the ABI x86_64 GovinDOS is identical to the System V ABI with a few exceptions:
 
 * Scratch registers are rax, rbx, rcx, rdx, rsi, rdi, r8, r9
 * Preserved registers are rbp, rsp, r10, r11, r12, r13, r13, r14, r15
 * The first 8 Integer arguments (char, short, int, long) are placed in the scratch registers in the order rax, rbx, rcx, rdx, rsi, rdi, r8, r9. The rest are placed onto the stack (Right to left)
 * Return values are passed in the scratch registers, in the above order. This allows returning multiple values from a function. However, this is only up to 8. Beyond that, the caller must allocate space for the return arguments in the stack, above the arguments.  It is not possible to return a variable amount of values from a function.
-* Structs shall be broken down into their respective 
+* Structs shall be broken down into their respective
 
 In addition, for variadic functions, the first argument shall be the number of values provided (not including this first argument)
 
@@ -17,13 +17,13 @@ In this example a function that returns multiple values (malloc) is defined. Mal
 The foo function calls malloc and handles a potential error.
 
 ```nasm
-; /* the following function mallocs and provides an error code */ 
-; /* Nothing is variadic, everything is predetermined */ 
+; /* the following function mallocs and provides an error code */
+; /* Nothing is variadic, everything is predetermined */
 ; (Void*, U64) malloc(U64 size) {
-;   /* 
+;   /*
 ;    * Do malloc stuff here
 ;    */
-;   if(has_error) { 
+;   if(has_error) {
 ;     return(NULL, error_code);
 ;   } else {
 ;     return(mem_addr, NO_ERROR);
@@ -32,21 +32,21 @@ The foo function calls malloc and handles a potential error.
 
 malloc:
   ; Preserve the old frame pointer and then set it
-  ; This also aligns the stack since RIP has been pushed. 
+  ; This also aligns the stack since RIP has been pushed.
   ; Pushing rbp allows it to be once more 16 byte aligned
   push rbp
   mov rbp, rsp
 
-  ; Do malloc stuff here. We assume, by the end that rax 
-  ; has an error code, and that rdx has the memory address 
+  ; Do malloc stuff here. We assume, by the end that rax
+  ; has an error code, and that rdx has the memory address
 
   ; check if there's been an error
   cmp rax, NO_ERROR
   je .noerror
   ; this is what happens if there's an error
   ; (meaning that rax has a value not 0)
-  
-  mov rbx, rax ; The second return value is the error code 
+
+  mov rbx, rax ; The second return value is the error code
   mov rax, PTR_NULL ; The first return value is null
 
   jmp .end
@@ -54,7 +54,7 @@ malloc:
   ; This shall run if there wasnt an error
   mov rbx, NO_ERROR
   mov rax, rdx ; we put the memory address as the first return arg
-  
+
   .end
   ; We pop rbp back where it belongs and return
   pop rbp
@@ -73,13 +73,13 @@ malloc:
 ;   }
 ; }
 
-foo:   
+foo:
   ; Once again, we must set up the stack frame
   push rbp
   mov rbp, rsp
 
   ; Set the first argument to 500
-  mov rax, 500 
+  mov rax, 500
   call malloc
 
   ; check if there's been an error
@@ -91,8 +91,8 @@ foo:
   ; print the fail message
   mov rax, MEM_ALLOC_FAIL_MSG
   call puts
-  ; Exit with 1 status 
-  mov rax, 1 
+  ; Exit with 1 status
+  mov rax, 1
   call exit
   jmp .end
 
@@ -125,7 +125,7 @@ The following example shows an example of a variadic function. The function prin
 ;     return(INVALID_ARGS);
 ;   }
 ;   /*
-;    * Do printf stuff 
+;    * Do printf stuff
 ;    */
 ; }
 
@@ -157,7 +157,7 @@ printf:
 ; Void foo() {
 ;   printf("hello world, %d", 5);
 ; }
-foo: 
+foo:
   ; set up stack frame
   push rbp
   mov rbp, rsp
@@ -168,7 +168,7 @@ foo:
   mov rbx, HELLO_WORLD_MSG ; The format string
   mov rcx, 5 ; the value to sub in
   call printf
-  
+
   ; Destroy stack frame
   pop rbp
   ret
@@ -197,7 +197,7 @@ The following example shows an example of a function utilizing structs, demonstr
 ;   U64 var9;
 ;   U64 var10;
 ; } Dectet;
-; 
+;
 ; /* Foolish mechanism to increment every field on a struct */
 ; Dectet increment(Dectet src) {
 ;   src.var1++;
@@ -227,20 +227,20 @@ increment:
   inc rdi
   inc r8
   inc r9
-  
-  ; We'll need to save the value of a register or two so we can use 
+
+  ; We'll need to save the value of a register or two so we can use
   ; it to do other stuff
   push r10
 
   ; save src.var9 in r10
-  ; In the govinDOS ABI the stack arguments will start at the base pointer 
-  ; plus some space for RIP and RBP (that is why we have the +2) Since 
+  ; In the govinDOS ABI the stack arguments will start at the base pointer
+  ; plus some space for RIP and RBP (that is why we have the +2) Since
   ; each of these values is a qword, that gives us 16 bytes of offset
   mov r10, [rbp + (0+2)*8]
   inc r10
 
-  ; Now we must put this into the space reserved for the return arguments 
-  ; by the caller. The caller knows that 2 qwords of stack space is reserved 
+  ; Now we must put this into the space reserved for the return arguments
+  ; by the caller. The caller knows that 2 qwords of stack space is reserved
   ; for the remainder of this massive struct. But above this is space for the
   ; two qwords of the struct that don't fit on the return stack.
   ; We will copy the value to that location. This location is 4 qwords away
@@ -262,7 +262,7 @@ increment:
   ret
 
 
-; /* 
+; /*
 ;  * Foo initializes the Dectet to 0, and then makes a call to increment.
 ;  * Why memset was not used, we may never know.
 ;  */
@@ -286,7 +286,7 @@ foo:
 
   ; we need to create space for the function's return
   ; We give enough space for 2 qwords, 16 bytes. This is var9 and var10
-  
+
   sub rsp, 2*8
 
   ; zero rax
@@ -309,9 +309,9 @@ foo:
   call increment
   ; drop old args
   add rsp, 2*8
-  
-  ; we can reuse the space we used for the return args of this function 
-  ; for the next function call's return space. however, we do need to push 
+
+  ; we can reuse the space we used for the return args of this function
+  ; for the next function call's return space. however, we do need to push
   ; the the args, which are the returns of the just called func
 
   ; we've already saved r10 and r11

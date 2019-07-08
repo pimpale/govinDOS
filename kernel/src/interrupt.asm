@@ -10,48 +10,48 @@
 ; arg3 the type, as defined in interrupt.mac
 ; no returns
 idt_set_gate_addr: proc
-  ; rax contains pointer to idt struct
-  lea rax, [rax*IDT_SIZE+idt]
-  ; r8 shall be our tmp register
+  ; r8 contains pointer to idt struct
+  lea r8, [rax*IDT_SIZE+idt]
+  ; rax shall now be our tmp register
 
   ; set offset 1
-  mov r8, rbx
-  and r8, 0xFFFF000000000000 ; bits 0-15
-  mov WORD PTR [rax], r8
+  mov rax, rbx
+  mov [r8], ax
   ; set offset 2
-  mov r8, rbx
-  and r8, 0x0000FFFF00000000 ; bits 16-31
-  mov WORD PTR [rax+6], r8
+  mov rax, rbx
+  shl rax, 16
+  mov [r8+6], ax
 
   ; and offset 3
-  mov r8, rbx
-  and r8, 0x00000000FFFFFFFF ; bits 32-63
-  mov DWORD PTR [rax+8], r8
+  mov rax, rbx
+  shl rax, 32
+  mov [r8+8], eax
 
   ; set zeros
-  mov r8, 0
-  mov DWORD PTR [rax+12], r8
+  mov rax, 0
+  mov [r8+12], eax
 
-  ; set IST to zero for now 
+  ; set IST to zero for now
   ; TODO when we do task switching
-  mov BYTE PTR [rax+4], r8
+  mov [r8+4], al
 
   ; begin work on the flags byte
-  mov r8, 0 ; set the flags to zero
+  ; rax should already be zero
 
-  or r8, IDT_GATE_PRESENT << 7 ; set present bit
+  or al, IDT_GATE_PRESENT << 7 ; set present bit
 
   shl rcx, 5 ; align the dpl
-  or r8, rcx ; make dpl flags
+  or al, cl ; make dpl flags
 
-  or r8, rdx ; set type (arg3)
+  or al, dl ; set type (arg3)
 
-  mov BYTE PTR [rax+5], r8
+  mov [r8+5], dl ; set flags
 endproc
 
 
-
-
+idt_init: proc
+  
+endproc
 
 [SECTION .data]
 
