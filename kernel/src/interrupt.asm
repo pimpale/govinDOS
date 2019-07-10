@@ -57,15 +57,23 @@ idt_init: proc
   ; the entry has the default interrupt handler
   ; it can only be called from the kernel
   ; it is an interupt
-  mov rax, 0
-  mov rbx, interrupt_default_handler
-  mov rcx, IDT_GATE_DPL_0
-  mov rdx, IDT_GATE_TYPE_INT32
-  .initialidtloop:
+  push r10
+  push r11
+  push r12
+  push r13
+  mov r10, 0
+  mov r11, interrupt_default_handler
+  mov r12, IDT_GATE_DPL_0
+  mov r13, IDT_GATE_TYPE_INT32
+  .loop:
+    mov rax, r10
+    mov rbx, r11
+    mov rcx, r12
+    mov rdx, r13
     call idt_set_gate
-    inc rax
-    cmp rax, IDT_MAX_COUNT
-    jb .initialidtloop
+    inc r10
+    cmp r10, IDT_MAX_COUNT
+    jb .loop
   
 endproc
 
