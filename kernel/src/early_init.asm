@@ -6,7 +6,6 @@
 %include "cr.mac"
 %include "cpuid.mac"
 %include "multiboot.mac"
-%include "common.mac"
 
 %define PAGE_SIZE  0x1000           ; 4096 bytes
 %define STACK_SIZE 0x4000           ; 16384 bytes (16 kb) for stack
