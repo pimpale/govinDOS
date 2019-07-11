@@ -32,7 +32,7 @@ log_write: proc
   ; TODO get lock on ring
 
   mov rsi, rbx                       ; set string source
-  mov rdi, [log_write_head_ptr]  ; set string destination
+  mov rdi, [log_write_head_ptr]      ; set string destination
   mov rcx, rax                       ; set size of message
 
   mov eax, log_buf

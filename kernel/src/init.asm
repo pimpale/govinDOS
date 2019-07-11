@@ -3,17 +3,22 @@
 %include "call.mac"
 %include "debug.mac"
 %include "log.mac"
+%include "vga.mac"
 
 [EXTERN log_init]
 [EXTERN log_write]
 [EXTERN debug_write]
+[EXTERN vga_write]
 
 
 [SECTION .text]
 
+
 ; Not actual method, just starting point for 64 bit kernel
 [GLOBAL init]
 init:
+  call cpu_init
+  call page_init
   call main
   hlt
 
@@ -26,6 +31,13 @@ main: proc
   mov rax, 26
   mov rbx, message
   call debug_write
+
+  mov rax, 26
+  mov rbx, message
+  mov rcx, 6
+  mov rdx, 7
+  mov rsi, vga_color(VGA_COLOR_GREEN, VGA_COLOR_BLACK)
+  call vga_write
 endproc
 
 

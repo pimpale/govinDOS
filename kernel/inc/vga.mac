@@ -22,3 +22,6 @@
 %define VGA_BUF 0xb8000
 %define VGA_BUF_LEN VGA_XSIZE * VGA_YSIZE * 2
 %define VGA_BUF_END VGA_BUF + VGA_BUF_LEN
+
+; create vga entry from character (arg0) and vga_color (arg1)
+%define VGA_COLOR(fg, bg) (fg | (bg << 4))

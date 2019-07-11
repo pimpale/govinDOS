@@ -74,7 +74,10 @@ idt_init: proc
     inc r10
     cmp r10, IDT_MAX_COUNT
     jb .loop
-  
+  pop r13
+  pop r12
+  pop r11
+  pop r10
 endproc
 
 [SECTION .data]
