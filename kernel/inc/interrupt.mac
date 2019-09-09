@@ -70,9 +70,9 @@
 
 %macro proc_interrupt 0
   pushall
-
-
 %endmacro
+
+
 
 %macro endintproc 0
 

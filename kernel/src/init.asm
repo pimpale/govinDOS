@@ -17,8 +17,8 @@
 ; Not actual method, just starting point for 64 bit kernel
 [GLOBAL init]
 init:
-  call cpu_init
-  call page_init
+  ; call cpu_init
+  ; call page_init
   call main
   hlt
 
@@ -36,7 +36,7 @@ main: proc
   mov rbx, message
   mov rcx, 6
   mov rdx, 7
-  mov rsi, vga_color(VGA_COLOR_GREEN, VGA_COLOR_BLACK)
+  mov rsi, VGA_COLOR_GREEN_FG | VGA_COLOR_BLACK_BG
   call vga_write
 endproc
 

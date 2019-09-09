@@ -24,63 +24,6 @@ endproc
 ; u64  y
 ; enum color
 
-; Places specified vga_char (arg0) at location x (arg1) and y (arg2)
-; returns the location of cursor after write
-; arg0: char to write
-; arg1: x location (x values greater than VGA_XSIZE will be ignored)
-; arg2: y location (y values greater than VGA_YSIZE will be ignored)
-; arg3: color (from vga.mac)
-; ret0: x location
-; ret1: y location
-; ret2: color
-vga_putchar: proc
-  ; save coords
-  push rbx
-  push rcx
-  push rdx
-  ; ensure there are no out of bound mem writes
-  cmp rbx, VGA_XSIZE
-  jae .end
-  cmp rcx, VGA_YSIZE
-  jae .end
-
-  ; preserve vga char and move xsize to accumulator
-  mov rsi, rax
-  mov rax, rcx
-
-  ; find buffer index to write to
-  mul VGA_XSIZE
-  add rax, rbx
-
-  ; rax now contains the index to write to
-  ; write to location
-  mov [VGA_BUF+rax*2], dl
-  mov rdx, rsi
-  mov [VGA_BUF+rax*2+1], dl
-
-  ; pop em into the return locations
-  pop rcx
-  pop rbx
-  pop rax
-
-  ; if too much has been written on this line
-  cmp rax, VGA_XSIZE
-  jb .no_overflow
-  inc rbx ; move to next line
-  mov rax, 0 ; move x back
-  .no_overflow:
-
-  ; check if it is a newline character
-  cmp rsi, '\n'
-  jne .end
-
-  ; this executes if newline
-  inc rbx
-  mov rax, 0
-  .end:
-endproc
-
-
 ; Displays string ptr arg0 with length arg1 to screen at cursor location
 ; arg0 pointer to string
 ; arg1 length of string
@@ -155,4 +98,4 @@ endproc
 [SECTION .data]
 x: db 0
 y: db 0
-color: db vga_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK)
+color: dw VGA_COLOR_WHITE_FG | VGA_COLOR_BLACK_BG

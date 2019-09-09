@@ -4,7 +4,8 @@
 %include "interrupt.mac"
 
 interrupt_default_handler: proc_interrupt
-  
+
+
 
 ; sets a gate handling the arg0'th idt entry with the interrupt handler arg1
 ; arg0 the entry number

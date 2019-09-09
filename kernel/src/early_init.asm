@@ -13,10 +13,10 @@
 [EXTERN init]
 [EXTERN main]
 
-[EXTERN gdt]
-[EXTERN gdt.code]
-[EXTERN gdt.data]
-[EXTERN gdt.pointer]
+[EXTERN early_gdt]
+[EXTERN early_gdt.code]
+[EXTERN early_gdt.data]
+[EXTERN early_gdt.pointer]
 
 ; This is all executable code
 [SECTION .text]
@@ -24,13 +24,7 @@
 ; This function prints an error (arg0) to the screen and then halts forever
 early_halt_with_error: proc32
   ; First get vga color for space white foreground black background
-  push VGA_COLOR_BLACK ; Background
-  push VGA_COLOR_WHITE ; Foreground
-  call early_vga_color
-  add esp, DWORD_SIZE*2 ; Pop stack
-
-  ; push the resultant color
-  push eax
+  push VGA_COLOR_WHITE_FG | VGA_COLOR_BLACK_BG
   ; clear screen using this color
   call early_vga_clear_screen
 
@@ -73,40 +67,13 @@ early_check_long_mode_support: proc32
   .end:
 endproc32
 
-
-; get vga color from foreground (arg0) and background (arg1)
-; arg0: foreground color, as defined in vga.asm
-; arg1: background color, as defined in vga.asm
-early_vga_color: proc32
-  mov eax, arg32(0) ; fg
-  mov ecx, arg32(1) ; bg
-  shl ecx, 4
-  or  eax, ecx ; fg | bg << 4
-endproc32
-
-; create vga entry from character (arg0) and vga_color (arg1)
-; arg0: 8 bit character
-; arg1: vga_color created by vga_color32
-early_vga_entry: proc32
-  mov eax, arg32(0) ; character
-  mov ecx, arg32(1) ; vga_color
-  shl ecx, 8 ; color << 8
-  or eax, ecx ; character | color
-endproc32
-
 ; This clears the screen with space characters with the given color arg0
 ; arg0: the color to clear the screen with
 early_vga_clear_screen: proc32
 
   mov eax, arg32(0) ; arg0 is the color
-
-  ; get vga entry using provided color
-  ; push args for next proc
-  push eax
-  push ' ' ; Char to clear screen with
-  call early_vga_entry
-  add esp, DWORD_SIZE*2 ; Pop stack
-
+  ; create vga entry with space to clear screen
+  or eax, ' '
   mov ecx, VGA_BUF_LEN ; ecx is counter
 
   push edi ; Preserve this register
@@ -255,14 +222,14 @@ early_init:
   add esp, DWORD_SIZE
 
 
-  lgdt [gdt.pointer]
+  lgdt [early_gdt.pointer]
   ; update selectors
-  mov ax, gdt.data
+  mov ax, early_gdt.data
   mov ss, ax
   mov ds, ax
   mov es, ax
 
-  jmp gdt.code:init
+  jmp early_gdt.code:init
 
 
 [SECTION .data]
