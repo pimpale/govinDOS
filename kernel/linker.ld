@@ -24,6 +24,12 @@ SECTIONS
     . = ALIGN(4K);
   }
 
+  .rodata : 
+  {
+    *(.rodata);
+    . = ALIGN(4K);
+  }
+
   .bss :
   {
     BOOT_BSS = .;

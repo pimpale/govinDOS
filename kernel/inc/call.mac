@@ -4,26 +4,6 @@
 %define DWORD_SIZE 4
 %define QWORD_SIZE 8
 
-; For args above 7, returns the address of an argument on the stack
-; argoff represents the arg number on the stack
-; for example arg8 would be argoff 0, because its first arg on the stack
-%define argaddr(argoff) rbp + (argoff+2)*QWORD_SIZE
-%define arg(argoff) [argaddr(argoff)]
-
-; argcount is number of arguments on the stack
-%define retaddr(argcount, retoff)
-
-; Preserves base pointer and sets it
-%macro proc 0
-  push rbp
-  mov rbp, rsp
-%endmacro
-
-; Ends procedure and returns
-%macro endproc 0
-  pop rbp ; restore base pointer
-  ret
-%endmacro
 %define argaddr32(arg) ebp + (arg+2)*DWORD_SIZE
 %define arg32(arg) [argaddr32(arg)]
 
@@ -34,5 +14,15 @@
 
 %macro endproc32 0
   pop ebp
+  ret
+%endmacro
+
+%macro proc 0
+  push rbp
+  mov rbp, rsp
+%endmacro
+
+%macro endproc 0
+  pop rbp
   ret
 %endmacro

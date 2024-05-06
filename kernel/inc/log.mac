@@ -1,1 +1,0 @@
-%define LOG_BUF_LEN 0x10 ; 4 kb ring buffer

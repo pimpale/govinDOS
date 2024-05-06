@@ -1,4 +1,5 @@
-; Declare VGA color consts
+; Declare VGA color consts 
+; Each constant is a 16 bit value
 %define VGA_COLOR_BLACK_BG         0x00 << 0x0c
 %define VGA_COLOR_BLUE_BG          0x01 << 0x0c
 %define VGA_COLOR_GREEN_BG         0x02 << 0x0c
@@ -16,22 +17,22 @@
 %define VGA_COLOR_LIGHT_BROWN_BG   0x0e << 0x0c
 %define VGA_COLOR_WHITE_BG         0x0f << 0x0c
 
-%define VGA_COLOR_BLACK_FG         0x00 << 0x04
-%define VGA_COLOR_BLUE_FG          0x01 << 0x04
-%define VGA_COLOR_GREEN_FG         0x02 << 0x04
-%define VGA_COLOR_CYAN_FG          0x03 << 0x04
-%define VGA_COLOR_RED_FG           0x04 << 0x04
-%define VGA_COLOR_MAGENTA_FG       0x05 << 0x04
-%define VGA_COLOR_BROWN_FG         0x06 << 0x04
-%define VGA_COLOR_LIGHT_GREY_FG    0x07 << 0x04
-%define VGA_COLOR_DARK_GREY_FG     0x08 << 0x04
-%define VGA_COLOR_LIGHT_BLUE_FG    0x09 << 0x04
-%define VGA_COLOR_LIGHT_GREEN_FG   0x0a << 0x04
-%define VGA_COLOR_LIGHT_CYAN_FG    0x0b << 0x04
-%define VGA_COLOR_LIGHT_RED_FG     0x0c << 0x04
-%define VGA_COLOR_LIGHT_MAGENTA_FG 0x0d << 0x04
-%define VGA_COLOR_LIGHT_BROWN_FG   0x0e << 0x04
-%define VGA_COLOR_WHITE_FG         0x0f << 0x04
+%define VGA_COLOR_BLACK_FG         0x00 << 0x08
+%define VGA_COLOR_BLUE_FG          0x01 << 0x08
+%define VGA_COLOR_GREEN_FG         0x02 << 0x08
+%define VGA_COLOR_CYAN_FG          0x03 << 0x08
+%define VGA_COLOR_RED_FG           0x04 << 0x08
+%define VGA_COLOR_MAGENTA_FG       0x05 << 0x08
+%define VGA_COLOR_BROWN_FG         0x06 << 0x08
+%define VGA_COLOR_LIGHT_GREY_FG    0x07 << 0x08
+%define VGA_COLOR_DARK_GREY_FG     0x08 << 0x08
+%define VGA_COLOR_LIGHT_BLUE_FG    0x09 << 0x08
+%define VGA_COLOR_LIGHT_GREEN_FG   0x0a << 0x08
+%define VGA_COLOR_LIGHT_CYAN_FG    0x0b << 0x08
+%define VGA_COLOR_LIGHT_RED_FG     0x0c << 0x08
+%define VGA_COLOR_LIGHT_MAGENTA_FG 0x0d << 0x08
+%define VGA_COLOR_LIGHT_BROWN_FG   0x0e << 0x08
+%define VGA_COLOR_WHITE_FG         0x0f << 0x08
 
 ; Dimensions and properties of buffer
 %define VGA_XSIZE 80

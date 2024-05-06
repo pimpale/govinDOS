@@ -1,1 +1,0 @@
-%define DBG_SERIAL_PORT 0xe9    ; Port to print messages to

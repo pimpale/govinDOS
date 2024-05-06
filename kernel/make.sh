@@ -13,10 +13,17 @@ set -e
 INSTALL_DIR="../bin/sysroot/boot"
 
 # One arg, assembles it and places it inside the build dir
-assemble() {
+assemble_nasm() {
   mkdir -p bin
   nasm -i inc -f elf64 src/$1 -o bin/$1.o
 }
+
+# One arg, assembles it and places it inside the build dir
+compile_gcc() {
+  mkdir -p bin
+  clang-15 -std=gnu2x -ffreestanding -nostdlib -nostdinc -O0 -g -Iinc src/$1 -c -o bin/$1.o
+}
+
 
 # No args, links all objects everything into kernel.bin
 link() {
@@ -37,14 +44,12 @@ install() {
 
 # No arguments, makes everything, printing out the path of the finished product
 make() {
-  assemble debug.asm
-  assemble log.asm
-  assemble early_init.asm
-  assemble header.asm
-  assemble init.asm
-  assemble interrupt.asm
-  assemble vga.asm
-  assemble gdt.asm
+  assemble_nasm early_init.asm
+  assemble_nasm header.asm
+  assemble_nasm interrupt.asm
+  assemble_nasm gdt.asm
+  compile_gcc vga.c
+  compile_gcc init.c
   link
 }
 

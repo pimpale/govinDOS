@@ -229,6 +229,7 @@ early_init:
   mov ds, ax
   mov es, ax
 
+  ; call init, now in 64 bit mode
   jmp early_gdt.code:init
 
 
