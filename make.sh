@@ -25,10 +25,10 @@ subproject() {
 # No args, links all objects everything into kernel.bin
 make() {
   mkdir -p bin
-  cp -r root bin/root
-  cp -r efi bin/efi
+  cp -rT root bin/root
+  cp -rT efi bin/efi
   subproject kernel make
-  cp kernel/bin/kernel.efi bin/root/
+  cp -rT kernel/bin/kernel.efi bin/root/kernel.efi
 }
 
 # No arguments, cleans the build directory
@@ -48,6 +48,7 @@ runkernel() {
     -drive if=pflash,format=raw,file=./bin/efi/OVMF.fd \
     -drive format=raw,file=fat:rw:bin/root \
     -monitor stdio \
+    -m 4G \
     -net none
 }
 

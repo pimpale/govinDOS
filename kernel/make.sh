@@ -13,10 +13,10 @@ set -e
 # One arg, assembles it and places it inside the build dir
 compile_c() {
   mkdir -p bin
-  clang-15 \
-    -std=gnu2x \
+  clang-19 \
+    -std=c23 \
     -target x86_64-unknown-windows \
-    -ffreestanding -fno-builtin -fshort-wchar -mno-red-zone \
+    -ffreestanding  -fno-builtin -fshort-wchar -mno-red-zone \
     -O0 -g \
     -Iinc \
     -Ivendor \
@@ -27,7 +27,7 @@ compile_c() {
 # No args, links all objects everything into kernel.efi
 link() {
   mkdir -p bin
-  lld-link-15 \
+  lld-link-19 \
     -flavor link \
     -subsystem:efi_application \
     -entry:efi_main \
@@ -43,7 +43,10 @@ clean() {
 # No arguments, makes everything, printing out the path of the finished product
 make() {
   compile_c init.c
-  compile_c vga.c
+  compile_c print.c
+  compile_c allocator.c
+  compile_c interrupts.c
+  compile_c c_builtins.c
   link
 }
 
