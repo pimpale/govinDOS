@@ -1,6 +1,0 @@
-; Declare constants for the multiboot header.
-%define MULTIBOOT_PAGE_ALIGN          1<<0  ; everything is aligned 4096
-%define MULTIBOOT_MEMORY_INFO         1<<1  ; grub gets sys mem info
-%define MULTIBOOT_AOUT_KLUDGE         1<<16 ; bootloader load non-elf 
-%define MULTIBOOT_HEADER_MAGIC        0x1BADB002 ; magic value to put in header
-%define MULTIBOOT_BOOT_REGISTER_MAGIC 0x2BADB002 ; magic value to be stored in ebx

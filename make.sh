@@ -25,10 +25,10 @@ subproject() {
 # No args, links all objects everything into kernel.bin
 make() {
   mkdir -p bin
-  cp -r sysroot bin/sysroot
+  cp -r root bin/root
+  cp -r efi bin/efi
   subproject kernel make
-  subproject kernel install
-  grub-mkrescue -o bin/$ISO_NAME bin/sysroot
+  cp kernel/bin/kernel.efi bin/root/
 }
 
 # No arguments, cleans the build directory
@@ -41,19 +41,14 @@ cleanall() {
   clean
 }
 
-runiso() {
-  make
-  qemu-system-x86_64 -monitor stdio -no-shutdown -no-reboot -d int \
-    -cdrom bin/$ISO_NAME
-}
-
 runkernel() {
   make
-  qemu-system-x86_64 \
-    -no-shutdown \
+
+ qemu-system-x86_64 \
+    -drive if=pflash,format=raw,file=./bin/efi/OVMF.fd \
+    -drive format=raw,file=fat:rw:bin/root \
     -monitor stdio \
-    -no-reboot -d int \
-    -kernel bin/sysroot/boot/kernel.bin
+    -net none
 }
 
 if [ $# -eq 0 ]; then
@@ -61,7 +56,7 @@ if [ $# -eq 0 ]; then
 else
   for cmd in $@; do
     case "$cmd" in
-      make|clean|cleanall|runiso|runkernel)
+      make|clean|cleanall|runkernel)
         $cmd
         ;;
       *)

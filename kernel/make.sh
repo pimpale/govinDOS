@@ -10,25 +10,29 @@
 
 set -e
 
-INSTALL_DIR="../bin/sysroot/boot"
-
 # One arg, assembles it and places it inside the build dir
-assemble_nasm() {
+compile_c() {
   mkdir -p bin
-  nasm -i inc -f elf64 src/$1 -o bin/$1.o
+  clang-15 \
+    -std=gnu2x \
+    -target x86_64-unknown-windows \
+    -ffreestanding -fno-builtin -fshort-wchar -mno-red-zone \
+    -O0 -g \
+    -Iinc \
+    -Ivendor \
+    -c -o bin/$1.o \
+    src/$1
 }
 
-# One arg, assembles it and places it inside the build dir
-compile_gcc() {
-  mkdir -p bin
-  clang-15 -std=gnu2x -ffreestanding -nostdlib -nostdinc -O0 -g -Iinc src/$1 -c -o bin/$1.o
-}
-
-
-# No args, links all objects everything into kernel.bin
+# No args, links all objects everything into kernel.efi
 link() {
-  gcc -mcmodel=large -ffreestanding -nostdlib -T linker.ld \
-    -o bin/kernel.bin bin/*.o
+  mkdir -p bin
+  lld-link-15 \
+    -flavor link \
+    -subsystem:efi_application \
+    -entry:efi_main \
+    -out:bin/kernel.efi \
+    bin/*.o
 }
 
 # No arguments, cleans the build directory
@@ -36,20 +40,10 @@ clean() {
   rm -rf bin
 }
 
-# No args. installs in install dir
-install() {
-  mkdir -p $INSTALL_DIR
-  cp bin/kernel.bin $INSTALL_DIR
-}
-
 # No arguments, makes everything, printing out the path of the finished product
 make() {
-  assemble_nasm early_init.asm
-  assemble_nasm header.asm
-  assemble_nasm interrupt.asm
-  assemble_nasm gdt.asm
-  compile_gcc vga.c
-  compile_gcc init.c
+  compile_c init.c
+  compile_c vga.c
   link
 }
 
@@ -58,7 +52,7 @@ if [ $# -eq 0 ]; then
 else
   for cmd in $@; do
     case "$cmd" in
-      make|clean|link|install)
+      make|clean|link)
         $cmd
         ;;
       *)

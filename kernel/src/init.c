@@ -1,17 +1,15 @@
 #include "stdint.h"
 
 #include "vga.h"
+#include "efi/efi.h"
 
-void main() {
-  vga_fill_screen('u' | VGA_COLOR_BLACK_BG | VGA_COLOR_BLUE_FG);
+efi_status_t efi_main(
+	efi_handle_t handle,
+	struct efi_system_table *system)
+{
+  while(true) {
+      system->out->output_string(system->out, L"hello");
+  }
+
+  return EFI_SUCCESS;
 }
-
-[[noreturn]] 
-void init() {
-  main();
-
-  asm("hlt");
-
-  while(true);
-}
-
