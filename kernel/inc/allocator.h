@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+struct allocator_entry
+
 
 struct allocator {
     // how many levels there are

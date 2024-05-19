@@ -45,9 +45,10 @@ runkernel() {
   make
 
  qemu-system-x86_64 \
+    -no-reboot \
     -drive if=pflash,format=raw,file=./bin/efi/OVMF.fd \
     -drive format=raw,file=fat:rw:bin/root \
-    -monitor stdio \
+    -serial stdio \
     -m 4G \
     -net none
 }

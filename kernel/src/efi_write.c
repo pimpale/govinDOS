@@ -1,7 +1,8 @@
-#include "print.h"
+#include "efi_write.h"
+
 #include <stdint.h>
 
-uint16_t tohex(uint64_t v) {
+static inline uint16_t tohex(uint64_t v) {
   if (v < 10) {
     return '0' + v;
   } else {
@@ -9,14 +10,14 @@ uint16_t tohex(uint64_t v) {
   }
 }
 
-efi_status_t output_string(struct efi_simple_text_output_protocol *out,
+efi_status_t efi_write_string(struct efi_simple_text_output_protocol *out,
                            uint16_t *str) {
   return out->output_string(out, str);
 }
 
-efi_status_t output_u64hex(struct efi_simple_text_output_protocol *out,
+efi_status_t efi_write_u64hex(struct efi_simple_text_output_protocol *out,
                            uint64_t v) {
-  constexpr int LEN = 16;
+  constexpr uint64_t LEN = sizeof(v) * 2;
   uint16_t str[LEN+1] = {};
   for (uint32_t i = 0; i < LEN; i++) {
     str[i] = '0';
@@ -32,9 +33,9 @@ efi_status_t output_u64hex(struct efi_simple_text_output_protocol *out,
   return out->output_string(out, str);
 }
 
-efi_status_t output_u32hex(struct efi_simple_text_output_protocol *out,
+efi_status_t efi_write_u32hex(struct efi_simple_text_output_protocol *out,
                            uint32_t v) {
-  constexpr int LEN = 8;
+  constexpr uint64_t LEN = sizeof(v) * 2;
   uint16_t str[LEN+1] = {};
   for (uint32_t i = 0; i < LEN; i++) {
     str[i] = '0';
@@ -49,9 +50,10 @@ efi_status_t output_u32hex(struct efi_simple_text_output_protocol *out,
   }
   return out->output_string(out, str);
 }
-efi_status_t output_u16hex(struct efi_simple_text_output_protocol *out,
+
+efi_status_t efi_write_u16hex(struct efi_simple_text_output_protocol *out,
                            uint16_t v) {
-  constexpr int LEN = 4;
+  constexpr uint64_t LEN = sizeof(v) * 2;
   uint16_t str[LEN+1] = {};
   for (uint32_t i = 0; i < LEN; i++) {
     str[i] = '0';
@@ -67,9 +69,9 @@ efi_status_t output_u16hex(struct efi_simple_text_output_protocol *out,
   return out->output_string(out, str);
 }
 
-efi_status_t output_u8hex(struct efi_simple_text_output_protocol *out,
+efi_status_t efi_write_u8hex(struct efi_simple_text_output_protocol *out,
                           uint8_t v) {
-  constexpr int LEN = 2;
+  constexpr uint64_t LEN = sizeof(v) * 2;
   uint16_t str[LEN+1] = {};
   for (uint32_t i = 0; i < LEN; i++) {
     str[i] = '0';

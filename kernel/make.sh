@@ -12,27 +12,29 @@ set -e
 
 # One arg, assembles it and places it inside the build dir
 compile_c() {
-  mkdir -p bin
+  mkdir -p bin/$(dirname $1)
   clang-19 \
     -std=c23 \
     -target x86_64-unknown-windows \
     -ffreestanding  -fno-builtin -fshort-wchar -mno-red-zone \
     -O0 -g \
     -Iinc \
+    -Iinc_x86_64 \
     -Ivendor \
     -c -o bin/$1.o \
-    src/$1
+    $1
 }
 
 # No args, links all objects everything into kernel.efi
 link() {
   mkdir -p bin
+  files=$(find ./bin/ -name "*.o")
   lld-link-19 \
     -flavor link \
     -subsystem:efi_application \
     -entry:efi_main \
     -out:bin/kernel.efi \
-    bin/*.o
+    $files
 }
 
 # No arguments, cleans the build directory
@@ -42,11 +44,13 @@ clean() {
 
 # No arguments, makes everything, printing out the path of the finished product
 make() {
-  compile_c init.c
-  compile_c print.c
-  compile_c allocator.c
-  compile_c interrupts.c
-  compile_c c_builtins.c
+  compile_c src/init.c
+  compile_c src/efi_write.c
+  compile_c src/serial_write.c
+  compile_c src/allocator.c
+  compile_c src/c_builtins.c
+  compile_c src_x86_64/serial.c
+  compile_c src_x86_64/interrupts.c
   link
 }
 
