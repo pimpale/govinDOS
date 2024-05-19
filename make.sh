@@ -50,6 +50,7 @@ runkernel() {
     -drive format=raw,file=fat:rw:bin/root \
     -serial stdio \
     -m 4G \
+    -d int \
     -net none
 }
 

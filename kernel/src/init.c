@@ -1,10 +1,12 @@
 #include <stdint.h>
 
-#include "serial.h"
 #include "c_builtins.h"
-#include "serial_write.h"
-#include "efi_write.h"
 #include "debug.h"
+#include "efi/loaded_image_protocol.h"
+#include "efi_write.h"
+#include "serial.h"
+#include "serial_write.h"
+#include "setup_gdt.h"
 
 #include "efi/efi.h"
 #include "efi/types.h"
@@ -76,46 +78,56 @@ efi_status_t efi_main(efi_handle_t handle, struct efi_system_table *system) {
 
   serial_init();
 
-  system->out->output_string(system->out, L"starting kernel!\r\n");
+  efi_write_string(system->out, L"starting kernel!\r\n");
+
+  // Get ImageBase
+  struct efi_loaded_image_protocol *LIP = nullptr;
+  struct efi_guid lip_guid = EFI_LOADED_IMAGE_PROTOCOL_GUID;
+  efi_status_t handle_protocol_status =
+      system->boot->handle_protocol(handle, &lip_guid, &LIP);
+  assert(handle_protocol_status == EFI_SUCCESS, "failed to get handle protocol");
+  efi_write_string(system->out, L"image base: ");
+  efi_write_u64hex(system->out, (uint64_t)LIP->image_base);
+  efi_write_string(system->out, L"\r\n");
 
   // get memory map
   efi_uint_t n_mmap = 0;
-  struct efi_memory_descriptor *mmap = NULL;
+  struct efi_memory_descriptor *mmap = nullptr;
   efi_uint_t mmap_key = 0;
   efi_status_t mmap_status = get_memory_map(system, &mmap, &n_mmap, &mmap_key);
   assert(mmap_status == EFI_SUCCESS, "failed to get memory map!\r\n");
 
-  serial_write_string("NEntries");
-  serial_write_u32hex(n_mmap);
-  serial_write_string("\r\n");
+  // serial_write_string("NEntries");
+  // serial_write_u32hex(n_mmap);
+  // serial_write_string("\r\n");
 
-  uint32_t n_pages = 0;
-  for (int i = 0; i < n_mmap; i++) {
-    if (mmap[i].type == 7) {
-      n_pages += mmap[i].pages;
-    }
-  }
+  // uint32_t n_pages = 0;
+  // for (int i = 0; i < n_mmap; i++) {
+  //   if (mmap[i].type == 7) {
+  //     n_pages += mmap[i].pages;
+  //   }
+  // }
 
-  serial_write_string("NPages ");
-  serial_write_u32hex(n_pages);
-  serial_write_string("\r\n");
+  // serial_write_string("NPages ");
+  // serial_write_u32hex(n_pages);
+  // serial_write_string("\r\n");
 
-  for (uint32_t i = 0; i < n_mmap; i++) {
-    serial_write_string("MMAP ");
-    serial_write_u32hex(i);
-    serial_write_string(":\r\n TYPE: ");
-    serial_write_u32hex(mmap[i].type);
-    serial_write_string("\r\n PHYS_START: ");
-    serial_write_u64hex(mmap[i].physical_start);
-    serial_write_string("\r\n VIRT_START: ");
-    serial_write_u64hex(mmap[i].virtual_start);
-    serial_write_string("\r\n PAGES: ");
-    serial_write_u64hex(mmap[i].pages);
-    serial_write_string("\r\n ATTRIBUTES: ");
-    serial_write_u64hex(mmap[i].attributes);
-    serial_write_string("\r\n");
-  }
-  
+  // for (uint32_t i = 0; i < n_mmap; i++) {
+  //   serial_write_string("MMAP ");
+  //   serial_write_u32hex(i);
+  //   serial_write_string(":\r\n TYPE: ");
+  //   serial_write_u32hex(mmap[i].type);
+  //   serial_write_string("\r\n PHYS_START: ");
+  //   serial_write_u64hex(mmap[i].physical_start);
+  //   serial_write_string("\r\n VIRT_START: ");
+  //   serial_write_u64hex(mmap[i].virtual_start);
+  //   serial_write_string("\r\n PAGES: ");
+  //   serial_write_u64hex(mmap[i].pages);
+  //   serial_write_string("\r\n ATTRIBUTES: ");
+  //   serial_write_u64hex(mmap[i].attributes);
+  //   serial_write_string("\r\n");
+  // }
+
   // exit boot services
   efi_status_t exit_status = system->boot->exit_boot_services(handle, mmap_key);
   if (exit_status != EFI_SUCCESS) {
@@ -125,12 +137,12 @@ efi_status_t efi_main(efi_handle_t handle, struct efi_system_table *system) {
 
   // set up allocator
 
+  setup_gdt();
 
   // set up interrupts
   // setup_interrupts();
 
   while (true) {
-
   }
 
   return EFI_SUCCESS;

@@ -25,12 +25,22 @@ compile_c() {
     $1
 }
 
+assemble() {
+  mkdir -p bin/$(dirname $1)
+  nasm \
+    -g \
+    -f win64 \
+    -o bin/$1.o \
+    $1
+}
+
 # No args, links all objects everything into kernel.efi
 link() {
   mkdir -p bin
   files=$(find ./bin/ -name "*.o")
   lld-link-19 \
     -flavor link \
+    -debug \
     -subsystem:efi_application \
     -entry:efi_main \
     -out:bin/kernel.efi \
@@ -48,9 +58,12 @@ make() {
   compile_c src/efi_write.c
   compile_c src/serial_write.c
   compile_c src/allocator.c
+  compile_c src/debug.c
   compile_c src/c_builtins.c
   compile_c src_x86_64/serial.c
   compile_c src_x86_64/interrupts.c
+  compile_c src_x86_64/setup_gdt.c
+  assemble src_x86_64/gdt.asm
   link
 }
 
