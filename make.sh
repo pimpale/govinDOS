@@ -49,7 +49,7 @@ runkernel() {
     -drive if=pflash,format=raw,file=./bin/efi/OVMF.fd \
     -drive format=raw,file=fat:rw:bin/root \
     -serial stdio \
-    -m 4G \
+    -m 1G \
     -d int \
     -net none
 }

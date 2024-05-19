@@ -9,11 +9,11 @@
 [GLOBAL GDT.TSS]
 [GLOBAL GDT.Pointer]
 
-[GLOBAL load_gdt]
+[GLOBAL asm_load_gdt]
 
 [SECTION .text]
 
-load_gdt:
+asm_load_gdt:
     mov rax, GDT.Pointer
     lgdt [rax]                   ; Load the 64-bit global descriptor table.
     push GDT.Code

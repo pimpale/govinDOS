@@ -61,8 +61,7 @@ make() {
   compile_c src/debug.c
   compile_c src/c_builtins.c
   compile_c src_x86_64/serial.c
-  compile_c src_x86_64/interrupts.c
-  compile_c src_x86_64/setup_gdt.c
+  compile_c src_x86_64/setup_interrupts.c
   assemble src_x86_64/gdt.asm
   link
 }

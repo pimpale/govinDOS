@@ -6,7 +6,7 @@
 #include "efi_write.h"
 #include "serial.h"
 #include "serial_write.h"
-#include "setup_gdt.h"
+#include "setup_interrupts.h"
 
 #include "efi/efi.h"
 #include "efi/types.h"
@@ -135,12 +135,13 @@ efi_status_t efi_main(efi_handle_t handle, struct efi_system_table *system) {
     return exit_status;
   }
 
-  // set up allocator
-
-  setup_gdt();
 
   // set up interrupts
-  // setup_interrupts();
+  setup_interrupts();
+
+
+  // set up allocator
+
 
   while (true) {
   }
