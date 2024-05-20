@@ -74,20 +74,68 @@ static efi_status_t get_memory_map(struct efi_system_table *system,
   }
 }
 
+// Get ImageBase
+static efi_status_t get_image_base(efi_handle_t handle,
+                                   struct efi_system_table *system,
+                                   uint64_t *image_base) {
+  struct efi_loaded_image_protocol *LIP = nullptr;
+  struct efi_guid lip_guid = EFI_LOADED_IMAGE_PROTOCOL_GUID;
+  efi_status_t handle_protocol_status =
+      system->boot->handle_protocol(handle, &lip_guid, &LIP);
+
+  if (handle_protocol_status == EFI_SUCCESS) {
+    *image_base = (uint64_t)LIP->image_base;
+  }
+  return handle_protocol_status;
+}
+
+static void dump_mmap(const uint64_t n_mmap,
+                      const struct efi_memory_descriptor *mmap) {
+  serial_write_string("NEntries");
+  serial_write_u32hex(n_mmap);
+  serial_write_string("\r\n");
+
+  uint32_t n_pages = 0;
+  for (int i = 0; i < n_mmap; i++) {
+    if (mmap[i].type == 7) {
+      n_pages += mmap[i].pages;
+    }
+  }
+
+  serial_write_string("NPages ");
+  serial_write_u32hex(n_pages);
+  serial_write_string("\r\n");
+
+  for (uint32_t i = 0; i < n_mmap; i++) {
+    serial_write_string("MMAP ");
+    serial_write_u32hex(i);
+    serial_write_string(":\r\n TYPE: ");
+    serial_write_u32hex(mmap[i].type);
+    serial_write_string("\r\n PHYS_START: ");
+    serial_write_u64hex(mmap[i].physical_start);
+    serial_write_string("\r\n VIRT_START: ");
+    serial_write_u64hex(mmap[i].virtual_start);
+    serial_write_string("\r\n PAGES: ");
+    serial_write_u64hex(mmap[i].pages);
+    serial_write_string("\r\n ATTRIBUTES: ");
+    serial_write_u64hex(mmap[i].attributes);
+    serial_write_string("\r\n");
+  }
+}
+
 efi_status_t efi_main(efi_handle_t handle, struct efi_system_table *system) {
 
   serial_init();
 
   efi_write_string(system->out, L"starting kernel!\r\n");
 
-  // Get ImageBase
-  struct efi_loaded_image_protocol *LIP = nullptr;
-  struct efi_guid lip_guid = EFI_LOADED_IMAGE_PROTOCOL_GUID;
-  efi_status_t handle_protocol_status =
-      system->boot->handle_protocol(handle, &lip_guid, &LIP);
-  assert(handle_protocol_status == EFI_SUCCESS, "failed to get handle protocol");
+  uint64_t image_base;
+  efi_status_t image_base_status = get_image_base(handle, system, &image_base);
+
+  assert(image_base_status == EFI_SUCCESS, "failed to get image base");
+
   efi_write_string(system->out, L"image base: ");
-  efi_write_u64hex(system->out, (uint64_t)LIP->image_base);
+  efi_write_u64hex(system->out, image_base);
   efi_write_string(system->out, L"\r\n");
 
   // get memory map
@@ -97,37 +145,6 @@ efi_status_t efi_main(efi_handle_t handle, struct efi_system_table *system) {
   efi_status_t mmap_status = get_memory_map(system, &mmap, &n_mmap, &mmap_key);
   assert(mmap_status == EFI_SUCCESS, "failed to get memory map!\r\n");
 
-  // serial_write_string("NEntries");
-  // serial_write_u32hex(n_mmap);
-  // serial_write_string("\r\n");
-
-  // uint32_t n_pages = 0;
-  // for (int i = 0; i < n_mmap; i++) {
-  //   if (mmap[i].type == 7) {
-  //     n_pages += mmap[i].pages;
-  //   }
-  // }
-
-  // serial_write_string("NPages ");
-  // serial_write_u32hex(n_pages);
-  // serial_write_string("\r\n");
-
-  // for (uint32_t i = 0; i < n_mmap; i++) {
-  //   serial_write_string("MMAP ");
-  //   serial_write_u32hex(i);
-  //   serial_write_string(":\r\n TYPE: ");
-  //   serial_write_u32hex(mmap[i].type);
-  //   serial_write_string("\r\n PHYS_START: ");
-  //   serial_write_u64hex(mmap[i].physical_start);
-  //   serial_write_string("\r\n VIRT_START: ");
-  //   serial_write_u64hex(mmap[i].virtual_start);
-  //   serial_write_string("\r\n PAGES: ");
-  //   serial_write_u64hex(mmap[i].pages);
-  //   serial_write_string("\r\n ATTRIBUTES: ");
-  //   serial_write_u64hex(mmap[i].attributes);
-  //   serial_write_string("\r\n");
-  // }
-
   // exit boot services
   efi_status_t exit_status = system->boot->exit_boot_services(handle, mmap_key);
   if (exit_status != EFI_SUCCESS) {
@@ -135,13 +152,11 @@ efi_status_t efi_main(efi_handle_t handle, struct efi_system_table *system) {
     return exit_status;
   }
 
-
   // set up interrupts
   setup_interrupts();
 
-
   // set up allocator
-
+  setup_allocator();
 
   while (true) {
   }

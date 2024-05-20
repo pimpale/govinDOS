@@ -50,8 +50,8 @@ runkernel() {
     -drive format=raw,file=fat:rw:bin/root \
     -serial stdio \
     -m 1G \
-    -d int \
-    -net none
+    -net none \
+    # -d int
 }
 
 if [ $# -eq 0 ]; then

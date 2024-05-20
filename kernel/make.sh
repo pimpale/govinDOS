@@ -63,6 +63,7 @@ make() {
   compile_c src_x86_64/serial.c
   compile_c src_x86_64/setup_interrupts.c
   assemble src_x86_64/gdt.asm
+  assemble src_x86_64/idt.asm
   link
 }
 

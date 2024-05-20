@@ -2,6 +2,8 @@
 
 #include <stdint.h>
 
+#include "serial_write.h"
+
 // defined in assembly
 extern void asm_load_gdt();
 extern void asm_load_idt();
@@ -38,5 +40,14 @@ struct [[gnu::packed]] cpu_state {
 };
 
 uint64_t interrupt_handler(struct cpu_state cpu, uint64_t vector, uint64_t error, uint64_t rip) {
+    serial_write_string("vector:") ;
+    serial_write_u64hex(vector);
+    serial_write_string("\n") ;
+    serial_write_string("error:") ;
+    serial_write_u64hex(error);
+    serial_write_string("\n") ;
+    serial_write_string("rip:") ;
+    serial_write_u64hex(rip);
+    serial_write_string("\n") ;
     return 0;
 }
