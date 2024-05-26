@@ -18,8 +18,8 @@ compile_c() {
     -target x86_64-unknown-windows \
     -ffreestanding  -fno-builtin -fshort-wchar -mno-red-zone \
     -O0 -g \
-    -Iinc \
-    -Iinc_x86_64 \
+    -Isrc \
+    -Iarchsrc/x86_64 \
     -Ivendor \
     -c -o bin/$1.o \
     $1
@@ -54,16 +54,20 @@ clean() {
 
 # No arguments, makes everything, printing out the path of the finished product
 make() {
+  # core kernel
   compile_c src/init.c
-  compile_c src/efi_write.c
   compile_c src/serial_write.c
   compile_c src/allocator.c
   compile_c src/debug.c
   compile_c src/c_builtins.c
-  compile_c src_x86_64/serial.c
-  compile_c src_x86_64/setup_interrupts.c
-  assemble src_x86_64/gdt.asm
-  assemble src_x86_64/idt.asm
+  # architecture specific
+  compile_c archsrc/x86_64/serial.c
+  compile_c archsrc/x86_64/setup_interrupts.c
+  assemble  archsrc/x86_64/gdt.asm
+  assemble  archsrc/x86_64/idt.asm
+  # vendor
+  compile_c vendor/buddy_allocator/buddy_allocator.c
+
   link
 }
 

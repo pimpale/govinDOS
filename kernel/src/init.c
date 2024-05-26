@@ -2,14 +2,13 @@
 
 #include "c_builtins.h"
 #include "debug.h"
-#include "efi/loaded_image_protocol.h"
-#include "efi_write.h"
 #include "serial.h"
 #include "serial_write.h"
 #include "setup_interrupts.h"
 
-#include "efi/efi.h"
-#include "efi/types.h"
+#include <efi/efi.h>
+#include <efi/types.h>
+#include <efi/loaded_image_protocol.h>
 
 // EFI may use a stride given by desc_size. This regularizes the stride back to
 // sizeof(efi_memory_descriptor)
@@ -124,31 +123,29 @@ static void dump_mmap(const uint64_t n_mmap,
 }
 
 efi_status_t efi_main(efi_handle_t handle, struct efi_system_table *system) {
-
   serial_init();
 
-  efi_write_string(system->out, L"starting kernel!\r\n");
+  serial_write_string("starting kernel!\n");
 
   uint64_t image_base;
   efi_status_t image_base_status = get_image_base(handle, system, &image_base);
-
   assert(image_base_status == EFI_SUCCESS, "failed to get image base");
 
-  efi_write_string(system->out, L"image base: ");
-  efi_write_u64hex(system->out, image_base);
-  efi_write_string(system->out, L"\r\n");
+  serial_write_string("image base: ");
+  serial_write_u64hex(image_base);
+  serial_write_string("\n");
 
   // get memory map
   efi_uint_t n_mmap = 0;
   struct efi_memory_descriptor *mmap = nullptr;
   efi_uint_t mmap_key = 0;
   efi_status_t mmap_status = get_memory_map(system, &mmap, &n_mmap, &mmap_key);
-  assert(mmap_status == EFI_SUCCESS, "failed to get memory map!\r\n");
+  assert(mmap_status == EFI_SUCCESS, "failed to get memory map!\n");
 
   // exit boot services
   efi_status_t exit_status = system->boot->exit_boot_services(handle, mmap_key);
   if (exit_status != EFI_SUCCESS) {
-    system->out->output_string(system->out, L"failed to exit boot loader!\r\n");
+    serial_write_string("failed to exit boot loader!\n");
     return exit_status;
   }
 
@@ -156,7 +153,7 @@ efi_status_t efi_main(efi_handle_t handle, struct efi_system_table *system) {
   setup_interrupts();
 
   // set up allocator
-  setup_allocator();
+  //setup_allocator();
 
   while (true) {
   }
