@@ -28,7 +28,7 @@ make() {
   cp -rT root bin/root
   cp -rT efi bin/efi
   subproject kernel make
-  cp -rT kernel/bin/kernel.efi bin/root/kernel.efi
+  cp -rT kernel/bin/kernel.efi bin/root/bootx64.efi
 }
 
 # No arguments, cleans the build directory

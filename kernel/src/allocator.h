@@ -2,7 +2,7 @@
 #define allocator_h_INCLUDED
 
 #include <stdint.h>
-#include <efi/types.h>
+#include <efi/efi.h>
 #include <buddy_allocator/buddy_allocator.h>
 
 #define PAGE_SIZE 4096

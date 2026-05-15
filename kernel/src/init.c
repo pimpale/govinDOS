@@ -7,8 +7,8 @@
 #include "setup_interrupts.h"
 
 #include <efi/efi.h>
-#include <efi/types.h>
 #include <efi/loaded_image_protocol.h>
+#include <efi/types.h>
 
 // EFI may use a stride given by desc_size. This regularizes the stride back to
 // sizeof(efi_memory_descriptor)
@@ -80,7 +80,7 @@ static efi_status_t get_image_base(efi_handle_t handle,
   struct efi_loaded_image_protocol *LIP = nullptr;
   struct efi_guid lip_guid = EFI_LOADED_IMAGE_PROTOCOL_GUID;
   efi_status_t handle_protocol_status =
-      system->boot->handle_protocol(handle, &lip_guid, &LIP);
+      system->boot->handle_protocol(handle, &lip_guid, (void **)&LIP);
 
   if (handle_protocol_status == EFI_SUCCESS) {
     *image_base = (uint64_t)LIP->image_base;
@@ -153,7 +153,7 @@ efi_status_t efi_main(efi_handle_t handle, struct efi_system_table *system) {
   setup_interrupts();
 
   // set up allocator
-  //setup_allocator();
+  // setup_allocator();
 
   while (true) {
   }

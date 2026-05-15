@@ -13,7 +13,7 @@ set -e
 # One arg, assembles it and places it inside the build dir
 compile_c() {
   mkdir -p bin/$(dirname $1)
-  clang-19 \
+  clang-22 \
     -std=c23 \
     -target x86_64-unknown-windows \
     -ffreestanding  -fno-builtin -fshort-wchar -mno-red-zone \
@@ -38,12 +38,12 @@ assemble() {
 link() {
   mkdir -p bin
   files=$(find ./bin/ -name "*.o")
-  lld-link-19 \
+  lld-link \
     -flavor link \
     -debug \
     -subsystem:efi_application \
     -entry:efi_main \
-    -out:bin/kernel.efi \
+    -out:bin/bootx64.efi \
     $files
 }
 
