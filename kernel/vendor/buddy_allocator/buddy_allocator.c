@@ -416,3 +416,21 @@ buddy_status_t buddy_mem_alloc(struct buddy_allocator_s *ba, uint64_t n_bytes,
 buddy_status_t buddy_mem_free(struct buddy_allocator_s *ba, void *mem) {
   return buddy_page_free(ba, ptr_to_page(ba, mem));
 }
+
+buddy_status_t buddy_mem_size(struct buddy_allocator_s *ba, void *mem,
+                              uint64_t *n_bytes) {
+  assert(ba->state == BUDDY_STATE_READY, "allocator state is not ready\n");
+
+  uint64_t block_index;
+  buddy_status_t s =
+      get_block_index_from_page_index(ba, ptr_to_page(ba, mem), &block_index);
+  if (s != BUDDY_STATUS_SUCCESS) {
+    return s;
+  }
+
+  // bucket size = pages_in_block * page_size
+  //             = 2^(max_level - heap_level(block_index)) * 2^page_size_log2
+  uint8_t shift = ba->max_level - heap_level(block_index) + ba->page_size_log2;
+  *n_bytes = uint64_pow2(shift);
+  return BUDDY_STATUS_SUCCESS;
+}

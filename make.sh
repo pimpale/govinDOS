@@ -25,10 +25,12 @@ subproject() {
 # No args, links all objects everything into kernel.bin
 make() {
   mkdir -p bin
+  mkdir -p root
   cp -rT root bin/root
   cp -rT efi bin/efi
   subproject kernel make
-  cp -rT kernel/bin/kernel.efi bin/root/bootx64.efi
+  mkdir -p bin/root/EFI/BOOT
+  cp -rT kernel/bin/kernel.efi bin/root/EFI/BOOT/BOOTX64.efi
 }
 
 # No arguments, cleans the build directory
@@ -48,6 +50,7 @@ runkernel() {
     -no-reboot \
     -drive if=pflash,format=raw,file=./bin/efi/OVMF.fd \
     -drive format=raw,file=fat:rw:bin/root \
+    -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
     -serial stdio \
     -m 1G \
     -net none \

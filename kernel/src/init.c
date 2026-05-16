@@ -1,13 +1,14 @@
 #include <stdint.h>
 
-#include "c_builtins.h"
 #include "debug.h"
 #include "serial.h"
-#include "serial_write.h"
 #include "setup_interrupts.h"
+#include "stdlib/stdio.h"
+#include "stdlib/string.h"
 
 #include <efi/efi.h>
 #include <efi/loaded_image_protocol.h>
+#include <efi/mp_services_protocol.h>
 #include <efi/types.h>
 
 // EFI may use a stride given by desc_size. This regularizes the stride back to
@@ -64,12 +65,35 @@ static efi_status_t get_memory_map(struct efi_system_table *system,
       // needed for the memory map. However subsequent free_pool and
       // allocate_pool might change the memory map and therefore I
       // additionally multiply it by 2.
-      system->boot->free_pool(mmap);
+      system->boot->free_pool(*mmap);
       mmap_size *= 2;
     } else {
-      system->boot->free_pool(mmap);
+      system->boot->free_pool(*mmap);
       return mmap_status;
     }
+  }
+}
+
+static void dump_mmap(const uint64_t n_mmap,
+                      const struct efi_memory_descriptor *mmap) {
+  printf("NEntries%08X\r\n", (uint32_t)n_mmap);
+
+  uint32_t n_pages = 0;
+  for (int i = 0; i < n_mmap; i++) {
+    if (mmap[i].type == 7) {
+      n_pages += mmap[i].pages;
+    }
+  }
+
+  printf("NPages %08X\r\n", n_pages);
+
+  for (uint32_t i = 0; i < n_mmap; i++) {
+    printf("MMAP %08X:\r\n", i);
+    printf(" TYPE: %08X\r\n", mmap[i].type);
+    printf(" PHYS_START: %016llX\r\n", (uint64_t)mmap[i].physical_start);
+    printf(" VIRT_START: %016llX\r\n", (uint64_t)mmap[i].virtual_start);
+    printf(" PAGES: %016llX\r\n", mmap[i].pages);
+    printf(" ATTRIBUTES: %016llX\r\n", mmap[i].attributes);
   }
 }
 
@@ -88,52 +112,16 @@ static efi_status_t get_image_base(efi_handle_t handle,
   return handle_protocol_status;
 }
 
-static void dump_mmap(const uint64_t n_mmap,
-                      const struct efi_memory_descriptor *mmap) {
-  serial_write_string("NEntries");
-  serial_write_u32hex(n_mmap);
-  serial_write_string("\r\n");
-
-  uint32_t n_pages = 0;
-  for (int i = 0; i < n_mmap; i++) {
-    if (mmap[i].type == 7) {
-      n_pages += mmap[i].pages;
-    }
-  }
-
-  serial_write_string("NPages ");
-  serial_write_u32hex(n_pages);
-  serial_write_string("\r\n");
-
-  for (uint32_t i = 0; i < n_mmap; i++) {
-    serial_write_string("MMAP ");
-    serial_write_u32hex(i);
-    serial_write_string(":\r\n TYPE: ");
-    serial_write_u32hex(mmap[i].type);
-    serial_write_string("\r\n PHYS_START: ");
-    serial_write_u64hex(mmap[i].physical_start);
-    serial_write_string("\r\n VIRT_START: ");
-    serial_write_u64hex(mmap[i].virtual_start);
-    serial_write_string("\r\n PAGES: ");
-    serial_write_u64hex(mmap[i].pages);
-    serial_write_string("\r\n ATTRIBUTES: ");
-    serial_write_u64hex(mmap[i].attributes);
-    serial_write_string("\r\n");
-  }
-}
-
 efi_status_t efi_main(efi_handle_t handle, struct efi_system_table *system) {
   serial_init();
 
-  serial_write_string("starting kernel!\n");
+  printf("starting kernel!\n");
 
   uint64_t image_base;
   efi_status_t image_base_status = get_image_base(handle, system, &image_base);
   assert(image_base_status == EFI_SUCCESS, "failed to get image base");
 
-  serial_write_string("image base: ");
-  serial_write_u64hex(image_base);
-  serial_write_string("\n");
+  printf("image base: %016llX\n", image_base);
 
   // get memory map
   efi_uint_t n_mmap = 0;
@@ -142,10 +130,12 @@ efi_status_t efi_main(efi_handle_t handle, struct efi_system_table *system) {
   efi_status_t mmap_status = get_memory_map(system, &mmap, &n_mmap, &mmap_key);
   assert(mmap_status == EFI_SUCCESS, "failed to get memory map!\n");
 
+  dump_mmap(n_mmap, mmap);
+
   // exit boot services
   efi_status_t exit_status = system->boot->exit_boot_services(handle, mmap_key);
   if (exit_status != EFI_SUCCESS) {
-    serial_write_string("failed to exit boot loader!\n");
+    printf("failed to exit boot loader!\n");
     return exit_status;
   }
 
@@ -155,8 +145,7 @@ efi_status_t efi_main(efi_handle_t handle, struct efi_system_table *system) {
   // set up allocator
   // setup_allocator();
 
-  while (true) {
-  }
+  assert(false, "Exit");
 
   return EFI_SUCCESS;
 }

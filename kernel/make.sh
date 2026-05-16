@@ -18,9 +18,12 @@ compile_c() {
     -target x86_64-unknown-windows \
     -ffreestanding  -fno-builtin -fshort-wchar -mno-red-zone \
     -O0 -g \
+    -DPRINTF_SUPPORT_DECIMAL_SPECIFIERS=0 \
+    -DPRINTF_SUPPORT_EXPONENTIAL_SPECIFIERS=0 \
     -Isrc \
     -Iarchsrc/x86_64 \
     -Ivendor \
+    -Isrc/stdlib \
     -c -o bin/$1.o \
     $1
 }
@@ -43,7 +46,7 @@ link() {
     -debug \
     -subsystem:efi_application \
     -entry:efi_main \
-    -out:bin/bootx64.efi \
+    -out:bin/kernel.efi \
     $files
 }
 
@@ -56,17 +59,20 @@ clean() {
 make() {
   # core kernel
   compile_c src/init.c
-  compile_c src/serial_write.c
   compile_c src/allocator.c
   compile_c src/debug.c
-  compile_c src/c_builtins.c
+  compile_c src/stdlib/stdio.c
+  compile_c src/stdlib/stdlib.c
+  compile_c src/stdlib/string.c
   # architecture specific
   compile_c archsrc/x86_64/serial.c
+  compile_c archsrc/x86_64/panic.c
   compile_c archsrc/x86_64/setup_interrupts.c
   assemble  archsrc/x86_64/gdt.asm
   assemble  archsrc/x86_64/idt.asm
   # vendor
   compile_c vendor/buddy_allocator/buddy_allocator.c
+  compile_c vendor/printf/printf.c
 
   link
 }

@@ -1,3 +1,9 @@
 # govinDOS
 
-Currently based on the osdev barebones tutorial. 
+Install clang-22 and lld-link 
+
+Then run with:
+
+```
+./make.sh runkernel
+```

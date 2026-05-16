@@ -56,4 +56,10 @@ buddy_status_t buddy_mem_alloc(struct buddy_allocator_s *ba, uint64_t n_bytes,
 // Free a region previously returned by buddy_mem_alloc.
 buddy_status_t buddy_mem_free(struct buddy_allocator_s *ba, void *mem);
 
+// Returns the size in bytes of the allocation starting at mem. The reported
+// size is the rounded-up bucket size (power-of-2 pages), not the original
+// n_bytes requested.
+buddy_status_t buddy_mem_size(struct buddy_allocator_s *ba, void *mem,
+                              uint64_t *n_bytes);
+
 #endif // buddy_allocator_h_INCLUDED

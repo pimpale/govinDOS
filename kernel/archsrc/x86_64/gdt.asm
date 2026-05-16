@@ -1,4 +1,5 @@
 [BITS 64]
+default rel
 
 ; From https://wiki.osdev.org/Setting_Up_Long_Mode
 ; This is the early gdt that will be replaced later

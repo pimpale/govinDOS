@@ -1,4 +1,4 @@
-#include "c_builtins.h"
+#include "string.h"
 
 void *memset(void *ptr, int value, size_t size) {
   char *dst = ptr;
@@ -10,7 +10,7 @@ void *memset(void *ptr, int value, size_t size) {
 
 void *memcpy(void *dst, const void *src, size_t size) {
   char *dst_c = dst;
-  char *src_c = dst;
+  const char *src_c = src;
   for (size_t i = 0; i < size; i++) {
     dst_c[i] = src_c[i];
   }
