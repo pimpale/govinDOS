@@ -59,8 +59,9 @@ clean() {
 make() {
   # core kernel
   compile_c src/init.c
-  compile_c src/allocator.c
+  compile_c src/acpi.c
   compile_c src/debug.c
+  compile_c src/mmap.c
   compile_c src/stdlib/stdio.c
   compile_c src/stdlib/stdlib.c
   compile_c src/stdlib/string.c

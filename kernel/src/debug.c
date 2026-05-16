@@ -9,12 +9,7 @@ void fatal(char *message) {
   panic();
 }
 
-[[noreturn]] void fatal_s_u64_s(char *s1, uint64_t u1, char *s2) {
-  printf("%s%016llX%s", s1, u1, s2);
-  panic();
-}
-
-void assert(bool h, char *message) {
+void asserts(bool h, char *message) {
   if (!h) {
     fatal(message);
   }

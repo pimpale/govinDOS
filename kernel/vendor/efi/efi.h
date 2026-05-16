@@ -148,7 +148,12 @@ struct efi_runtime_services {
 // --- Simple text I/O (opaque) ---------------------------------------------
 struct efi_simple_text_input_protocol;
 struct efi_simple_text_output_protocol;
-struct efi_configuration_table;
+
+// --- Configuration table --------------------------------------------------
+struct efi_configuration_table {
+  struct efi_guid vendor_guid;
+  void           *vendor_table;
+};
 
 // --- System table ---------------------------------------------------------
 struct efi_system_table {
