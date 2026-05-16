@@ -17,6 +17,8 @@ compile_c() {
     -std=c23 \
     -target x86_64-unknown-windows \
     -ffreestanding  -fno-builtin -fshort-wchar -mno-red-zone \
+    -mgeneral-regs-only \
+    -fstack-protector-all \
     -O0 -g \
     -DPRINTF_SUPPORT_DECIMAL_SPECIFIERS=0 \
     -DPRINTF_SUPPORT_EXPONENTIAL_SPECIFIERS=0 \
@@ -61,6 +63,7 @@ make() {
   compile_c src/init.c
   compile_c src/acpi.c
   compile_c src/debug.c
+  compile_c src/impl_stack_protector.c
   compile_c src/mmap.c
   compile_c src/stdlib/stdio.c
   compile_c src/stdlib/stdlib.c
@@ -69,6 +72,8 @@ make() {
   compile_c archsrc/x86_64/serial.c
   compile_c archsrc/x86_64/panic.c
   compile_c archsrc/x86_64/setup_interrupts.c
+  compile_c archsrc/x86_64/enumerate_cpus.c
+  compile_c archsrc/x86_64/smp.c
   assemble  archsrc/x86_64/gdt.asm
   assemble  archsrc/x86_64/idt.asm
   # vendor

@@ -53,6 +53,7 @@ runkernel() {
     -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
     -serial stdio \
     -m 1G \
+    -smp 4 \
     -net none \
     # -d int
 }

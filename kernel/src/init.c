@@ -1,6 +1,7 @@
 #include <stdint.h>
 
 #include "acpi.h"
+#include "enumerate_cpus.h"
 #include "debug.h"
 #include "mmap.h"
 #include "serial.h"
@@ -28,15 +29,13 @@ efi_status_t efi_main(efi_handle_t handle, struct efi_system_table *system) {
   // throw it all away
   const struct acpi_rsdp *rsdp = acpi_init(system);
   const struct acpi_madt *madt = acpi_find_madt(rsdp);
-  struct acpi_processor_list cpus = acpi_parse_processors(madt);
-  printf("acpi: %u processors, lapic @ %016llX, madt_flags=%08X\n",
-         (uint32_t)cpus.count, cpus.local_apic_address, cpus.madt_flags);
+  struct cpu_list cpus = enumerate_cpus(madt);
+  printf("acpi: %u processors\n", (uint32_t)cpus.count);
   for (size_t i = 0; i < cpus.count; i++) {
-    printf("  cpu[%u]: acpi_id=%02X apic_id=%02X %s%s\n", (uint32_t)i,
-           cpus.processors[i].acpi_processor_id,
-           cpus.processors[i].apic_id,
-           cpus.processors[i].enabled ? "enabled " : "",
-           cpus.processors[i].online_capable ? "online_capable" : "");
+    printf("  cpu[%u]: hw_id=%016llX %s%s\n", (uint32_t)i,
+           cpus.cpus[i].hw_id,
+           cpus.cpus[i].enabled ? "enabled " : "",
+           cpus.cpus[i].online_capable ? "online_capable" : "");
   }
 
   // exit boot services

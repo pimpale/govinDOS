@@ -7,6 +7,10 @@
 #include <efi/efi.h>
 
 // --- Raw ACPI structures --------------------------------------------------
+//
+// These structures and the table-walking API are arch-neutral. Decoding the
+// per-arch entries inside the MADT (Local APIC on x86_64, GICC on aarch64,
+// etc.) is the job of arch-specific code in archsrc/.
 
 // Root System Description Pointer. The first 20 bytes are the ACPI 1.0 layout;
 // fields after `revision` only exist when revision >= 2.
@@ -36,62 +40,22 @@ struct acpi_sdt_header {
   uint32_t creator_revision;
 } __attribute__((packed));
 
-// Multiple APIC Description Table ("APIC" signature).
+// Multiple APIC Description Table ("APIC" signature). On aarch64 this same
+// table holds GICC/GICD/GICR/GICITS entries; the per-entry decoders are
+// arch-specific.
 struct acpi_madt {
   struct acpi_sdt_header header;
-  uint32_t local_apic_address;
-  uint32_t flags;            // bit 0 = PCAT_COMPAT (legacy 8259 PIC present)
+  uint32_t local_apic_address; // x86 only; ignored on other archs
+  uint32_t flags;              // bit 0 = PCAT_COMPAT (legacy 8259 PIC present)
   // Followed by `length - sizeof(*this)` bytes of variable entries; each
   // entry begins with struct acpi_madt_entry_header.
 } __attribute__((packed));
 
-// Header on every MADT entry (ICS).
+// Header on every MADT entry (ICS). Entry payload follows.
 struct acpi_madt_entry_header {
   uint8_t type;
   uint8_t length;
 } __attribute__((packed));
-
-enum acpi_madt_entry_type {
-  ACPI_MADT_LOCAL_APIC               = 0,
-  ACPI_MADT_IO_APIC                  = 1,
-  ACPI_MADT_INTERRUPT_SOURCE_OVERRIDE = 2,
-  ACPI_MADT_LAPIC_ADDRESS_OVERRIDE   = 5,
-  ACPI_MADT_LOCAL_X2APIC             = 9,
-};
-
-// Type 0
-struct acpi_madt_local_apic {
-  struct acpi_madt_entry_header header;
-  uint8_t  acpi_processor_id;
-  uint8_t  apic_id;
-  uint32_t flags;            // bit 0 = enabled, bit 1 = online_capable
-} __attribute__((packed));
-
-// Type 5 (overrides MADT.local_apic_address)
-struct acpi_madt_lapic_address_override {
-  struct acpi_madt_entry_header header;
-  uint16_t reserved;
-  uint64_t local_apic_address;
-} __attribute__((packed));
-
-// --- Friendly representation ----------------------------------------------
-
-#define ACPI_MAX_PROCESSORS 255
-
-struct acpi_processor {
-  uint8_t acpi_processor_id;
-  uint8_t apic_id;
-  bool    enabled;         // OS may use this CPU now
-  bool    online_capable;  // OS may bring it online later
-};
-
-struct acpi_processor_list {
-  uint64_t local_apic_address; // honors a Type 5 override if present
-  uint32_t madt_flags;         // raw MADT flags (bit 0 = legacy PIC present)
-  size_t   count;
-  // Type 9 (x2APIC) entries are skipped — APIC IDs > 254 don't fit here.
-  struct acpi_processor processors[ACPI_MAX_PROCESSORS];
-};
 
 // --- API -------------------------------------------------------------------
 
@@ -105,9 +69,5 @@ const struct acpi_rsdp *acpi_init(struct efi_system_table *system);
 // Walks the RSDT or XSDT (XSDT preferred when rsdp->revision >= 2) looking
 // for the MADT. Returns nullptr if not present or invalid.
 const struct acpi_madt *acpi_find_madt(const struct acpi_rsdp *rsdp);
-
-// Parses the MADT into a friendly processor list. Caller owns the returned
-// value (returned by value, ~1 KB).
-struct acpi_processor_list acpi_parse_processors(const struct acpi_madt *madt);
 
 #endif // acpi_h_INCLUDED
