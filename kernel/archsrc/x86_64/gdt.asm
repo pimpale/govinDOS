@@ -1,68 +1,39 @@
 [BITS 64]
 default rel
 
-; From https://wiki.osdev.org/Setting_Up_Long_Mode
-; This is the early gdt that will be replaced later
-[GLOBAL GDT]
-[GLOBAL GDT.Null]
-[GLOBAL GDT.Code]
-[GLOBAL GDT.Data]
-[GLOBAL GDT.TSS]
-[GLOBAL GDT.Pointer]
-
 [GLOBAL asm_load_gdt]
 
 [SECTION .text]
 
+; void asm_load_gdt(const struct gdtr *gdtr_ptr, uint16_t code_sel)
+;
+; Loads the GDT pointed to by gdtr_ptr, then far-returns into the new
+; kernel code segment and reloads the data segment registers.
+;
+; The GDT contents themselves are built in C (see archsrc/x86_64/gdt.c).
+; This routine is the small slice that must be assembly because reloading
+; CS in 64-bit mode requires lretq, which is awkward to express in C.
+;
+; Win64 ABI:
+;   rcx = pointer to a packed { uint16_t limit; uint64_t base; }
+;   dx  = kernel code selector
+;
+; The data selector is assumed to be (code_sel + 8) — i.e. kernel CS and
+; kernel DS are adjacent in the GDT. This matches the layout in gdt.c and
+; the layout required by syscall/sysret (STAR MSR), so user CS/DS will fit
+; the same convention later.
 asm_load_gdt:
-    mov rax, GDT.Pointer
-    lgdt [rax]                   ; Load the 64-bit global descriptor table.
-    push GDT.Code
-    lea  rax, [rel .reload_CS]
-    push rax
+    lgdt [rcx]
+    movzx rdx, dx              ; zero-extend selector for the push
+    push  rdx                  ; CS for lretq
+    lea   rax, [rel .reload_CS]
+    push  rax                  ; RIP for lretq
     retfq
 .reload_CS:
-    mov ax, GDT.Data              ; Set the A-register to the data descriptor.
-    mov ds, ax                    ; Set the data segment to the A-register.
-    mov es, ax                    ; Set the extra segment to the A-register.
-    mov fs, ax                    ; Set the F-segment to the A-register.
-    mov gs, ax                    ; Set the G-segment to the A-register.
-    mov ss, ax
+    add   dx, 8                ; data selector = code + 8
+    mov   ds, dx
+    mov   es, dx
+    mov   fs, dx
+    mov   gs, dx
+    mov   ss, dx
     ret
-
-[SECTION .data]
-
-; Access bits
-PRESENT        equ 1 << 7
-NOT_SYS        equ 1 << 4
-EXEC           equ 1 << 3
-DC             equ 1 << 2
-RW             equ 1 << 1
-ACCESSED       equ 1 << 0
-
-; Flags bits
-GRAN_4K       equ 1 << 7
-SZ_32         equ 1 << 6
-LONG_MODE     equ 1 << 5
-
-GDT:
-    .Null: equ $ - GDT
-        dq 0
-    .Code: equ $ - GDT
-        dd 0xFFFF                                   ; Limit & Base (low, bits 0-15)
-        db 0                                        ; Base (mid, bits 16-23)
-        db PRESENT | NOT_SYS | EXEC | RW            ; Access
-        db GRAN_4K | LONG_MODE | 0xF                ; Flags & Limit (high, bits 16-19)
-        db 0                                        ; Base (high, bits 24-31)
-    .Data: equ $ - GDT
-        dd 0xFFFF                                   ; Limit & Base (low, bits 0-15)
-        db 0                                        ; Base (mid, bits 16-23)
-        db PRESENT | NOT_SYS | RW                   ; Access
-        db GRAN_4K | SZ_32 | 0xF                    ; Flags & Limit (high, bits 16-19)
-        db 0                                        ; Base (high, bits 24-31)
-    .TSS: equ $ - GDT
-        dd 0x00000068
-        dd 0x00CF8900
-    .Pointer:
-        dw $ - GDT - 1
-        dq GDT

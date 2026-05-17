@@ -17,4 +17,9 @@
 //   - aarch64: PSCI CPU_ON (HVC/SMC) — AP lands at `entry` already in EL1.
 void cpu_start(uint64_t hw_id, void (*entry)(void), void *stack);
 
+// Called from an AP's entry function once it has finished anything it wants
+// to do before the BSP proceeds to start the next CPU. cpu_start blocks
+// until this is invoked (or it times out).
+void cpu_signal_alive(void);
+
 #endif // smp_h_INCLUDED

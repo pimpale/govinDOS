@@ -1,5 +1,5 @@
-#ifndef mmap_h_INCLUDED
-#define mmap_h_INCLUDED
+#ifndef get_mmap_h_INCLUDED
+#define get_mmap_h_INCLUDED
 
 #include <stdint.h>
 
@@ -18,4 +18,4 @@ efi_status_t get_memory_map(struct efi_system_table *system,
 
 void dump_mmap(uint64_t n_mmap, const struct efi_memory_descriptor *mmap);
 
-#endif // mmap_h_INCLUDED
+#endif // get_mmap_h_INCLUDED

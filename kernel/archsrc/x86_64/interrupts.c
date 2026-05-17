@@ -1,19 +1,8 @@
-#include "setup_interrupts.h"
+#include "interrupts.h"
 
 #include <stdint.h>
 
 #include "stdlib/stdio.h"
-
-// defined in assembly
-extern void asm_load_gdt();
-extern void asm_load_idt();
-
-void setup_interrupts() {
-    asm_load_gdt();
-    asm_load_idt();
-}
-
-
 
 #define INT_DOUBLE_FAULT 0x00000002
 #define INT_GENERAL_PROTECTION 0x0000000D
