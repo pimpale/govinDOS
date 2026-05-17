@@ -42,13 +42,22 @@
 #define IST_PAGE_FAULT     3
 #define IST_MACHINE_CHECK  4
 
-// One-time per-CPU bring-up. Allocates this CPU's GDT, TSS, kernel stack,
-// and IST stacks; populates the descriptors; and installs them via
+// One-time per-CPU bring-up. Allocates this CPU's GDT and TSS, populates
+// the descriptors using the caller-provided stacks, and installs them via
 // lgdt + segment reloads + ltr. Call once on each CPU (BSP and every AP)
 // from its C entry point, before enabling interrupts.
 //
+// Each stack pointer is the *top* of an already-allocated kernel stack
+// whose bottom page has been mapped absent as a guard. The caller owns
+// these allocations; this function only records them in the TSS.
+//
 // On return, this CPU is running with its own GDT loaded, segment registers
 // pointing at the new kernel selectors, and TR pointing at the new TSS.
-void cpu_install_gdt_tss(void);
+void cpu_install_gdt_tss(
+    void *rsp0_stack_top,
+    void *ist_double_fault_stack_top,
+    void *ist_nmi_stack_top,
+    void *ist_page_fault_stack_top,
+    void *ist_machine_check_stack_top);
 
 #endif // gdt_h_INCLUDED

@@ -5,6 +5,7 @@
 #include "debug.h"
 
 struct buddy_allocator_s *g_allocator = nullptr;
+struct spinlock g_allocator_lock = SPINLOCK_INITIALIZER;
 
 struct frame_info *g_frames = nullptr;
 uint64_t           g_n_frames = 0;

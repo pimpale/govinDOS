@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 
+#include "paging.h"
 #include "stdlib/stdio.h"
 
 #define INT_DOUBLE_FAULT 0x00000002
@@ -29,6 +30,13 @@ struct [[gnu::packed]] cpu_state {
 };
 
 uint64_t interrupt_handler(struct cpu_state cpu, uint64_t vector, uint64_t error, uint64_t rip) {
+    switch (vector) {
+        case VECTOR_TLB_SHOOTDOWN:
+            paging_handle_tlb_shootdown();
+            return 0;
+        default:
+            break;
+    }
     printf("vector:%016llX\n", vector);
     printf("error:%016llX\n", error);
     printf("rip:%016llX\n", rip);

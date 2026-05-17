@@ -23,6 +23,15 @@ struct acpi_madt_local_apic {
   uint32_t flags;            // bit 0 = enabled, bit 1 = online_capable
 } __attribute__((packed));
 
+// Type 1
+struct acpi_madt_io_apic {
+  struct acpi_madt_entry_header header;
+  uint8_t  io_apic_id;
+  uint8_t  reserved;
+  uint32_t io_apic_address;
+  uint32_t global_system_interrupt_base;
+} __attribute__((packed));
+
 // Type 5 (overrides MADT.local_apic_address)
 struct acpi_madt_lapic_address_override {
   struct acpi_madt_entry_header header;

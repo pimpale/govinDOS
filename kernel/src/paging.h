@@ -2,9 +2,10 @@
 #define paging_h_INCLUDED
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
-// Architecture-independent page-tree manipulation API.
+// Architecture-independent identity page-tree manipulation API.
 //
 // All address-space mutations go through this interface. The boot-time
 // constructors live in archsrc/<arch>/paging_init.h.
@@ -20,9 +21,6 @@ struct address_space;
 // these to hardware PTE bits.
 //
 //   PAGE_R, PAGE_W, PAGE_X     - access rights granted to the mapping.
-//                                 PAGE_R is the minimum for any present
-//                                 mapping; absence of all three means
-//                                 "not present" (use as_unmap instead).
 //   PAGE_U                     - usable from ring 3 (DPL=3 on x86,
 //                                 EL0 on aarch64). Without it, the
 //                                 mapping is kernel-only.
@@ -30,81 +28,81 @@ struct address_space;
 //                                 write-back, suitable for RAM. UC for
 //                                 MMIO, WC for framebuffers.
 typedef uint32_t paging_flags_t;
-#define PAGE_R   (1u << 0)
-#define PAGE_W   (1u << 1)
-#define PAGE_X   (1u << 2)
-#define PAGE_U   (1u << 3)
+#define PAGE_R (1u << 0)
+#define PAGE_W (1u << 1)
+#define PAGE_X (1u << 2)
+#define PAGE_U (1u << 3)
 
-#define PAGE_WB  (0u << 4)
-#define PAGE_UC  (1u << 4)
-#define PAGE_WC  (2u << 4)
-#define PAGE_WT  (3u << 4)
+#define PAGE_WB (0u << 4)
+#define PAGE_UC (1u << 4)
+#define PAGE_WC (2u << 4)
+#define PAGE_WT (3u << 4)
 #define PAGE_CACHE_MASK (3u << 4)
 
 // ---------------------------------------------------------------------------
 // Lifecycle / singletons
 // ---------------------------------------------------------------------------
 
-// The kernel address space. Built by paging_init_shared() and sealed
-// against further modification once boot finishes.
-struct address_space *as_kernel(void);
+// The kernel address space.
+// will be set in cpu_setup.c
+extern struct address_space *g_as_kernel;
 
-// Bootstrap the kernel AS's root table. Called once from
-// paging_init_shared, before any other operation on the kernel AS.
-// Not for general use.
-void as_init_kernel(void);
+// Current CPU Address Space Pointer
+// will be allocated + initialized in cpu_setup.c
+// one per CPU (thus n_cpu entries)
+extern struct address_space **g_as_current_percpu;
 
-// Create a new (unsealed) process address space. Aliases the kernel
-// AS's upper-level tables by reference where possible; private tables
-// are allocated lazily on first per-process upgrade.
-struct address_space *as_create(void);
+/////////////////////////////////////////////////////////////
+// AS Data Manipulation (No side effects apart from allocation/deallocation)
+/////////////////////////////////////////////////////////////
 
-// Tear down a non-sealed AS. Frees every private intermediate table
-// owned by `as` and drops refcounts on every user frame it has mapped.
-// Must not be called on the kernel AS.
-void as_destroy(struct address_space *as);
+// Create an identity mapped address space.
+struct address_space *as_identity_mapping(void);
 
-// One-way: mark `as` as immutable. Any later as_map / as_unmap /
-// as_protect on it asserts. Used to enforce "kernel mappings are
-// frozen after boot" as a structural invariant.
-void as_seal(struct address_space *as);
+// create a deep copy of an address space
+struct address_space *as_clone(struct address_space* src);
 
-// ---------------------------------------------------------------------------
-// Per-CPU operations
-// ---------------------------------------------------------------------------
+// Frees the address space and its children
+void as_free(struct address_space *as);
 
-// Switch this CPU to `as`. Updates the AS's active-CPU mask for
-// future shootdowns.
+// get data about an address in a given tab
+int as_getinfo(const struct address_space *as, uint64_t addr,
+               paging_flags_t *flags_out, bool *present_out);
+
+// set flags
+// will mark ranges as dirty. Call flush after making a set of changes
+int as_flag(struct address_space *as, uint64_t addr, uint64_t end,
+            paging_flags_t flags);
+
+//////////////////////////////////////////////////////
+// Invalidation + Shootdown Functions (Yes side effects)
+//////////////////////////////////////////////////////
+
+// Make `as` the current address space on this CPU. Updates
+// g_as_current_percpu[this_cpu] and writes the architecture's page-table
+// base register (CR3 on x86_64).
 void as_switch(struct address_space *as);
 
-// Invalidate the TLB for `addr` on this CPU, then IPI-shootdown to
-// any other CPU currently running `as`. Called automatically by the
-// map/unmap/protect operations; exposed for code that wants to batch
-// several mutations and flush once.
-void as_flush(struct address_space *as, uint64_t addr);
+// invalidate dirty pages
+int as_flush(struct address_space *as);
 
-// ---------------------------------------------------------------------------
-// Tree manipulation
-// ---------------------------------------------------------------------------
-//
-// addr is both VA and PA (identity-mapped). All addrs must be 4 KiB
-// aligned. Range variants take a half-open [start, end).
-//
-// Return value: 0 on success, negative on failure (out of memory,
-// already-mapped, etc. -- specific codes TBD).
+// Allocate a kernel stack of `total_size` bytes from the global allocator
+// and return a pointer to its top. The bottom 4 KiB is mapped absent in the
+// kernel address space as an overflow guard. Caller must as_flush(g_as_kernel)
+// before the stack can be used on a different CPU.
+void *kernel_stack_alloc(size_t total_size);
 
-int as_map     (struct address_space *as, uint64_t addr, paging_flags_t flags);
-int as_unmap   (struct address_space *as, uint64_t addr);
-int as_protect (struct address_space *as, uint64_t addr, paging_flags_t flags);
-int as_walk    (const struct address_space *as, uint64_t addr,
-                paging_flags_t *flags_out, bool *present_out);
+//////////////////////////////////////////////////////
+// Cross-CPU shootdown (interrupt dispatch glue)
+//////////////////////////////////////////////////////
 
-// Bulk variants. The implementation is allowed to install huge-page
-// leaves (2 MiB / 1 GiB) when the range is large and aligned enough,
-// which is the only practical way to build the kernel identity map.
-int as_map_range  (struct address_space *as,
-                   uint64_t start, uint64_t end, paging_flags_t flags);
-int as_unmap_range(struct address_space *as,
-                   uint64_t start, uint64_t end);
+// IDT vector reserved for TLB shootdown IPIs. Architecture-specific dispatch
+// (interrupts.c on x86_64) routes this vector to paging_handle_tlb_shootdown.
+#define VECTOR_TLB_SHOOTDOWN 0xFD
+
+// ISR body for the TLB shootdown IPI. Reads the in-flight shootdown
+// request, invalidates the requested range locally if this CPU is running
+// the targeted AS, acks the initiator, and EOIs the local APIC.
+void paging_handle_tlb_shootdown(void);
 
 #endif // paging_h_INCLUDED

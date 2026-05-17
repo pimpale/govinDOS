@@ -10,6 +10,8 @@
 #include "interrupts.h"
 #include "allocator.h"
 #include "smp.h"
+#include "cpu_setup.h"
+#include "paging.h"
 
 #include "stdlib/stdio.h"
 #include "stdlib/stdlib.h"
@@ -19,15 +21,42 @@
 
 #define AP_TRAMPOLINE_BASE 0x8000
 #define AP_STACK_SIZE      (16 * 1024)
+#define IST_STACK_SIZE     (16 * 1024)
+
+// Per-CPU stack tops, indexed by LAPIC ID. Populated by the BSP before SIPI
+// (for APs) or directly by the BSP for itself. Each AP reads its own row by
+// LAPIC ID in ap_main, then passes the tops into cpu_setup.
+struct cpu_stacks {
+  void *rsp0_top;
+  void *ist_double_fault_top;
+  void *ist_nmi_top;
+  void *ist_page_fault_top;
+  void *ist_machine_check_top;
+};
+static struct cpu_stacks g_cpu_stacks[MAX_CPUS];
+
+static void alloc_cpu_stacks(struct cpu_stacks *s) {
+  s->rsp0_top              = kernel_stack_alloc(AP_STACK_SIZE);
+  s->ist_double_fault_top  = kernel_stack_alloc(IST_STACK_SIZE);
+  s->ist_nmi_top           = kernel_stack_alloc(IST_STACK_SIZE);
+  s->ist_page_fault_top    = kernel_stack_alloc(IST_STACK_SIZE);
+  s->ist_machine_check_top = kernel_stack_alloc(IST_STACK_SIZE);
+}
 
 static void ap_main(void) {
   // Each AP arrives here in long mode on the trampoline's bootstrap GDT
   // with no IDT loaded. Move it onto the kernel GDT/IDT before doing
   // anything else.
-  // setup_interrupts_ap();
   uint8_t id = x86_lapic_id();
+  struct cpu_stacks *s = &g_cpu_stacks[id];
+  cpu_setup(s->rsp0_top,
+            s->ist_double_fault_top,
+            s->ist_nmi_top,
+            s->ist_page_fault_top,
+            s->ist_machine_check_top);
   printf("ap[%u]: hello from long mode\n", (uint32_t)id);
   cpu_signal_alive();
+  __asm__ volatile("sti");
   for (;;) {
     __asm__ volatile("hlt");
   }
@@ -82,10 +111,25 @@ efi_status_t efi_main(efi_handle_t handle, struct efi_system_table *system) {
   // set up allocator
   allocator_init(n_mmap, mmap);
 
+  x86_lapic_init(lapic_phys);
+  cpu_setup_bsp(rsdp);
+
+  // Allocate the BSP's kernel + IST stacks. Their guard pages were marked
+  // absent in g_as_kernel by kernel_stack_alloc, so flush before we switch
+  // onto the kernel AS inside cpu_setup.
+  uint8_t bsp_id = x86_lapic_id();
+  alloc_cpu_stacks(&g_cpu_stacks[bsp_id]);
+  as_flush(g_as_kernel);
+
+  cpu_setup(g_cpu_stacks[bsp_id].rsp0_top,
+            g_cpu_stacks[bsp_id].ist_double_fault_top,
+            g_cpu_stacks[bsp_id].ist_nmi_top,
+            g_cpu_stacks[bsp_id].ist_page_fault_top,
+            g_cpu_stacks[bsp_id].ist_machine_check_top);
+  as_flush(g_as_kernel);
+
   // Bring up the application processors.
   if (have_trampoline) {
-    x86_lapic_init(lapic_phys);
-    uint8_t bsp_id = x86_lapic_id();
     for (size_t i = 0; i < cpus.count; i++) {
       if (!cpus.cpus[i].enabled) {
         continue;
@@ -93,11 +137,18 @@ efi_status_t efi_main(efi_handle_t handle, struct efi_system_table *system) {
       if (cpus.cpus[i].hw_id == bsp_id) {
         continue;
       }
-      void *stack = malloc(AP_STACK_SIZE);
-      asserts(stack != nullptr, "smp: failed to allocate AP stack\n");
-      void *stack_top = (uint8_t *)stack + AP_STACK_SIZE;
+      alloc_cpu_stacks(&g_cpu_stacks[cpus.cpus[i].hw_id]);
+    }
+
+    as_flush(g_as_kernel);
+
+    for (size_t i = 0; i < cpus.count; i++) {
+      if (!cpus.cpus[i].enabled || cpus.cpus[i].hw_id == bsp_id) {
+        continue;
+      }
       printf("smp: starting cpu hw_id=%llu\n", cpus.cpus[i].hw_id);
-      cpu_start(cpus.cpus[i].hw_id, ap_main, stack_top);
+      cpu_start(cpus.cpus[i].hw_id, ap_main,
+                g_cpu_stacks[cpus.cpus[i].hw_id].rsp0_top);
     }
   }
 

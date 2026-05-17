@@ -2,13 +2,16 @@
 
 #include <stdint.h>
 
+#include "allocator.h"
 #include "debug.h"
 #include "panic.h"
+#include "paging.h"
 #include "serial.h"
 #include "stdlib/stdio.h"
 
 // LAPIC register offsets (xAPIC MMIO).
 #define LAPIC_REG_ID         0x020   // bits 24..31 = APIC ID
+#define LAPIC_REG_EOI        0x0B0
 #define LAPIC_REG_ICR_LOW    0x300
 #define LAPIC_REG_ICR_HIGH   0x310
 
@@ -79,4 +82,14 @@ void x86_lapic_send_init(uint8_t apic_id) {
 
 void x86_lapic_send_sipi(uint8_t apic_id, uint8_t vector) {
   send_ipi(apic_id, ICR_DELIVERY_SIPI | ICR_LEVEL_ASSERT | (uint32_t)vector);
+}
+
+void x86_lapic_send_fixed(uint8_t apic_id, uint8_t vector) {
+  // Delivery mode 0 (fixed) and trigger mode 0 (edge) are encoded as zero
+  // bits; only level=assert and the vector itself need to be set.
+  send_ipi(apic_id, ICR_LEVEL_ASSERT | (uint32_t)vector);
+}
+
+void x86_lapic_eoi(void) {
+  lapic_write(LAPIC_REG_EOI, 0);
 }
