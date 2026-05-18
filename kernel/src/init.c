@@ -1,65 +1,44 @@
 #include <stdint.h>
 
 #include "acpi.h"
+#include "allocator.h"
+#include "cpu_hwid.h"
+#include "cpu_setup.h"
 #include "debug.h"
 #include "enumerate_cpus.h"
-#include "lapic.h"
-#include "madt_x86.h"
 #include "get_mmap.h"
-#include "serial.h"
 #include "interrupts.h"
-#include "allocator.h"
-#include "smp.h"
-#include "cpu_setup.h"
 #include "paging.h"
+#include "serial.h"
+#include "smp.h"
 
 #include "stdlib/stdio.h"
 #include "stdlib/stdlib.h"
+#include "thread.h"
 
 #include <efi/efi.h>
 #include <efi/types.h>
 
 #define AP_TRAMPOLINE_BASE 0x8000
-#define AP_STACK_SIZE      (16 * 1024)
-#define IST_STACK_SIZE     (16 * 1024)
 
-// Per-CPU stack tops, indexed by LAPIC ID. Populated by the BSP before SIPI
-// (for APs) or directly by the BSP for itself. Each AP reads its own row by
-// LAPIC ID in ap_main, then passes the tops into cpu_setup.
-struct cpu_stacks {
-  void *rsp0_top;
-  void *ist_double_fault_top;
-  void *ist_nmi_top;
-  void *ist_page_fault_top;
-  void *ist_machine_check_top;
-};
-static struct cpu_stacks g_cpu_stacks[MAX_CPUS];
-
-static void alloc_cpu_stacks(struct cpu_stacks *s) {
-  s->rsp0_top              = kernel_stack_alloc(AP_STACK_SIZE);
-  s->ist_double_fault_top  = kernel_stack_alloc(IST_STACK_SIZE);
-  s->ist_nmi_top           = kernel_stack_alloc(IST_STACK_SIZE);
-  s->ist_page_fault_top    = kernel_stack_alloc(IST_STACK_SIZE);
-  s->ist_machine_check_top = kernel_stack_alloc(IST_STACK_SIZE);
+// Smoke test for the scheduler: prints a few times, yielding between
+// prints so other threads (and the idle loop) get to run.
+static void hello_thread(void *arg) {
+  uint64_t n = (uint64_t)arg;
+  for (uint64_t i = 0; i < 5; i++) {
+    printf("thread %llu tick %llu (cpu %u)\n", n, i,
+           (unsigned)cpu_state_whoami());
+    yield();
+  }
 }
 
-static void ap_main(void) {
-  // Each AP arrives here in long mode on the trampoline's bootstrap GDT
-  // with no IDT loaded. Move it onto the kernel GDT/IDT before doing
-  // anything else.
-  uint8_t id = x86_lapic_id();
-  struct cpu_stacks *s = &g_cpu_stacks[id];
-  cpu_setup(s->rsp0_top,
-            s->ist_double_fault_top,
-            s->ist_nmi_top,
-            s->ist_page_fault_top,
-            s->ist_machine_check_top);
-  printf("ap[%u]: hello from long mode\n", (uint32_t)id);
+static void ap_main() {
+  cpu_setup();
+  printf("ap[%u]: hello from long mode\n", (unsigned)cpu_state_whoami());
   cpu_signal_alive();
-  __asm__ volatile("sti");
-  for (;;) {
-    __asm__ volatile("hlt");
-  }
+  // Hand this CPU off to the scheduler. The current execution becomes
+  // this CPU's idle thread and never returns from here.
+  threading_cpu_enter();
 }
 
 efi_status_t efi_main(efi_handle_t handle, struct efi_system_table *system) {
@@ -91,15 +70,6 @@ efi_status_t efi_main(efi_handle_t handle, struct efi_system_table *system) {
   // throw it all away
   const struct acpi_rsdp *rsdp = acpi_init(system);
   const struct acpi_madt *madt = acpi_find_madt(rsdp);
-  struct cpu_list cpus = enumerate_cpus(madt);
-  uint64_t lapic_phys = x86_lapic_address(madt);
-  printf("acpi: %u processors\n", (uint32_t)cpus.count);
-  for (size_t i = 0; i < cpus.count; i++) {
-    printf("  cpu[%u]: hw_id=%016llX %s%s\n", (uint32_t)i,
-           cpus.cpus[i].hw_id,
-           cpus.cpus[i].enabled ? "enabled " : "",
-           cpus.cpus[i].online_capable ? "online_capable" : "");
-  }
 
   // exit boot services
   efi_status_t exit_status = system->boot->exit_boot_services(handle, mmap_key);
@@ -111,48 +81,42 @@ efi_status_t efi_main(efi_handle_t handle, struct efi_system_table *system) {
   // set up allocator
   allocator_init(n_mmap, mmap);
 
-  x86_lapic_init(lapic_phys);
+  // now we can initialize the cpu state table.
+  cpu_state_table_init(madt);
+
+  // set up early boot processor stuff
+  // allocates per-cpu kernel stacks for all cpus
+  // paging, interrupts, etc still not yet set up
   cpu_setup_bsp(rsdp);
 
-  // Allocate the BSP's kernel + IST stacks. Their guard pages were marked
-  // absent in g_as_kernel by kernel_stack_alloc, so flush before we switch
-  // onto the kernel AS inside cpu_setup.
-  uint8_t bsp_id = x86_lapic_id();
-  alloc_cpu_stacks(&g_cpu_stacks[bsp_id]);
-  as_flush(g_as_kernel);
+  // Initialize threading before bringing up APs — APs will call
+  // threading_cpu_enter() as soon as they finish cpu_setup, which
+  // requires g_kernel_process to exist.
+  threading_init();
 
-  cpu_setup(g_cpu_stacks[bsp_id].rsp0_top,
-            g_cpu_stacks[bsp_id].ist_double_fault_top,
-            g_cpu_stacks[bsp_id].ist_nmi_top,
-            g_cpu_stacks[bsp_id].ist_page_fault_top,
-            g_cpu_stacks[bsp_id].ist_machine_check_top);
-  as_flush(g_as_kernel);
+  uint64_t bsp_id = cpu_hwid();
 
   // Bring up the application processors.
   if (have_trampoline) {
-    for (size_t i = 0; i < cpus.count; i++) {
-      if (!cpus.cpus[i].enabled) {
+    for (size_t i = 0; i < g_cpu_state_table_len; i++) {
+      if (g_cpu_state_table[i].hw_id == bsp_id) {
         continue;
       }
-      if (cpus.cpus[i].hw_id == bsp_id) {
-        continue;
-      }
-      alloc_cpu_stacks(&g_cpu_stacks[cpus.cpus[i].hw_id]);
-    }
-
-    as_flush(g_as_kernel);
-
-    for (size_t i = 0; i < cpus.count; i++) {
-      if (!cpus.cpus[i].enabled || cpus.cpus[i].hw_id == bsp_id) {
-        continue;
-      }
-      printf("smp: starting cpu hw_id=%llu\n", cpus.cpus[i].hw_id);
-      cpu_start(cpus.cpus[i].hw_id, ap_main,
-                g_cpu_stacks[cpus.cpus[i].hw_id].rsp0_top);
+      printf("smp: starting cpu hw_id=%llu\n", g_cpu_state_table[i].hw_id);
+      cpu_start(g_cpu_state_table[i].hw_id, ap_main,
+                g_cpu_state_table[i].stacks.kernel_bootstrap_top);
     }
   }
 
-  asserts(false, "Exit");
+  // set up our own cpu. Enables paging + interrupts
+  cpu_setup();
 
-  return EFI_SUCCESS;
+  // Drop a few smoke-test threads onto the global ready queue. Any CPU
+  // (BSP or APs already in their idle loops) is free to pick them up.
+  for (uint64_t i = 0; i < 3; i++) {
+    kthread_spawn(hello_thread, (void *)(uintptr_t)i);
+  }
+
+  // Become the BSP's idle thread. Never returns.
+  threading_cpu_enter();
 }

@@ -3,6 +3,7 @@
 
 #include "allocator.h"
 #include "debug.h"
+#include "paging.h"
 
 struct buddy_allocator_s *g_allocator = nullptr;
 struct spinlock g_allocator_lock = SPINLOCK_INITIALIZER;

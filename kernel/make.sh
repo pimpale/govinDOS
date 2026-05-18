@@ -73,10 +73,13 @@ make() {
   compile_c src/init.c
   compile_c src/acpi.c
   compile_c src/debug.c
+  compile_c src/stacks.c
   compile_c src/impl_stack_protector.c
   compile_c src/get_mmap.c
   compile_c src/allocator.c
+  compile_c src/cpu_state.c
   compile_c src/spinlock.c
+  compile_c src/thread.c
   compile_c src/stdlib/stdio.c
   compile_c src/stdlib/stdlib.c
   compile_c src/stdlib/string.c
@@ -85,13 +88,16 @@ make() {
   compile_c archsrc/x86_64/panic.c
   compile_c archsrc/x86_64/interrupts.c
   compile_c archsrc/x86_64/enumerate_cpus.c
+  compile_c archsrc/x86_64/cpu_hwid.c
   compile_c archsrc/x86_64/lapic.c
   compile_c archsrc/x86_64/smp.c
   compile_c archsrc/x86_64/gdt.c
   compile_c archsrc/x86_64/paging.c
   compile_c archsrc/x86_64/cpu_setup.c
+  compile_c archsrc/x86_64/thread_arch.c
   assemble  archsrc/x86_64/gdt.asm
   assemble  archsrc/x86_64/interrupts.asm
+  assemble  archsrc/x86_64/context_switch.asm
   # AP trampoline: flat binary first, then COFF wrapper that incbin's it.
   assemble_bin archsrc/x86_64/blobs/ap_trampoline.asm
   assemble     archsrc/x86_64/ap_trampoline_blob.asm

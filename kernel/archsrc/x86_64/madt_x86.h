@@ -39,9 +39,4 @@ struct acpi_madt_lapic_address_override {
   uint64_t local_apic_address;
 } __attribute__((packed));
 
-// Returns the effective LAPIC MMIO address: starts at madt->local_apic_address
-// and is replaced by the first Type-5 override if present. Returns 0 if `madt`
-// is null.
-uint64_t x86_lapic_address(const struct acpi_madt *madt);
-
 #endif // madt_x86_h_INCLUDED

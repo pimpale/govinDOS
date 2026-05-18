@@ -6,9 +6,6 @@
 #include "buddy_allocator/buddy_allocator.h"
 #include "spinlock.h"
 
-
-#define PAGE_SIZE 4096
-
 // a (global) pointer to the allocator
 extern struct buddy_allocator_s* g_allocator;
 extern struct spinlock g_allocator_lock;

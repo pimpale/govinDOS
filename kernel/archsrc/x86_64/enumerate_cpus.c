@@ -45,29 +45,3 @@ struct cpu_list enumerate_cpus(const struct acpi_madt *madt) {
   return list;
 }
 
-uint64_t x86_lapic_address(const struct acpi_madt *madt) {
-  if (madt == nullptr) {
-    return 0;
-  }
-
-  uint64_t addr = madt->local_apic_address;
-
-  const uint8_t *p = (const uint8_t *)madt + sizeof(*madt);
-  const uint8_t *end = (const uint8_t *)madt + madt->header.length;
-
-  while (p + sizeof(struct acpi_madt_entry_header) <= end) {
-    const struct acpi_madt_entry_header *eh =
-        (const struct acpi_madt_entry_header *)p;
-    if (eh->length < sizeof(*eh) || p + eh->length > end) {
-      break;
-    }
-    if (eh->type == ACPI_MADT_LAPIC_ADDRESS_OVERRIDE) {
-      const struct acpi_madt_lapic_address_override *ovr =
-          (const struct acpi_madt_lapic_address_override *)p;
-      addr = ovr->local_apic_address;
-    }
-    p += eh->length;
-  }
-
-  return addr;
-}

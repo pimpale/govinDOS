@@ -4,29 +4,28 @@
 
 #include "allocator.h"
 #include "debug.h"
-#include "panic.h"
+#include "madt_x86.h"
 #include "paging.h"
+#include "panic.h"
 #include "serial.h"
 #include "stdlib/stdio.h"
 
 // LAPIC register offsets (xAPIC MMIO).
-#define LAPIC_REG_ID         0x020   // bits 24..31 = APIC ID
-#define LAPIC_REG_EOI        0x0B0
-#define LAPIC_REG_ICR_LOW    0x300
-#define LAPIC_REG_ICR_HIGH   0x310
+#define LAPIC_REG_ID 0x020 // bits 24..31 = APIC ID
+#define LAPIC_REG_EOI 0x0B0
+#define LAPIC_REG_ICR_LOW 0x300
+#define LAPIC_REG_ICR_HIGH 0x310
 
 // ICR low fields. Vector goes in bits 0..7.
-#define ICR_DELIVERY_INIT    (5u << 8)
-#define ICR_DELIVERY_SIPI    (6u << 8)
-#define ICR_LEVEL_ASSERT     (1u << 14)
-#define ICR_TRIGGER_LEVEL    (1u << 15)
+#define ICR_DELIVERY_INIT (5u << 8)
+#define ICR_DELIVERY_SIPI (6u << 8)
+#define ICR_LEVEL_ASSERT (1u << 14)
+#define ICR_TRIGGER_LEVEL (1u << 15)
 #define ICR_DELIVERY_PENDING (1u << 12)
 
 static volatile uint32_t *g_lapic = nullptr;
 
-static inline uint32_t lapic_read(uint32_t off) {
-  return g_lapic[off / 4];
-}
+static inline uint32_t lapic_read(uint32_t off) { return g_lapic[off / 4]; }
 
 static inline void lapic_write(uint32_t off, uint32_t val) {
   g_lapic[off / 4] = val;
@@ -41,7 +40,35 @@ static void io_delay_us(uint64_t us) {
   }
 }
 
-void x86_lapic_init(uint64_t lapic_phys_base) {
+uint64_t x86_lapic_address(const struct acpi_madt *madt) {
+  if (madt == nullptr) {
+    fatal("provided invalid madt");
+  }
+
+  uint64_t addr = madt->local_apic_address;
+
+  const uint8_t *p = (const uint8_t *)madt + sizeof(*madt);
+  const uint8_t *end = (const uint8_t *)madt + madt->header.length;
+
+  while (p + sizeof(struct acpi_madt_entry_header) <= end) {
+    const struct acpi_madt_entry_header *eh =
+        (const struct acpi_madt_entry_header *)p;
+    if (eh->length < sizeof(*eh) || p + eh->length > end) {
+      break;
+    }
+    if (eh->type == ACPI_MADT_LAPIC_ADDRESS_OVERRIDE) {
+      const struct acpi_madt_lapic_address_override *ovr =
+          (const struct acpi_madt_lapic_address_override *)p;
+      addr = ovr->local_apic_address;
+    }
+    p += eh->length;
+  }
+  return addr;
+}
+
+void x86_lapic_init(const struct acpi_madt *madt) {
+  uint64_t lapic_phys_base = x86_lapic_address(madt);
+
   if (lapic_phys_base == 0) {
     fatal("lapic: MADT reported no LAPIC base\n");
   }
@@ -52,9 +79,7 @@ void x86_lapic_init(uint64_t lapic_phys_base) {
          (uint32_t)x86_lapic_id());
 }
 
-uint8_t x86_lapic_id(void) {
-  return (uint8_t)(lapic_read(LAPIC_REG_ID) >> 24);
-}
+uint8_t x86_lapic_id(void) { return (uint8_t)(lapic_read(LAPIC_REG_ID) >> 24); }
 
 // Spin until the previous IPI has left the LAPIC.
 static void wait_for_idle(void) {
@@ -90,6 +115,4 @@ void x86_lapic_send_fixed(uint8_t apic_id, uint8_t vector) {
   send_ipi(apic_id, ICR_LEVEL_ASSERT | (uint32_t)vector);
 }
 
-void x86_lapic_eoi(void) {
-  lapic_write(LAPIC_REG_EOI, 0);
-}
+void x86_lapic_eoi(void) { lapic_write(LAPIC_REG_EOI, 0); }

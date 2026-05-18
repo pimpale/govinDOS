@@ -120,8 +120,7 @@ static void ltr(uint16_t selector) {
 // Per-CPU bring-up
 // ---------------------------------------------------------------------------
 
-void cpu_install_gdt_tss(
-    void *rsp0_stack_top,
+void *cpu_install_gdt_tss(
     void *ist_double_fault_stack_top,
     void *ist_nmi_stack_top,
     void *ist_page_fault_stack_top,
@@ -147,11 +146,12 @@ void cpu_install_gdt_tss(
       .tss       = make_tss_desc((uint64_t)tss, sizeof(*tss) - 1),
   };
 
-  // RSP0 is what the CPU loads on a ring 3 -> ring 0 transition. The IST
-  // entries are loaded automatically when an IDT gate names them. Each
-  // pointer is the top of a caller-owned, guard-paged kernel stack.
+  // RSP0 is left at 0 here — it's per-thread and gets written by
+  // arch_thread_install() each time a thread is scheduled. The IST entries
+  // are loaded automatically when an IDT gate names them. Each pointer is
+  // the top of a caller-owned, guard-paged kernel stack.
   *tss = (struct tss64){
-      .rsp0                          = (uint64_t)rsp0_stack_top,
+      .rsp0                          = 0,
       .ist[IST_DOUBLE_FAULT  - 1]    = (uint64_t)ist_double_fault_stack_top,
       .ist[IST_NMI           - 1]    = (uint64_t)ist_nmi_stack_top,
       .ist[IST_PAGE_FAULT    - 1]    = (uint64_t)ist_page_fault_stack_top,
@@ -167,4 +167,10 @@ void cpu_install_gdt_tss(
 
   asm_load_gdt(&g, GDT_SEL_KERNEL_CS);
   ltr(GDT_SEL_TSS);
+
+  return tss;
+}
+
+void cpu_tss_set_rsp0(void *tss, void *rsp0) {
+  ((struct tss64 *)tss)->rsp0 = (uint64_t)rsp0;
 }

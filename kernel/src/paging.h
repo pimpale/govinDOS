@@ -5,6 +5,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define PAGE_SIZE 4096
+
 // Architecture-independent identity page-tree manipulation API.
 //
 // All address-space mutations go through this interface. The boot-time
@@ -47,11 +49,6 @@ typedef uint32_t paging_flags_t;
 // will be set in cpu_setup.c
 extern struct address_space *g_as_kernel;
 
-// Current CPU Address Space Pointer
-// will be allocated + initialized in cpu_setup.c
-// one per CPU (thus n_cpu entries)
-extern struct address_space **g_as_current_percpu;
-
 /////////////////////////////////////////////////////////////
 // AS Data Manipulation (No side effects apart from allocation/deallocation)
 /////////////////////////////////////////////////////////////
@@ -85,12 +82,6 @@ void as_switch(struct address_space *as);
 
 // invalidate dirty pages
 int as_flush(struct address_space *as);
-
-// Allocate a kernel stack of `total_size` bytes from the global allocator
-// and return a pointer to its top. The bottom 4 KiB is mapped absent in the
-// kernel address space as an overflow guard. Caller must as_flush(g_as_kernel)
-// before the stack can be used on a different CPU.
-void *kernel_stack_alloc(size_t total_size);
 
 //////////////////////////////////////////////////////
 // Cross-CPU shootdown (interrupt dispatch glue)

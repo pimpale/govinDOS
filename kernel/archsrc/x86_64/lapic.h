@@ -2,8 +2,14 @@
 #define lapic_h_INCLUDED
 
 #include <stdint.h>
+#include "acpi.h"
 
 struct address_space;
+
+// Returns the effective LAPIC MMIO address: starts at madt->local_apic_address
+// and is replaced by the first Type-5 override if present. Returns 0 if `madt`
+// is null.
+uint64_t x86_lapic_address(const struct acpi_madt *madt);
 
 // xAPIC handler. We assume the LAPIC MMIO base is identity-mapped (UEFI's
 // page tables cover the typical 0xFEE00000 region during early boot; the
@@ -12,8 +18,8 @@ struct address_space;
 // APIC IDs > 254.
 
 // Records the MMIO base of the local APIC. Call once on the BSP after
-// exit_boot_services, with the value returned by x86_lapic_address(madt).
-void x86_lapic_init(uint64_t lapic_phys_base);
+// exit_boot_services
+void x86_lapic_init(const struct acpi_madt *madt);
 
 // LAPIC ID of the currently executing CPU. Reads bits 24..31 of the ID
 // register (offset 0x20). Valid only after x86_lapic_init.
