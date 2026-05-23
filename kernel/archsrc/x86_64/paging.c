@@ -67,13 +67,14 @@ struct address_space *g_as_kernel = nullptr;
 // Pull a single zeroed 4 KiB frame from the buddy. Identity mapping means
 // the returned pointer is both the VA we can write to and the PA we install
 // into a parent table entry.
+//
+// The buddy allocator isn't internally synchronized; every caller is
+// responsible for holding g_allocator_lock across the buddy access. malloc()
+// /free() do this already; we have to do the same on this side or two CPUs
+// (one in malloc, one in as_flag) can corrupt the buddy free lists.
 static pte_t *pt_alloc(void) {
-  allocator_require();
-  uint64_t page_id = 0;
-  buddy_status_t s = buddy_page_alloc(g_allocator, 1, &page_id);
-  asserts(s == BUDDY_STATUS_SUCCESS,
-          "paging: out of memory allocating page table\n");
-  pte_t *p = (pte_t *)(page_id * PAGE_SIZE);
+  pte_t *p = malloc(PAGE_SIZE);
+  asserts(p != nullptr, "paging: out of memory allocating page table\n");
   memset(p, 0, PAGE_SIZE);
 
   struct frame_info *fi = frame_for((uint64_t)p);
@@ -90,7 +91,7 @@ static void pt_free(pte_t *p) {
     fi->kind = FRAME_FREE;
     fi->refcount = 0;
   }
-  buddy_page_free(g_allocator, (uint64_t)p / PAGE_SIZE);
+  free(p);
 }
 
 // ---------------------------------------------------------------------------

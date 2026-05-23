@@ -43,34 +43,27 @@
 #define IST_MACHINE_CHECK  4
 
 // One-time per-CPU bring-up. Allocates this CPU's GDT and TSS, populates
-// the descriptors using the caller-provided IST stacks, and installs them via
-// lgdt + segment reloads + ltr. Call once on each CPU (BSP and every AP)
-// from its C entry point, before enabling interrupts.
+// the descriptors using the caller-provided IST and RSP0 stacks, and installs
+// them via lgdt + segment reloads + ltr. Call once on each CPU (BSP and every
+// AP) from its C entry point, before enabling interrupts.
 //
 // Each stack pointer is the *top* of an already-allocated kernel stack
 // whose bottom page has been mapped absent as a guard. The caller owns
 // these allocations; this function only records them in the TSS.
 //
-// RSP0 (the kernel stack the CPU loads on a ring-3 -> ring-0 transition)
-// is *not* set here. It's per-thread, and gets written into the TSS by
-// arch_thread_install() during each context switch. Until a userspace
-// thread is scheduled, RSP0 remains 0 — fine because no ring transitions
-// occur on a kernel-only thread.
+// RSP0 is per-CPU rather than per-thread: a single stack shared by every
+// ring-3 -> ring-0 transition on this CPU. It is set once here and the TSS
+// is never rewritten after install.
 //
 // On return, this CPU is running with its own GDT loaded, segment registers
 // pointing at the new kernel selectors, and TR pointing at the new TSS.
-// The TSS pointer is returned so the caller can stash it in cpu_state for
-// later use by arch_thread_install.
+// The TSS pointer is returned so the caller can stash it in cpu_state (for
+// IST inspection or future per-cpu fields).
 void *cpu_install_gdt_tss(
+    void *rsp0_stack_top,
     void *ist_double_fault_stack_top,
     void *ist_nmi_stack_top,
     void *ist_page_fault_stack_top,
     void *ist_machine_check_stack_top);
-
-// Write the kernel stack the CPU should load on a ring 3 -> ring 0
-// transition. Called by arch_thread_install on each context switch with
-// the new thread's kernel stack top. `tss` is the per-CPU TSS pointer
-// returned by cpu_install_gdt_tss().
-void cpu_tss_set_rsp0(void *tss, void *rsp0);
 
 #endif // gdt_h_INCLUDED

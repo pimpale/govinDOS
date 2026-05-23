@@ -13,8 +13,16 @@
 // LAPIC register offsets (xAPIC MMIO).
 #define LAPIC_REG_ID 0x020 // bits 24..31 = APIC ID
 #define LAPIC_REG_EOI 0x0B0
+#define LAPIC_REG_SVR 0x0F0 // spurious interrupt vector
 #define LAPIC_REG_ICR_LOW 0x300
 #define LAPIC_REG_ICR_HIGH 0x310
+
+// SVR bit 8 = APIC software enable. Must be set for the LAPIC to deliver
+// any interrupts (including IPIs). Spurious vector in bits 0..7 — pick
+// 0xFF, an unused vector; the default ISR will print and continue if it
+// ever fires.
+#define LAPIC_SVR_ENABLE (1u << 8)
+#define LAPIC_SPURIOUS_VECTOR 0xFFu
 
 // ICR low fields. Vector goes in bits 0..7.
 #define ICR_DELIVERY_INIT (5u << 8)
@@ -80,6 +88,10 @@ void x86_lapic_init(const struct acpi_madt *madt) {
 }
 
 uint8_t x86_lapic_id(void) { return (uint8_t)(lapic_read(LAPIC_REG_ID) >> 24); }
+
+void x86_lapic_enable(void) {
+  lapic_write(LAPIC_REG_SVR, LAPIC_SVR_ENABLE | LAPIC_SPURIOUS_VECTOR);
+}
 
 // Spin until the previous IPI has left the LAPIC.
 static void wait_for_idle(void) {

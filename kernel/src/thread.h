@@ -10,28 +10,27 @@
 #include "arch_thread.h"
 
 struct address_space;
-struct process;
+typedef struct process process;
 
-enum thread_state {
+enum thread_status {
   THREAD_RUNNABLE,
   THREAD_RUNNING,
   THREAD_BLOCKED,
   THREAD_DEAD,
 };
 
-struct thread {
+typedef struct thread {
   uint64_t tid;
   struct process *proc;       // never null
-  enum thread_state state;
+  enum thread_status status;
 
-  // Intrusive scheduler queue link.
-  struct thread *next;
-  struct thread *prev;
-
-  // Kernel stack. The top is written into TSS.rsp0 (x86) or the per-cpu
-  // kernel-SP slot (aarch64) by arch_thread_install on each schedule.
-  void *kernel_stack_top;
-  void *kernel_stack_base;
+  // Top of this thread's own stack. For a kernel thread, this lives in
+  // kernel memory and is the stack the thread always runs on; arch code
+  // forges its initial frame here and arch.kernel_rsp later tracks where
+  // it suspended. For a userspace thread it would live in the process AS
+  // and hold the userspace entry frame instead. Allocator depends on
+  // thread kind; this field just records the top. Not freed yet.
+  void *stack_top;
 
   // User TLS base. FSBASE on x86_64, TPIDR_EL0 on aarch64. Unused (0) for
   // kernel threads. Saved/restored by arch code on user<->kernel boundary.
@@ -39,13 +38,17 @@ struct thread {
 
   // Arch-private state (saved kernel SP, FPU area, ...).
   struct arch_thread arch;
-};
+} thread;
+
+// Element type for generic containers that hold non-owning thread references.
+// The vec/list templates require a single-identifier type name for token
+// pasting, hence the typedef rather than using `thread *` directly.
+typedef thread *thread_ptr;
 
 struct process {
   uint64_t pid;
   struct address_space *as;   // == g_as_kernel for the kernel process
   bool is_kernel;
-  size_t n_threads;
 };
 
 // Singleton process every kernel thread belongs to. Allocated by

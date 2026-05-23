@@ -130,12 +130,28 @@ _isr_handler:
 
 [SECTION .data]
 
+; IST slot assignments must match the C constants in gdt.h:
+;   IST_DOUBLE_FAULT  = 1  (vector 0x08)
+;   IST_NMI           = 2  (vector 0x02)
+;   IST_PAGE_FAULT    = 3  (vector 0x0E)
+;   IST_MACHINE_CHECK = 4  (vector 0x12)
+; Other vectors run on the current stack (kernel) or RSP0 (from ring 3).
 idt:
 %assign i 0
 %rep 256
         dw 0xdead     ; isr 0..15
         dw 8h         ; kernel cs
-        db 0          ; ist (0 disable)
+%if i = 2
+        db 2          ; IST_NMI
+%elif i = 8
+        db 1          ; IST_DOUBLE_FAULT
+%elif i = 14
+        db 3          ; IST_PAGE_FAULT
+%elif i = 18
+        db 4          ; IST_MACHINE_CHECK
+%else
+        db 0          ; no IST
+%endif
 %if i = 80h
         db 11101110b  ; attributes (usermode)
 %else

@@ -19,6 +19,7 @@ compile_c() {
     -ffreestanding  -fno-builtin -fshort-wchar -mno-red-zone \
     -mgeneral-regs-only \
     -fstack-protector-all \
+    -Wframe-larger-than=8192 \
     -O0 -g \
     -DPRINTF_SUPPORT_DECIMAL_SPECIFIERS=0 \
     -DPRINTF_SUPPORT_EXPONENTIAL_SPECIFIERS=0 \
@@ -74,16 +75,19 @@ make() {
   compile_c src/acpi.c
   compile_c src/debug.c
   compile_c src/stacks.c
-  compile_c src/impl_stack_protector.c
   compile_c src/get_mmap.c
   compile_c src/allocator.c
   compile_c src/cpu_state.c
   compile_c src/spinlock.c
+  compile_c src/scheduler.c
   compile_c src/thread.c
   compile_c src/stdlib/stdio.c
   compile_c src/stdlib/stdlib.c
   compile_c src/stdlib/string.c
+  # generic-data-structure instantiations
+  compile_c src/instances/list_dtype_thread_ptr.c
   # architecture specific
+  compile_c archsrc/x86_64/impl_stack_protector.c
   compile_c archsrc/x86_64/serial.c
   compile_c archsrc/x86_64/panic.c
   compile_c archsrc/x86_64/interrupts.c

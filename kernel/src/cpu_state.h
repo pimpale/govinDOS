@@ -3,20 +3,22 @@
 
 #include <stdint.h>
 #include "acpi.h"
+#include "scheduler.h"
 
 // opaque structs
 struct address_space;
 struct thread;
 
-// Per-CPU kernel stacks. The "rsp0" the CPU loads on a ring-3 -> ring-0
-// transition is *not* here — that's per-thread (lives in struct thread)
-// and gets written into the TSS by arch_thread_install on each context
-// switch.
+// Per-CPU kernel stacks. RSP0 (the stack the CPU loads on a ring-3 -> ring-0
+// transition) is also per-CPU: a single stack shared by every syscall/
+// interrupt-from-userspace on this CPU, so the TSS never has to be rewritten
+// after install.
 struct cpu_stacks {
   // Bootstrap stack used during cpu_setup. Once threading takes over, this
   // stack is abandoned in favor of the per-thread kernel stacks.
   void *kernel_bootstrap_top;
   // Per-cpu interrupt stacks (constant for the life of the cpu).
+  void *kernel_rsp0_top;
   void *ist_double_fault_top;
   void *ist_nmi_top;
   void *ist_page_fault_top;
@@ -34,14 +36,15 @@ struct cpu_state {
   bool called_cpu_setup;
   // the current address space
   struct address_space *current_as;
-  // currently running thread on this CPU. nullptr until threading takes over.
+  // Currently running thread on this CPU. nullptr means the per-CPU
+  // scheduler loop is running (between threads). Set by the scheduler
+  // before switching into a thread; cleared after the thread switches
+  // back out.
   struct thread *current_thread;
-  // this CPU's idle thread. nullptr until threading_cpu_enter() runs.
-  struct thread *idle_thread;
-  // opaque arch-private per-cpu pointer. On x86_64 this is the per-cpu TSS
-  // pointer (so arch_thread_install can update tss->rsp0). On aarch64 it
-  // would point at whatever per-cpu structure the EL0->EL1 vector reads.
-  void *arch_per_cpu;
+  // Per-CPU runqueue + lock + saved scheduler SP. Initialized by
+  // scheduler_init(); sched_rsp is filled in on the first switch out
+  // of the scheduler loop.
+  struct scheduler scheduler;
   // stacks for the CPU
   struct cpu_stacks stacks;
 };

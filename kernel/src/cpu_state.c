@@ -17,7 +17,7 @@ void cpu_state_table_init(const struct acpi_madt *madt) {
   g_cpu_state_table_len = cl.count;
   g_cpu_state_table = calloc(cl.count, sizeof(struct cpu_state));
   for (size_t i = 0; i < cl.count; i++) {
-    g_cpu_state_table[i].hw_id = i;
+    g_cpu_state_table[i].logical_id = i;
     g_cpu_state_table[i].hw_id = cl.cpus[i].hw_id;
   }
 }

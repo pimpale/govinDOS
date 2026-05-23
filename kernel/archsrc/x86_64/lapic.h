@@ -25,6 +25,12 @@ void x86_lapic_init(const struct acpi_madt *madt);
 // register (offset 0x20). Valid only after x86_lapic_init.
 uint8_t x86_lapic_id(void);
 
+// Set this CPU's local-APIC Spurious Interrupt Vector Register so its
+// software-enable bit is on. Without this, the LAPIC silently drops
+// every IPI directed at this CPU. Must run on every CPU during setup,
+// after x86_lapic_init has recorded the MMIO base.
+void x86_lapic_enable(void);
+
 // Send an INIT IPI (level-triggered assert + edge deassert) to `apic_id`.
 // Blocks until the LAPIC reports the IPI as delivered.
 void x86_lapic_send_init(uint8_t apic_id);

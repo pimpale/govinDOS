@@ -34,5 +34,7 @@ void *stacks_alloc_kernel(enum stack_type purpose) {
   as_flag(g_as_kernel, (uint64_t)(uintptr_t)base,
           (uint64_t)(uintptr_t)(base + PAGE_SIZE), 0);
 
+  as_flush(g_as_kernel);
+
   return base + total_size;
 }

@@ -80,6 +80,8 @@ void cpu_setup_bsp(const struct acpi_rsdp *rsdp) {
   // allocate per-cpu kernel stacks for all of the cpus
   for (size_t i = 0; i < g_cpu_state_table_len; i++) {
     // interrupt stacks
+    g_cpu_state_table[i].stacks.kernel_rsp0_top =
+        stacks_alloc_kernel(STACK_TYPE_KERNEL_INTERRUPT);
     g_cpu_state_table[i].stacks.ist_double_fault_top =
         stacks_alloc_kernel(STACK_TYPE_KERNEL_INTERRUPT);
     g_cpu_state_table[i].stacks.ist_machine_check_top =
@@ -91,8 +93,6 @@ void cpu_setup_bsp(const struct acpi_rsdp *rsdp) {
     // bootstrap stack
     g_cpu_state_table[i].stacks.kernel_bootstrap_top =
         stacks_alloc_kernel(STACK_TYPE_KERNEL_BOOTSTRAP);
-    // No rsp0 stack: it's per-thread, lives in struct thread, and is
-    // written into the TSS by arch_thread_install on each context switch.
   }
 
   // prepare the idt vector to be loaded
@@ -111,14 +111,14 @@ void cpu_setup() {
   enable_nxe();
 
   // 1. Construct and load this CPU's GDT (also installs the TSS so that
-  //    IST-using exceptions and any future ring transitions have a stack
-  //    to switch to). Stash the TSS pointer so arch_thread_install can
-  //    update tss->rsp0 on every context switch.
-  this_cpu_state->arch_per_cpu =
-      cpu_install_gdt_tss(this_cpu_state->stacks.ist_double_fault_top,
-                          this_cpu_state->stacks.ist_nmi_top,
-                          this_cpu_state->stacks.ist_page_fault_top,
-                          this_cpu_state->stacks.ist_machine_check_top);
+  //    IST-using exceptions and ring transitions have a stack to switch to).
+  //    RSP0 is per-CPU and set once here; the TSS is not rewritten on
+  //    context switch.
+  cpu_install_gdt_tss(this_cpu_state->stacks.kernel_rsp0_top,
+                      this_cpu_state->stacks.ist_double_fault_top,
+                      this_cpu_state->stacks.ist_nmi_top,
+                      this_cpu_state->stacks.ist_page_fault_top,
+                      this_cpu_state->stacks.ist_machine_check_top);
 
   // 2. Load the IDT. Depends on the GDT already being installed because
   //    the IDT gates reference kernel CS by selector value.
@@ -126,4 +126,8 @@ void cpu_setup() {
 
   // 3. Switch onto the kernel page tables
   as_switch(g_as_kernel);
+
+  // 4. Enable this CPU's LAPIC (software-enable bit in SVR). Without
+  //    this, the LAPIC drops every IPI directed at this CPU.
+  x86_lapic_enable();
 }
