@@ -6,6 +6,7 @@
 
 #include "cpu_state.h"
 #include "debug.h"
+#include "irq.h"
 #include "paging.h"
 #include "scheduler.h"
 #include "spinlock.h"
@@ -22,8 +23,7 @@
 //   arch_thread_install: per-cpu setup before resuming the thread — switch
 //                   address space if needed, restore FS/TPIDR_EL0, etc.
 extern void switch_context(uint64_t *old_sp_out, uint64_t new_sp);
-extern void arch_thread_init_kernel(struct thread *t,
-                                    void (*entry)(void *),
+extern void arch_thread_init_kernel(struct thread *t, void (*entry)(void *),
                                     void *arg);
 extern void arch_thread_install(struct thread *t);
 
@@ -65,35 +65,39 @@ struct thread *kthread_spawn(void (*entry)(void *), void *arg) {
   return t;
 }
 
-void yield(void) {
-  bool ie = arch_irq_save();
-  struct cpu_state *cs = &g_cpu_state_table[cpu_state_whoami()];
-  struct thread *curr = cs->current_thread;
+// Each of {yield, thread_block, thread_exit} disables IRQs *before* taking
+// the scheduler lock so the lock's internal irq_enable on unlock decrements
+// the depth without bringing it to 0. That keeps IRQs masked across the
+// switch_context — without that an IRQ could fire between unlock and switch
+// and re-enter scheduler state.
 
+void yield(void) {
+  irq_disable();
+  struct cpu_state *cs = &g_cpu_state_table[cpu_state_whoami()];
   spinlock_lock(&cs->scheduler.lock);
+  struct thread *curr = cs->scheduler.current_thread;
   curr->status = THREAD_RUNNABLE;
-  scheduler_push_local_locked(cs, curr);
+  scheduler_push_local_locked(&cs->scheduler, curr);
   spinlock_unlock(&cs->scheduler.lock);
 
   // Bounce back to the scheduler loop. It will pick next and switch in.
   switch_context(&curr->arch.kernel_rsp, cs->scheduler.sched_rsp);
 
-  // Resumed: scheduler picked us again.
-  arch_irq_restore(ie);
+  // Resumed: scheduler picked us again. Balance the irq_disable above.
+  irq_enable();
 }
 
 void thread_block(void) {
-  bool ie = arch_irq_save();
+  irq_disable();
   struct cpu_state *cs = &g_cpu_state_table[cpu_state_whoami()];
-  struct thread *curr = cs->current_thread;
-
   spinlock_lock(&cs->scheduler.lock);
+  struct thread *curr = cs->scheduler.current_thread;
   curr->status = THREAD_BLOCKED;
   spinlock_unlock(&cs->scheduler.lock);
 
   switch_context(&curr->arch.kernel_rsp, cs->scheduler.sched_rsp);
 
-  arch_irq_restore(ie);
+  irq_enable();
 }
 
 void thread_unblock(struct thread *t) {
@@ -106,11 +110,14 @@ void thread_unblock(struct thread *t) {
 }
 
 [[noreturn]] void thread_exit(void) {
-  arch_irq_disable();
+  // No matching irq_enable: we never come back. The depth bump we leave
+  // behind is consumed by the scheduler loop, which calls irq_enable
+  // after its switch_context returns into the next thread / idle path.
+  irq_disable();
   struct cpu_state *cs = &g_cpu_state_table[cpu_state_whoami()];
-  struct thread *curr = cs->current_thread;
 
   spinlock_lock(&cs->scheduler.lock);
+  struct thread *curr = cs->scheduler.current_thread;
   curr->status = THREAD_DEAD;
   spinlock_unlock(&cs->scheduler.lock);
 
@@ -121,57 +128,11 @@ void thread_unblock(struct thread *t) {
 }
 
 // Entry point used by the arch context-switch trampoline. First instruction
-// of every freshly-spawned thread. The scheduler loop releases its lock
-// before entering us, so we just need to re-enable IRQs.
+// of every freshly-spawned thread. The scheduler enters us with IRQs off
+// (depth=1 from its top-of-iteration irq_disable); we balance that here
+// before invoking user code.
 void thread_trampoline(void (*entry)(void *), void *arg) {
-  arch_irq_enable();
+  irq_enable();
   entry(arg);
   thread_exit();
-}
-
-[[noreturn]] void threading_cpu_enter(void) {
-  asserts(g_kernel_process != nullptr,
-          "threading_cpu_enter: threading_init not called");
-  arch_irq_disable();
-
-  struct cpu_state *cs = &g_cpu_state_table[cpu_state_whoami()];
-
-  for (;;) {
-    spinlock_lock(&cs->scheduler.lock);
-    struct thread *next = scheduler_pop_local_locked(cs);
-    if (next == nullptr) {
-      // Mark ourselves idle BEFORE releasing the lock. A producer that
-      // grabs the lock next sees idle=true and will send us the
-      // reschedule IPI after its push. Setting under the lock is what
-      // makes the "push then check idle" sequence on the producer side
-      // race-free against this point.
-      atomic_store_explicit(&cs->scheduler.idle, true,
-                            memory_order_relaxed);
-      spinlock_unlock(&cs->scheduler.lock);
-
-      // STI;HLT is atomic on x86 — STI defers interrupt delivery by one
-      // instruction, so a pending IRQ (including our wakeup IPI) cannot
-      // arrive between them; HLT then either waits for or immediately
-      // wakes on it. CLI on resume to keep the loop's IRQ-disabled
-      // invariant.
-      __asm__ volatile("sti; hlt; cli" ::: "memory");
-
-      // Clearing outside the lock is fine: we're the only writer for
-      // this CPU's idle flag. A producer racing here may briefly send a
-      // spurious IPI (handler is a no-op + EOI), which is harmless.
-      atomic_store_explicit(&cs->scheduler.idle, false,
-                            memory_order_relaxed);
-      continue;
-    }
-    next->status = THREAD_RUNNING;
-    cs->current_thread = next;
-    arch_thread_install(next);
-    spinlock_unlock(&cs->scheduler.lock);
-
-    // Hand control to next thread. Returns when it yields / blocks /
-    // exits — by then it has unlocked the scheduler lock itself.
-    switch_context(&cs->scheduler.sched_rsp, next->arch.kernel_rsp);
-
-    cs->current_thread = nullptr;
-  }
 }

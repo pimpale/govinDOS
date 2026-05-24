@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include "cpu_state.h"
+#include "irq.h"
 #include "lapic.h"
 #include "paging.h"
 #include "panic.h"
@@ -87,14 +88,21 @@ struct [[gnu::packed]] isr_frame {
 
 uint64_t interrupt_handler(struct isr_frame regs, uint64_t vector, uint64_t error, uint64_t rip) {
   (void)regs;
+  // Bump the per-CPU IRQ depth without touching IF (hardware already
+  // cleared it on entry). This way, any spinlock_lock/unlock inside the
+  // handler nests above depth=1 and the final unlock won't sti
+  // mid-handler. iretq restores IF from the saved frame.
+  irq_enter();
   switch (vector) {
   case VECTOR_TLB_SHOOTDOWN:
     paging_handle_tlb_shootdown();
+    irq_exit();
     return 0;
   case VECTOR_RESCHED:
     // Wake-up only. The HLT'd scheduler loop resumes after the IRET,
     // sees the new queue entry on its next iteration, and dispatches it.
     x86_lapic_eoi();
+    irq_exit();
     return 0;
   default:
     break;
@@ -106,6 +114,7 @@ uint64_t interrupt_handler(struct isr_frame regs, uint64_t vector, uint64_t erro
     what = "kernel stack overflow (guard page hit)";
   }
   // Returning 0 here would IRET back to the same RIP and re-fault forever.
-  // Every unhandled vector is fatal until we grow real handlers.
+  // Every unhandled vector is fatal until we grow real handlers. No
+  // irq_exit before fault_panic — we're never coming back.
   fault_panic(what, vector, error, rip, cr2);
 }

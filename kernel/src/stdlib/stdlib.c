@@ -10,30 +10,7 @@
 #include "spinlock.h"
 #include "string.h"
 
-static void *malloc_unlocked(size_t size) {
-  if (size == 0) {
-    return nullptr;
-  }
-
-  void *p;
-  buddy_status_t s = buddy_mem_alloc(g_allocator, (uint64_t)size, &p);
-  if (s != BUDDY_STATUS_SUCCESS) {
-    return nullptr;
-  }
-  return p;
-}
-
-static void free_unlocked(void *ptr) {
-  if (ptr == nullptr) {
-    return;
-  }
-
-  buddy_status_t s = buddy_mem_free(g_allocator, ptr);
-  asserts(s == BUDDY_STATUS_SUCCESS, "free: pointer not owned by allocator\n");
-}
-
 void *malloc(size_t size) {
-  allocator_require();
 
   spinlock_lock(&g_allocator_lock);
   void *p = malloc_unlocked(size);
@@ -47,8 +24,6 @@ void *calloc(size_t nmemb, size_t size) {
   if (__builtin_mul_overflow(nmemb, size, &total)) {
     return nullptr;
   }
-
-  allocator_require();
 
   spinlock_lock(&g_allocator_lock);
   void *p = malloc_unlocked(total);
@@ -66,14 +41,12 @@ void *realloc(void *ptr, size_t size) {
     return malloc(size);
   }
   if (size == 0) {
-    allocator_require();
+
     spinlock_lock(&g_allocator_lock);
     free_unlocked(ptr);
     spinlock_unlock(&g_allocator_lock);
     return nullptr;
   }
-
-  allocator_require();
 
   spinlock_lock(&g_allocator_lock);
 
@@ -107,7 +80,6 @@ void free(void *ptr) {
   if (ptr == nullptr) {
     return;
   }
-  allocator_require();
 
   spinlock_lock(&g_allocator_lock);
   free_unlocked(ptr);

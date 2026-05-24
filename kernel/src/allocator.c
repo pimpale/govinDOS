@@ -9,7 +9,7 @@ struct buddy_allocator_s *g_allocator = nullptr;
 struct spinlock g_allocator_lock = SPINLOCK_INITIALIZER;
 
 struct frame_info *g_frames = nullptr;
-uint64_t           g_n_frames = 0;
+uint64_t g_n_frames = 0;
 
 static inline void *page_to_mem(uint64_t page_id) {
   return (void *)(page_id * PAGE_SIZE);
@@ -127,4 +127,28 @@ void allocator_init(uint64_t n_mmap, const struct efi_memory_descriptor *mmap) {
       g_frames[pfn].kind = FRAME_KERNEL;
     }
   }
+}
+
+static void *malloc_unlocked(size_t size) {
+  allocator_require();
+  if (size == 0) {
+    return nullptr;
+  }
+
+  void *p;
+  buddy_status_t s = buddy_mem_alloc(g_allocator, (uint64_t)size, &p);
+  if (s != BUDDY_STATUS_SUCCESS) {
+    return nullptr;
+  }
+  return p;
+}
+
+static void free_unlocked(void *ptr) {
+  allocator_require();
+  if (ptr == nullptr) {
+    return;
+  }
+
+  buddy_status_t s = buddy_mem_free(g_allocator, ptr);
+  asserts(s == BUDDY_STATUS_SUCCESS, "free: pointer not owned by allocator\n");
 }

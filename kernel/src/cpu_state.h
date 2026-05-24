@@ -36,24 +36,26 @@ struct cpu_state {
   bool called_cpu_setup;
   // the current address space
   struct address_space *current_as;
-  // Currently running thread on this CPU. nullptr means the per-CPU
-  // scheduler loop is running (between threads). Set by the scheduler
-  // before switching into a thread; cleared after the thread switches
-  // back out.
-  struct thread *current_thread;
   // Per-CPU runqueue + lock + saved scheduler SP. Initialized by
   // scheduler_init(); sched_rsp is filled in on the first switch out
   // of the scheduler loop.
   struct scheduler scheduler;
   // stacks for the CPU
   struct cpu_stacks stacks;
+  // Nesting depth for irq_disable/irq_enable. See irq.h. Mutated only by
+  // code running on this CPU with IRQs already off, so it needs no atomic.
+  // Starts at 0 (the calloc in cpu_state_table_init); the first
+  // irq_disable bumps it to 1 and issues the actual cli.
+  uint64_t irq_depth;
 };
 
 // the only global location for CPU Data
 extern size_t g_cpu_state_table_len;
 extern struct cpu_state* g_cpu_state_table;
 
+
 // validate that the cpu state has been set up
+bool cpu_state_table_initialized();
 void cpu_state_table_require();
 
 // must be called once to allocate CPU states + interrupt stacks

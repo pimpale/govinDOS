@@ -59,11 +59,6 @@ extern struct process *g_kernel_process;
 // cpu_state_table_init has run. Allocates the kernel process singleton.
 void threading_init(void);
 
-// Per-CPU entry point into the scheduler. Allocates this CPU's idle thread,
-// installs it as current, and context-switches onto it. Never returns —
-// the bootstrap stack the caller was running on is abandoned.
-[[noreturn]] void threading_cpu_enter(void);
-
 // Spawn a kernel thread. Entry is invoked with `arg` as its only argument.
 // If `entry` returns, the thread is reaped via thread_exit().
 struct thread *kthread_spawn(void (*entry)(void *), void *arg);

@@ -51,9 +51,8 @@ static void spawner_thread(void *arg) {
   cpu_setup();
   printf("ap[%llu]: hello from long mode\n", cpu_state_whoami());
   cpu_signal_alive();
-  // Hand this CPU off to the scheduler. The current execution becomes
-  // this CPU's idle thread and never returns from here.
-  threading_cpu_enter();
+
+  scheduler_loop(&g_cpu_state_table[cpu_state_whoami()].scheduler);
 }
 
 efi_status_t efi_main(efi_handle_t handle, struct efi_system_table *system) {

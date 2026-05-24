@@ -3,25 +3,26 @@
 #include <stdarg.h>
 #include <stdint.h>
 
-#include "arch_thread.h"
+#include "cpu_state.h"
 #include "serial.h"
 #include "spinlock.h"
 
-void putchar_(char c) {
-  serial_putchar((uint8_t)c);
-}
+void putchar_(char c) { serial_putchar((uint8_t)c); }
 
-// Console output lock. IRQs are disabled while held so an interrupt
-// handler trying to printf can't deadlock against the interrupted code.
+// Console output lock. spinlock_lock masks IRQs on this CPU so an
+// interrupt handler trying to printf can't deadlock against the
+// interrupted code.
 static struct spinlock g_print_lock = SPINLOCK_INITIALIZER;
 
 int vprintf_locked(const char *fmt, va_list args) {
-  bool ie = arch_irq_save();
-  spinlock_lock(&g_print_lock);
-  int n = vprintf_(fmt, args);
-  spinlock_unlock(&g_print_lock);
-  arch_irq_restore(ie);
-  return n;
+  if (cpu_state_table_initialized()) {
+    spinlock_lock(&g_print_lock);
+    int n = vprintf_(fmt, args);
+    spinlock_unlock(&g_print_lock);
+    return n;
+  } else {
+    return vprintf_(fmt, args);
+  }
 }
 
 int printf_locked(const char *fmt, ...) {

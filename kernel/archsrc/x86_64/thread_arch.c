@@ -31,8 +31,9 @@ extern void thread_bootstrap(void);
 //
 // arch.kernel_rsp points at the rflags slot, i.e. stack_top - 80.
 //
-// IF is left 0 because we enter holding the scheduler spinlock; the portable
-// thread_trampoline releases the lock and sti's before invoking user code.
+// IF is left 0 because the scheduler enters us with IRQs masked (depth=1
+// from the top-of-iteration irq_disable in scheduler_loop). The portable
+// thread_trampoline balances that with irq_enable before invoking user code.
 void arch_thread_init_kernel(struct thread *t,
                              void (*entry)(void *),
                              void *arg) {

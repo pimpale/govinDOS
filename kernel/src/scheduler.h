@@ -10,8 +10,6 @@
 #include <list/list.h>
 #undef LIST_DTYPE
 
-struct cpu_state;
-
 // IDT vector for the cross-CPU reschedule IPI. Value is arbitrary as long
 // as it doesn't collide with any other installed vector (currently only
 // VECTOR_TLB_SHOOTDOWN=0xFD and the syscall 0x80 are claimed). The
@@ -30,6 +28,11 @@ struct cpu_state;
 //                 onto an empty queue can decide whether to send an IPI.
 //                 Cleared by the consumer after waking (lock not held).
 struct scheduler {
+  // Currently running thread on this CPU. nullptr means the per-CPU
+  // scheduler loop is running (between threads). Set by the scheduler
+  // before switching into a thread; cleared after the thread switches
+  // back out.
+  struct thread *current_thread;
   list_thread_ptr *queue;
   struct spinlock lock;
   uint64_t sched_rsp;
@@ -41,16 +44,21 @@ struct scheduler {
 void scheduler_init(void);
 
 // Pop the head of THIS CPU's runqueue, or nullptr if empty.
-// Caller must hold cs->scheduler.lock and have IRQs disabled.
-struct thread *scheduler_pop_local_locked(struct cpu_state *cs);
+// Caller must hold scheduler->lock and have IRQs disabled.
+struct thread *scheduler_pop_local_locked(struct scheduler *scheduler);
 
 // Push `t` at the tail of THIS CPU's runqueue.
-// Caller must hold cs->scheduler.lock and have IRQs disabled.
-void scheduler_push_local_locked(struct cpu_state *cs, struct thread *t);
+// Caller must hold scheduler->lock and have IRQs disabled.
+void scheduler_push_local_locked(struct scheduler *scheduler,
+                                 struct thread *t);
 
 // Cross-CPU enqueue. Selects a target CPU via internal placement policy
 // (round-robin today) and pushes `t` onto that CPU's queue. Acquires the
 // target's lock briefly; safe to call from any CPU.
 void scheduler_enqueue(struct thread *t);
+
+// Per-CPU entry point into the scheduler.
+// Will repeatedly schedule threads, and sleep if no thread is available to run.
+[[noreturn]] void scheduler_loop(struct scheduler *scheduler);
 
 #endif // scheduler_h_INCLUDED

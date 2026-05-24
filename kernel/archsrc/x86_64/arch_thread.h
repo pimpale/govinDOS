@@ -18,29 +18,4 @@ struct arch_thread {
   void *xsave_area;
 };
 
-// -----------------------------------------------------------------------------
-// IRQ save/restore. Inline so the scheduler hot path doesn't take call cost.
-// Equivalents on aarch64 read/write DAIF.
-// -----------------------------------------------------------------------------
-
-static inline bool arch_irq_save(void) {
-  uint64_t rflags;
-  __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) : : "memory");
-  return (rflags & (1ull << 9)) != 0;
-}
-
-static inline void arch_irq_restore(bool was_enabled) {
-  if (was_enabled) {
-    __asm__ volatile("sti" : : : "memory");
-  }
-}
-
-static inline void arch_irq_enable(void) {
-  __asm__ volatile("sti" : : : "memory");
-}
-
-static inline void arch_irq_disable(void) {
-  __asm__ volatile("cli" : : : "memory");
-}
-
 #endif // arch_thread_h_INCLUDED

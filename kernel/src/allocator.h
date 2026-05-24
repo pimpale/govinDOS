@@ -18,6 +18,9 @@ void allocator_require(void);
 // during kernel init before any allocation.
 void allocator_init(uint64_t n_mmap, const struct efi_memory_descriptor *mmap);
 
+// very basic early malloc and free which doesn't lock. Users must ensure they are the only one using it
+void* malloc_unlocked(size_t size);
+void free_unlocked(void* ptr);
 
 // ---------------------------------------------------------------------------
 // Frame metadata

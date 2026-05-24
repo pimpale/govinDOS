@@ -99,6 +99,8 @@ make() {
   compile_c archsrc/x86_64/paging.c
   compile_c archsrc/x86_64/cpu_setup.c
   compile_c archsrc/x86_64/thread_arch.c
+  compile_c archsrc/x86_64/scheduler_arch.c
+  compile_c archsrc/x86_64/irq.c
   assemble  archsrc/x86_64/gdt.asm
   assemble  archsrc/x86_64/interrupts.asm
   assemble  archsrc/x86_64/context_switch.asm
