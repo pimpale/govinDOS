@@ -3,8 +3,11 @@
 #include "cpu_state.h"
 #include "debug.h"
 #include "gdt.h"
+#include "irq.h"
 #include "paging.h"
+#include "stdlib/string.h"
 #include "thread.h"
+#include "trap_frame.h"
 
 // Defined in context_switch.asm — first instruction of every freshly
 // spawned thread. After switch_context's pop sequence, control returns
@@ -54,6 +57,65 @@ void arch_thread_init_kernel(struct thread *t,
 
   t->arch.kernel_rsp = (uint64_t)sp;
   t->arch.xsave_area = nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// User threads (stackless in the kernel)
+// ---------------------------------------------------------------------------
+
+// Defined in context_switch.asm. Ret target of the forged resume frame.
+extern void uthread_resume(void);
+
+// Re-arm the forged switch_context frame at the top of resume_stack and
+// point kernel_rsp at it. Layout mirrors arch_thread_init_kernel, with
+// uthread_resume as the ret target and rdi = the thread itself. Contents
+// are constant per thread, but re-forging on every park keeps the "frame
+// is consumed by each resume" invariant obvious and preemption-proof.
+static void uthread_reset_resume_frame(struct thread *t) {
+  uint64_t *sp =
+      (uint64_t *)(t->arch.resume_stack + sizeof(t->arch.resume_stack));
+  *--sp = (uint64_t)uthread_resume;   // ret target
+  *--sp = 0;                          // rbp
+  *--sp = 0;                          // rbx
+  *--sp = (uint64_t)t;                // rdi
+  *--sp = 0;                          // rsi
+  *--sp = 0;                          // r12
+  *--sp = 0;                          // r13
+  *--sp = 0;                          // r14
+  *--sp = 0;                          // r15
+  *--sp = 0x002;                      // rflags: IF=0 until iretq
+  t->arch.kernel_rsp = (uint64_t)sp;
+}
+
+void arch_thread_init_user(struct thread *t, uint64_t entry,
+                           uint64_t user_stack_top) {
+  memset(&t->arch.uframe, 0, sizeof(t->arch.uframe));
+  t->arch.uframe.rip = entry;
+  t->arch.uframe.cs = GDT_SEL_USER_CS64;
+  t->arch.uframe.ss = GDT_SEL_USER_DS;
+  t->arch.uframe.rsp = user_stack_top;
+  // IF=1 (ring 3 always runs with interrupts on), reserved bit 1.
+  t->arch.uframe.rflags = 0x202;
+  t->arch.xsave_area = nullptr;
+  uthread_reset_resume_frame(t);
+}
+
+void arch_uthread_save_frame(struct thread *t, const struct trap_frame *tf) {
+  t->arch.uframe = *tf;
+  uthread_reset_resume_frame(t);
+}
+
+void arch_uthread_set_result(struct thread *t, uint64_t v) {
+  t->arch.uframe.rax = v;
+}
+
+// Called by uthread_resume (asm) on the thread's resume_stack, IRQs off.
+// The scheduler switched into us holding one irq_disable level; iretq will
+// set IF from the saved user rflags, so drop the depth without sti.
+struct trap_frame *uthread_resume_prepare(struct thread *t) {
+  irq_exit();
+  // Future: restore FSBASE from t->user_tls_base, XRSTOR t->arch.xsave_area.
+  return &t->arch.uframe;
 }
 
 // Per-cpu setup for switching into `t`. Runs with the scheduler spinlock

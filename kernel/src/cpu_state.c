@@ -26,12 +26,22 @@ void cpu_state_table_init(const struct acpi_madt *madt) {
   }
 }
 
-uint64_t cpu_state_whoami() {
+uint64_t cpu_state_whoami() { return cpu_state_this()->logical_id; }
+
+struct cpu_state *cpu_state_this(void) {
   cpu_state_table_require();
+  struct cpu_state *cs = cpu_percpu_try_get();
+  if (cs != nullptr) {
+    return cs;
+  }
+  // Slow path: this CPU hasn't run cpu_percpu_install yet (early boot).
+  // Scan by hardware id, then install so the next lookup is O(1) —
+  // nothing can un-install it afterwards (IA32_TSC_AUX is wrmsr-only).
   uint64_t hwid = cpu_hwid();
   for (size_t i = 0; i < g_cpu_state_table_len; i++) {
     if (g_cpu_state_table[i].hw_id == hwid) {
-      return i;
+      cpu_percpu_install(&g_cpu_state_table[i]);
+      return &g_cpu_state_table[i];
     }
   }
   fatal("unrecognized cpu hwid");

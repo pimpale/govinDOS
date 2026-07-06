@@ -1,6 +1,7 @@
 #ifndef thread_h_INCLUDED
 #define thread_h_INCLUDED
 
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -36,6 +37,23 @@ typedef struct thread {
   // kernel threads. Saved/restored by arch code on user<->kernel boundary.
   uint64_t user_tls_base;
 
+  // True from just before the scheduler switches into this thread until
+  // just after it has switched back out and its saved state is complete.
+  // Wakers must spin this false before re-enqueueing (thread_unblock does)
+  // — otherwise a thread that has set status=BLOCKED but not yet finished
+  // saving its context could be dispatched on another CPU.
+  _Atomic bool on_cpu;
+
+  // Scratch slot for wake-up payloads delivered to a blocked *kernel*
+  // thread (a parked user thread receives results in its saved trap frame
+  // instead — see thread_deliver_wait_result).
+  uint64_t wait_result;
+
+  // This thread's submission/completion ring, or nullptr. Rings are
+  // per-thread (SPSC with the ring's worker kthread). Owned here; created
+  // on first SYS_RING_CREATE. See ring.h.
+  struct ring *ring;
+
   // Arch-private state (saved kernel SP, FPU area, ...).
   struct arch_thread arch;
 } thread;
@@ -49,6 +67,10 @@ struct process {
   uint64_t pid;
   struct address_space *as;   // == g_as_kernel for the kernel process
   bool is_kernel;
+  // Owner of this process, for the eventual multi-user model. uid 0 is
+  // the kernel process. Checked (via frame_info.owner_id for now) when a
+  // process frees user memory; more enforcement comes with real users.
+  uint64_t uid;
 };
 
 // Singleton process every kernel thread belongs to. Allocated by
@@ -82,6 +104,46 @@ void thread_unblock(struct thread *t);
 // Internal: assembly bootstrap entry point for freshly-spawned threads.
 // Receives (entry, arg) in the arch's first two argument registers. Do
 // not call directly.
-void thread_trampoline(void (*entry)(void *), void *arg);
+void thread_enter(void (*entry)(void *), void *arg);
+
+// ---------------------------------------------------------------------------
+// User threads & processes
+// ---------------------------------------------------------------------------
+//
+// User threads are stackless in the kernel: their suspended state is the
+// trap frame saved in the TCB by arch_uthread_save_frame, and they are
+// resumed through a forged frame that irets straight back to ring 3. A
+// user thread may therefore only park at a point where its entire kernel
+// state is that frame — i.e. from the syscall/interrupt path, after the
+// frame has been saved. That is what keeps the single-kernel-stack-per-CPU
+// model sound, including under future preemption.
+
+// Create a user process. Shares the kernel's single address space (SASOS);
+// protection comes from PAGE_U mappings, not separate page tables.
+struct process *process_create_user(uint64_t uid);
+
+// Spawn a user thread that starts at `entry` in ring 3 on `user_stack_top`.
+// Caller must have mapped entry/stack PAGE_U beforehand.
+struct thread *uthread_spawn(struct process *proc, uint64_t entry,
+                             uint64_t user_stack_top);
+
+// Currently running thread on this CPU. Only meaningful from contexts
+// that cannot migrate (IRQs off / interrupt context).
+struct thread *thread_current(void);
+
+// Park the current *user* thread from syscall/interrupt context (IRQ
+// depth exactly 1, i.e. the irq_enter of the current entry). The caller
+// must already have saved the trap frame via arch_uthread_save_frame
+// (except for exit, where the context is dead anyway). Never returns to
+// the caller: control goes to the per-CPU scheduler loop, and the thread
+// itself, if it runs again, resumes in ring 3 from its saved frame.
+[[noreturn]] void uthread_park_exit(void);     // THREAD_DEAD
+[[noreturn]] void uthread_park_yield(void);    // requeue on this CPU
+[[noreturn]] void uthread_park_blocked(void);  // caller arranged a wake-up
+
+// Deliver `v` as the wake-up payload for a blocked thread: saved-frame rax
+// for a parked user thread, wait_result for a kernel thread. Call before
+// thread_unblock.
+void thread_deliver_wait_result(struct thread *t, uint64_t v);
 
 #endif // thread_h_INCLUDED

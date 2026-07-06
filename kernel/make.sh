@@ -50,6 +50,34 @@ assemble_bin() {
     $1
 }
 
+# Builds the embedded userspace test program as a real PE32+ executable
+# with the same toolchain as the kernel. -fixed:no keeps the .reloc
+# section: every process loads at a fresh address in the single AS, so
+# the kernel loader must be able to rebase. -mgeneral-regs-only because
+# the kernel doesn't preserve FPU/SSE state across switches yet.
+build_userspace() {
+  mkdir -p bin/userspace
+  clang-22 \
+    -std=c23 \
+    -target x86_64-unknown-windows \
+    -ffreestanding -fno-builtin -mno-red-zone \
+    -mgeneral-regs-only \
+    -fno-stack-protector \
+    -O1 \
+    -c -o bin/userspace/hello.o \
+    ../userspace/hello.c
+  lld-link \
+    -flavor link \
+    -subsystem:native \
+    -entry:_start \
+    -nodefaultlib \
+    -fixed:no \
+    -dynamicbase \
+    -debug:none \
+    -out:bin/userspace/hello.exe \
+    bin/userspace/hello.o
+}
+
 # No args, links all objects everything into kernel.efi
 link() {
   mkdir -p bin
@@ -81,6 +109,11 @@ make() {
   compile_c src/spinlock.c
   compile_c src/scheduler.c
   compile_c src/thread.c
+  compile_c src/syscall.c
+  compile_c src/uaccess.c
+  compile_c src/dummydev.c
+  compile_c src/ring.c
+  compile_c src/pe.c
   compile_c src/stdlib/stdio.c
   compile_c src/stdlib/stdlib.c
   compile_c src/stdlib/string.c
@@ -93,6 +126,7 @@ make() {
   compile_c archsrc/x86_64/interrupts.c
   compile_c archsrc/x86_64/enumerate_cpus.c
   compile_c archsrc/x86_64/cpu_hwid.c
+  compile_c archsrc/x86_64/percpu.c
   compile_c archsrc/x86_64/lapic.c
   compile_c archsrc/x86_64/smp.c
   compile_c archsrc/x86_64/gdt.c
@@ -107,6 +141,10 @@ make() {
   # AP trampoline: flat binary first, then COFF wrapper that incbin's it.
   assemble_bin archsrc/x86_64/blobs/ap_trampoline.asm
   assemble     archsrc/x86_64/ap_trampoline_blob.asm
+  # C userspace test program, compiled to PE and embedded for the PE
+  # loader test (no filesystem yet).
+  build_userspace
+  assemble     archsrc/x86_64/user_pe_blob.asm
   # vendor
   compile_c vendor/buddy_allocator/buddy_allocator.c
   compile_c vendor/printf/printf.c

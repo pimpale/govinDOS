@@ -98,6 +98,7 @@ void scheduler_enqueue(struct thread *t) {
       atomic_store_explicit(&scheduler->idle, false, memory_order_relaxed);
     } else {
       next->status = THREAD_RUNNING;
+      atomic_store_explicit(&next->on_cpu, true, memory_order_relaxed);
       scheduler->current_thread = next;
       arch_thread_install(next);
       spinlock_unlock(&scheduler->lock);
@@ -107,9 +108,15 @@ void scheduler_enqueue(struct thread *t) {
       // own halves of the switch.
       switch_context(&scheduler->sched_rsp, next->arch.kernel_rsp);
 
-      // Resumed: thread bounced back, depth still 1. Balance now.
-      irq_enable();
+      // Resumed: thread bounced back and its context save is complete.
+      // Publish that with a release store — thread_unblock spins on
+      // on_cpu before re-dispatching a blocker, and must observe the
+      // finished save. Clear current_thread before re-enabling IRQs so
+      // no handler sees a half-switched-out thread as "current".
+      struct thread *prev = scheduler->current_thread;
       scheduler->current_thread = nullptr;
+      atomic_store_explicit(&prev->on_cpu, false, memory_order_release);
+      irq_enable();
     }
   }
 }

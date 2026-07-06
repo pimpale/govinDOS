@@ -3,7 +3,9 @@ default rel
 
 [GLOBAL switch_context]
 [GLOBAL thread_bootstrap]
-[EXTERN thread_trampoline]
+[GLOBAL uthread_resume]
+[EXTERN thread_enter]
+[EXTERN uthread_resume_prepare]
 
 [SECTION .text]
 
@@ -54,7 +56,7 @@ switch_context:
 ;
 ; This shim translates Sys-V style argument regs into Win64 (rcx, rdx),
 ; allocates the 32-byte shadow space + an 8-byte slot for 16-byte SP
-; alignment at call entry, then tail-calls thread_trampoline. The
+; alignment at call entry, then tail-calls thread_enter. The
 ; trampoline never returns (it calls thread_exit), so the halt loop is
 ; just defensive.
 ; ----------------------------------------------------------------------------
@@ -62,7 +64,46 @@ thread_bootstrap:
     mov     rcx, rdi             ; entry
     mov     rdx, rsi             ; arg
     sub     rsp, 40              ; 32 shadow + 8 align (call adds 8 -> 16-aligned in callee)
-    call    thread_trampoline
+    call    thread_enter
 .spin:
     hlt
     jmp     .spin
+
+; ----------------------------------------------------------------------------
+; uthread_resume: ret target of the forged frame in arch_thread.resume_stack.
+;
+; User threads have no kernel stack: their entire suspended state is the
+; trap_frame saved in the TCB (arch_thread.uframe). The scheduler resumes
+; them through the ordinary switch_context path; the forged frame carries
+; rdi = struct thread *, and after the pops RSP sits at the top of the
+; thread's tiny resume_stack — enough room for exactly one C call.
+;
+; uthread_resume_prepare does the non-asm bookkeeping (drops the scheduler's
+; irq_disable depth without sti — iretq sets IF from the saved rflags —
+; plus, later, FSBASE/XSAVE restore) and returns &t->arch.uframe. We then
+; point RSP at the frame and pop it in trap_frame order, mirroring the
+; restore tail of _isr_handler in interrupts.asm.
+; ----------------------------------------------------------------------------
+uthread_resume:
+    mov     rcx, rdi             ; arg0 = struct thread *
+    sub     rsp, 40              ; shadow space + alignment, as thread_bootstrap
+    call    uthread_resume_prepare
+    mov     rsp, rax             ; rsp = &t->arch.uframe
+
+    pop     rax
+    pop     rbx
+    pop     rcx
+    pop     rbp
+    pop     rsi
+    pop     rdi
+    pop     r10
+    pop     r11
+    pop     r12
+    pop     r13
+    pop     r14
+    pop     r15
+    pop     r9
+    pop     r8
+    pop     rdx
+    add     rsp, 8               ; skip the error-code slot
+    iretq                        ; rip, cs, rflags, rsp, ss -> ring 3

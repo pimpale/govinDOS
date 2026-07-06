@@ -120,6 +120,12 @@ void cpu_setup() {
                       this_cpu_state->stacks.ist_page_fault_top,
                       this_cpu_state->stacks.ist_machine_check_top);
 
+  // 1.5. Record this CPU's identity in IA32_TSC_AUX so cpu_state_this()
+  //      is O(1) (rdpid/rdtscp + table index). Position is arbitrary —
+  //      the MSR is untouched by segment reloads and unreachable from
+  //      ring 3 — but per-CPU bring-up is the natural home.
+  cpu_percpu_install(this_cpu_state);
+
   // 2. Load the IDT. Depends on the GDT already being installed because
   //    the IDT gates reference kernel CS by selector value.
   interrupts_load_idt();

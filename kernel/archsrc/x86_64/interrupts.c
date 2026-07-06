@@ -10,6 +10,8 @@
 #include "panic.h"
 #include "scheduler.h"
 #include "stdlib/stdio.h"
+#include "syscall.h"
+#include "trap_frame.h"
 
 #define INT_NMI 0x02
 #define INT_DOUBLE_FAULT 0x08
@@ -64,30 +66,14 @@ static const char *exception_name(uint64_t vector) {
   }
 }
 
-// Register snapshot pushed by the asm ISR stub before calling in. Layout
-// must stay in sync with the push order in interrupts.asm. Named distinctly
-// from the global per-CPU `struct cpu_state` (cpu_state.h) so the two don't
-// collide if both headers are ever pulled into the same TU.
-struct [[gnu::packed]] isr_frame {
-  uint64_t rax;
-  uint64_t rbx;
-  uint64_t rcx;
-  uint64_t rbp;
-  uint64_t rsi;
-  uint64_t rdi;
-  uint64_t r10;
-  uint64_t r11;
-  uint64_t r12;
-  uint64_t r13;
-  uint64_t r14;
-  uint64_t r15;
-  uint64_t r9;
-  uint64_t r8;
-  uint64_t rdx;
-};
-
-uint64_t interrupt_handler(struct isr_frame regs, uint64_t vector, uint64_t error, uint64_t rip) {
-  (void)regs;
+// The register snapshot layout (struct trap_frame, trap_frame.h) must stay
+// in sync with the push order in interrupts.asm. The asm passes rcx =
+// pointer to the frame base; Win64 large-struct-byval had the same register
+// contents, but the pointer signature makes the aliasing explicit — writes
+// through `tf` (e.g. the syscall result into tf->rax) land in the actual
+// on-stack frame that the asm restore path pops.
+uint64_t interrupt_handler(struct trap_frame *tf, uint64_t vector,
+                           uint64_t error, uint64_t rip) {
   // Bump the per-CPU IRQ depth without touching IF (hardware already
   // cleared it on entry). This way, any spinlock_lock/unlock inside the
   // handler nests above depth=1 and the final unlock won't sti
@@ -102,6 +88,13 @@ uint64_t interrupt_handler(struct isr_frame regs, uint64_t vector, uint64_t erro
     // Wake-up only. The HLT'd scheduler loop resumes after the IRET,
     // sees the new queue entry on its next iteration, and dispatches it.
     x86_lapic_eoi();
+    irq_exit();
+    return 0;
+  case INT_SYSCALL:
+    // May not return: ops that park the calling user thread abandon this
+    // stack and jump to the scheduler loop, taking the depth-1 with them
+    // (the scheduler's post-switch irq_enable consumes it).
+    syscall_entry(tf);
     irq_exit();
     return 0;
   default:

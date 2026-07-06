@@ -9,6 +9,7 @@
 #include "buddy_allocator/buddy_allocator.h"
 #include "cpu_state.h"
 #include "debug.h"
+#include "irq.h"
 #include "lapic.h"
 #include "spinlock.h"
 #include "stdlib/stdlib.h"
@@ -430,28 +431,49 @@ static void tlb_invalidate_local(uint64_t min, uint64_t max) {
 }
 
 // Cross-CPU TLB shootdown mailbox. Only one shootdown is in flight at a
-// time (serialized by g_tlb_lock), so a single global slot is enough.
+// time (serialized by g_tlb_busy), so a single global slot is enough.
 //
-//   .as      : the address space whose dirty range needs invalidating.
-//              Remote CPUs short-circuit if they're not actually running it.
-//   .min/.max: the dirty range to invalidate.
-//   .pending : ack counter; targets decrement it as they finish, the
-//              initiator spins until it hits zero.
+//   .as       : the address space whose dirty range needs invalidating.
+//               Remote CPUs short-circuit if they're not running it.
+//   .min/.max : the dirty range to invalidate.
+//   .need_mask: bit i set means logical CPU i must invalidate and ack.
+//               The initiator spins until it reaches zero.
+//
+// Why a per-CPU mask instead of a plain counter: initiators wait for
+// acks with IRQs off (as_flush may run from syscall context, which is
+// IRQs-off by design). A second CPU spinning to become the initiator
+// also has IRQs off and thus can NEVER take the current holder's IPI —
+// with a counter this deadlocked both (holder waits for spinner's ack,
+// spinner waits for the slot). The mask makes acking idempotent and
+// callable from a polling loop, so slot-waiters ack by hand.
 static struct {
   struct address_space *as;
   uint64_t min;
   uint64_t max;
-  _Atomic uint32_t pending;
+  _Atomic uint64_t need_mask;
 } g_tlb_req;
 
-static struct spinlock g_tlb_lock = SPINLOCK_INITIALIZER;
+static _Atomic bool g_tlb_busy;
 
-void paging_handle_tlb_shootdown(void) {
+// Service the in-flight shootdown if it targets this CPU. Idempotent;
+// safe to call from any IRQs-off spin loop. The request fields are
+// stable while our bit is set: the initiator doesn't release the slot
+// (or rewrite the fields) until need_mask hits zero.
+static void tlb_service_local(void) {
   uint64_t me = cpu_state_whoami();
+  uint64_t bit = 1ull << me;
+  if ((atomic_load_explicit(&g_tlb_req.need_mask, memory_order_acquire) &
+       bit) == 0) {
+    return;
+  }
   if (g_cpu_state_table[me].current_as == g_tlb_req.as) {
     tlb_invalidate_local(g_tlb_req.min, g_tlb_req.max);
   }
-  atomic_fetch_sub_explicit(&g_tlb_req.pending, 1, memory_order_release);
+  atomic_fetch_and_explicit(&g_tlb_req.need_mask, ~bit, memory_order_release);
+}
+
+void paging_handle_tlb_shootdown(void) {
+  tlb_service_local();
   x86_lapic_eoi();
 }
 
@@ -459,33 +481,39 @@ int as_flush(struct address_space *as) {
   if (!has_dirty(as))
     return 0;
 
+  asserts(g_cpu_state_table_len <= 64, "as_flush: need_mask is 64 bits");
+
   uint64_t me = cpu_state_whoami();
   uint64_t min = as->min_dirty;
   uint64_t max = as->max_dirty;
 
-  spinlock_lock(&g_tlb_lock);
+  // Acquire the shootdown slot with IRQs off (we may already be at
+  // depth > 0, e.g. syscall context). While spinning we keep servicing
+  // the current holder's request: it may be waiting for OUR ack, and
+  // the IPI cannot be delivered here.
+  irq_disable();
+  while (atomic_exchange_explicit(&g_tlb_busy, true, memory_order_acquire)) {
+    tlb_service_local();
+    __asm__ volatile("pause");
+  }
 
-  // Publish the request. Remote CPUs only consult these once their IPI
-  // fires, so plain stores under the lock are sufficient — x86's TSO
-  // ordering plus the LAPIC ICR write below act as the release barrier.
+  // Publish the request. Targets only consult these after seeing their
+  // bit in need_mask (acquire), which is store-released below.
   g_tlb_req.as = as;
   g_tlb_req.min = min;
   g_tlb_req.max = max;
 
-  // Count and target every other CPU currently running this AS.
-  uint32_t targets = 0;
+  // Target every other CPU currently running this AS.
+  uint64_t targets = 0;
   for (uint32_t i = 0; i < g_cpu_state_table_len; i++) {
-    if (i == me)
-      continue;
-    if (g_cpu_state_table[i].current_as == as)
-      targets++;
+    if (i != me && g_cpu_state_table[i].current_as == as) {
+      targets |= 1ull << i;
+    }
   }
-  atomic_store_explicit(&g_tlb_req.pending, targets, memory_order_release);
+  atomic_store_explicit(&g_tlb_req.need_mask, targets, memory_order_release);
 
   for (uint32_t i = 0; i < g_cpu_state_table_len; i++) {
-    if (i == me)
-      continue;
-    if (g_cpu_state_table[i].current_as == as) {
+    if (targets & (1ull << i)) {
       x86_lapic_send_fixed((uint8_t)g_cpu_state_table[i].hw_id,
                            VECTOR_TLB_SHOOTDOWN);
     }
@@ -496,11 +524,15 @@ int as_flush(struct address_space *as) {
     tlb_invalidate_local(min, max);
   }
 
-  while (atomic_load_explicit(&g_tlb_req.pending, memory_order_acquire) != 0) {
+  // Wait for acks. Targets either take the IPI (IRQs on / HLT'd idle)
+  // or are themselves spinning for the slot above and ack by polling.
+  while (atomic_load_explicit(&g_tlb_req.need_mask, memory_order_acquire) !=
+         0) {
     __asm__ volatile("pause");
   }
 
-  spinlock_unlock(&g_tlb_lock);
+  atomic_store_explicit(&g_tlb_busy, false, memory_order_release);
+  irq_enable();
 
   clear_dirty(as);
   return 0;

@@ -64,4 +64,18 @@ void cpu_state_table_init(const struct acpi_madt *madt);
 // logical "whoami" for CPUs
 uint64_t cpu_state_whoami();
 
+// This CPU's cpu_state. Fast path is one gs-relative read once
+// cpu_percpu_install has run on this CPU; falls back to the hwid scan
+// before that. Callers must be pinned (IRQs off or otherwise migration-
+// free) for the result to stay meaningful, same as cpu_state_whoami.
+struct cpu_state *cpu_state_this(void);
+
+// Arch hooks (archsrc/<arch>/percpu.c).
+// cpu_percpu_install: record this CPU's identity in a register ring 3
+// cannot corrupt (tagged index in IA32_TSC_AUX on x86_64; TPIDR_EL1 on
+// aarch64). cpu_percpu_try_get: this CPU's cpu_state via that register,
+// or nullptr if this CPU hasn't installed yet (early boot).
+void cpu_percpu_install(struct cpu_state *cs);
+struct cpu_state *cpu_percpu_try_get(void);
+
 #endif

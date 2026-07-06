@@ -5,10 +5,12 @@
 #include "cpu_hwid.h"
 #include "cpu_setup.h"
 #include "debug.h"
+#include "dummydev.h"
 #include "enumerate_cpus.h"
 #include "get_mmap.h"
 #include "interrupts.h"
 #include "paging.h"
+#include "pe.h"
 #include "scheduler.h"
 #include "serial.h"
 #include "smp.h"
@@ -16,6 +18,7 @@
 #include "stdlib/stdio.h"
 #include "stdlib/stdlib.h"
 #include "thread.h"
+#include "uaccess.h"
 
 #include <efi/efi.h>
 #include <efi/types.h>
@@ -45,6 +48,25 @@ static void spawner_thread(void *arg) {
   for (uint64_t i = 0; i < n; i++) {
     kthread_spawn(hello_thread, (void *)i);
   }
+}
+
+// C userspace test program compiled to PE32+ (userspace/hello.c),
+// embedded by user_pe_blob.asm until a filesystem exists.
+extern uint8_t user_pe_blob[];
+extern uint8_t user_pe_blob_end[];
+
+static void pe_test_setup(void) {
+  struct process *p = process_create_user(1001);
+  uint64_t entry = 0;
+  int rc = pe_load(p, user_pe_blob, (size_t)(user_pe_blob_end - user_pe_blob),
+                   &entry);
+  asserts(rc == 0, "pe_test: load failed");
+
+  void *stack = umem_alloc(p, 4 * PAGE_SIZE, PAGE_R | PAGE_W);
+  asserts(stack != nullptr, "pe_test: stack alloc failed");
+
+  printf("pe_test: pid=%llu uid=%llu entry=%016llX\n", p->pid, p->uid, entry);
+  uthread_spawn(p, entry, (uint64_t)stack + 4 * PAGE_SIZE);
 }
 
 [[noreturn]] static void ap_main() {
@@ -119,6 +141,13 @@ efi_status_t efi_main(efi_handle_t handle, struct efi_system_table *system) {
   // running context, which round-robin onto all CPUs including the
   // ones currently HLT'd. Their wakeup proves the IPI path works.
   kthread_spawn(spawner_thread, (void *)8);
+
+  // Fake blocking device (spawns its producer kthread).
+  dummydev_init();
+
+  // Ring-3 test suite: a real C program (userspace/hello.c), compiled to
+  // PE32+, rebased at load time. Exercises the whole syscall surface.
+  pe_test_setup();
 
   uint64_t bsp_id = cpu_hwid();
 

@@ -48,6 +48,7 @@ runkernel() {
 
  qemu-system-x86_64 \
     -no-reboot \
+    -cpu max \
     -drive if=pflash,format=raw,file=./bin/efi/OVMF.fd \
     -drive format=raw,file=fat:rw:bin/root \
     -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
