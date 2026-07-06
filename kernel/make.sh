@@ -111,6 +111,8 @@ make() {
   compile_c src/thread.c
   compile_c src/syscall.c
   compile_c src/uaccess.c
+  compile_c src/umem.c
+  compile_c src/reaper.c
   compile_c src/dummydev.c
   compile_c src/ring.c
   compile_c src/pe.c
@@ -119,6 +121,8 @@ make() {
   compile_c src/stdlib/string.c
   # generic-data-structure instantiations
   compile_c src/instances/list_dtype_thread_ptr.c
+  compile_c src/instances/vec_dtype_ublock_ptr.c
+  compile_c src/instances/vec_dtype_process_ptr.c
   # architecture specific
   compile_c archsrc/x86_64/impl_stack_protector.c
   compile_c archsrc/x86_64/serial.c

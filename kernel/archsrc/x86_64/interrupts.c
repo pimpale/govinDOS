@@ -11,6 +11,7 @@
 #include "scheduler.h"
 #include "stdlib/stdio.h"
 #include "syscall.h"
+#include "thread.h"
 #include "trap_frame.h"
 
 #define INT_NMI 0x02
@@ -102,6 +103,19 @@ uint64_t interrupt_handler(struct trap_frame *tf, uint64_t vector,
   }
 
   uint64_t cr2 = (vector == INT_PAGE_FAULT) ? read_cr2() : 0;
+
+  // A fault raised in ring 3 kills the faulting thread, not the kernel.
+  // This is also the designed failure mode for revoked shared memory: the
+  // owner freed (or died with) a block a sharer still had pointers into,
+  // and the sharer's next touch lands here.
+  if ((tf->cs & 3) == 3 &&
+      (vector == INT_PAGE_FAULT || vector == INT_GENERAL_PROTECTION)) {
+    struct thread *curr = thread_current();
+    printf("user %s: killing pid=%llu tid=%llu rip=%016llX cr2=%016llX\n",
+           exception_name(vector), curr->proc->pid, curr->tid, rip, cr2);
+    uthread_park_exit(); // never returns; reaper handles teardown
+  }
+
   const char *what = exception_name(vector);
   if (vector == INT_PAGE_FAULT && looks_like_stack_guard(cr2)) {
     what = "kernel stack overflow (guard page hit)";

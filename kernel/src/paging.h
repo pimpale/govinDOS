@@ -41,6 +41,13 @@ typedef uint32_t paging_flags_t;
 #define PAGE_WT (3u << 4)
 #define PAGE_CACHE_MASK (3u << 4)
 
+// The boot identity mapping's flags: present, kernel-only, RWX, write-back.
+// Pristinity invariant: anything returned to the buddy allocator must be
+// mapped exactly like this in every live address space first — frees
+// *restore* this mapping rather than unmapping, which lets the merge pass
+// in as_flag collapse the region back into the surrounding hugepages.
+#define PAGE_KERNEL_PRISTINE (PAGE_R | PAGE_W | PAGE_X)
+
 // ---------------------------------------------------------------------------
 // Lifecycle / singletons
 // ---------------------------------------------------------------------------
@@ -48,6 +55,15 @@ typedef uint32_t paging_flags_t;
 // The kernel address space.
 // will be set in cpu_setup.c
 extern struct address_space *g_as_kernel;
+
+// Frozen snapshot of the kernel skeleton, sealed at the end of boot (after
+// the per-CPU stacks and their static guard pages, before any kthread or
+// user process exists). User process address spaces are cloned from this,
+// never from live g_as_kernel: g_as_kernel accumulates kthread-stack guard
+// punches over time, and a clone taken mid-flight would keep a stale
+// non-present page after that kthread's stack is freed and recycled.
+// Set once in init.c; never mutated afterwards.
+extern struct address_space *g_as_template;
 
 /////////////////////////////////////////////////////////////
 // AS Data Manipulation (No side effects apart from allocation/deallocation)
@@ -65,6 +81,11 @@ void as_free(struct address_space *as);
 // get data about an address in a given tab
 int as_getinfo(const struct address_space *as, uint64_t addr,
                paging_flags_t *flags_out, bool *present_out);
+
+// Number of page-table pages (all levels, including the root) owned by
+// this address space. Debug/testing aid: flag-and-revert sequences should
+// return the count to its prior value if the merge pass is working.
+uint64_t as_table_count(struct address_space *as);
 
 // set flags
 // will mark ranges as dirty. Call flush after making a set of changes
@@ -95,5 +116,12 @@ int as_flush(struct address_space *as);
 // request, invalidates the requested range locally if this CPU is running
 // the targeted AS, acks the initiator, and EOIs the local APIC.
 void paging_handle_tlb_shootdown(void);
+
+// Service the in-flight shootdown request targeting this CPU, if any.
+// Idempotent and cheap. Any IRQs-off spin loop that can run while a
+// shootdown initiator waits for this CPU's ack MUST call this each
+// iteration (the initiator's IPI cannot be delivered with IRQs off) —
+// e.g. a lock that is ever held across as_flush by another CPU.
+void paging_service_shootdown(void);
 
 #endif // paging_h_INCLUDED

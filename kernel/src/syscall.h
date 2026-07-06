@@ -31,7 +31,15 @@
 #define SYS_RING_ENTER  9 // ()                     -> 0 (doorbell)
 #define SYS_RING_WAIT  10 // (my_cq_head)           -> 0 (blocks if empty)
 
-#define SYS_MAX        11
+// Memory blocks are the vm_map unit (power-of-two pages). vm_protect
+// re-flags a page-aligned sub-range of a block in the caller's own view;
+// prot 0 makes it inaccessible. vm_share maps a whole owned block into
+// another process; the owner freeing the block (or dying) revokes it.
+#define SYS_VM_PROTECT 11 // (base, len, prot)      -> 0
+#define SYS_VM_SHARE   12 // (base, pid, prot)      -> 0
+#define SYS_VM_UNSHARE 13 // (base)                 -> 0
+
+#define SYS_MAX        14
 
 // vm_map prot bits (user-facing; translated to paging flags internally).
 #define VM_PROT_READ  1u

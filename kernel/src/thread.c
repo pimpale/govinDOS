@@ -12,13 +12,14 @@
 #include "spinlock.h"
 #include "stacks.h"
 #include "stdlib/stdlib.h"
+#include "umem.h"
 
 // Arch hooks. Implemented in archsrc/<arch>/.
 //   switch_context: save callee-saved state + SP at *old_sp_out, load new_sp
 //                   and pop its callee-saved state; return to whatever lives
 //                   at the top of that stack.
 //   arch_thread_init_kernel: forge an initial stack frame so the first
-//                   switch_context into this thread lands in thread_trampoline
+//                   switch_context into this thread lands in thread_enter
 //                   with (entry, arg) in the right argument registers.
 //   arch_thread_install: per-cpu setup before resuming the thread — switch
 //                   address space if needed, restore FS/TPIDR_EL0, etc.
@@ -49,17 +50,24 @@ void threading_init(void) {
   asserts(g_kernel_process != nullptr, "threading_init: alloc failed");
   g_kernel_process->pid = atomic_fetch_add(&g_next_pid, 1);
   g_kernel_process->as = g_as_kernel;
-  g_kernel_process->is_kernel = true;
   g_kernel_process->uid = 0;
 }
 
 struct process *process_create_user(uint64_t uid) {
+  asserts(g_as_template != nullptr,
+          "process: g_as_template not sealed yet (see init.c)");
+  asserts(uid != 0, "process: uid 0 is reserved for the kernel process");
   struct process *p = calloc(1, sizeof(*p));
   asserts(p != nullptr, "process: alloc failed");
   p->pid = atomic_fetch_add(&g_next_pid, 1);
-  p->as = g_as_kernel; // single address space: protection is PAGE_U, not CR3
-  p->is_kernel = false;
+  // Same identity layout as every AS (SASOS), but a private tree: only
+  // blocks granted to this process carry PAGE_U here. Cloned from the
+  // frozen template, never live g_as_kernel — the live tree carries
+  // kthread-stack guard punches that are restored in g_as_kernel alone,
+  // and a clone taken mid-flight would keep the hole forever.
+  p->as = as_clone(g_as_template);
   p->uid = uid;
+  umem_process_register(p);
   return p;
 }
 
@@ -70,6 +78,7 @@ static struct thread *alloc_thread(struct process *proc, bool with_kstack) {
   asserts(t != nullptr, "thread: alloc failed");
   t->tid = atomic_fetch_add(&g_next_tid, 1);
   t->proc = proc;
+  atomic_fetch_add(&proc->nthreads, 1);
   t->status = THREAD_RUNNABLE;
   if (with_kstack) {
     t->stack_top = stacks_alloc_kernel(STACK_TYPE_KERNEL_TASK);
@@ -87,7 +96,7 @@ struct thread *kthread_spawn(void (*entry)(void *), void *arg) {
 
 struct thread *uthread_spawn(struct process *proc, uint64_t entry,
                              uint64_t user_stack_top) {
-  asserts(proc != nullptr && !proc->is_kernel,
+  asserts(proc != nullptr && proc->uid != 0,
           "uthread_spawn: needs a user process");
   struct thread *t = alloc_thread(proc, false);
   arch_thread_init_user(t, entry, user_stack_top);
@@ -153,7 +162,8 @@ void thread_unblock(struct thread *t) {
 }
 
 void thread_deliver_wait_result(struct thread *t, uint64_t v) {
-  if (t->proc->is_kernel) {
+  if (t->proc->uid == 0) {
+    // Kernel thread: it resumes in kernel code and reads wait_result.
     t->wait_result = v;
   } else {
     // Parked user thread: the value lands in the saved frame's rax and
@@ -204,14 +214,13 @@ void thread_enter(void (*entry)(void *), void *arg) {
 // captured in its TCB frame (or is irrelevant, for exit). The per-CPU
 // interrupt stack we're abandoning is reused fresh by the next entry.
 
-[[noreturn]] static void uthread_park(enum thread_status status,
-                                      bool requeue) {
+[[noreturn]] static void uthread_park(enum thread_status status, bool requeue) {
   struct cpu_state *cs = cpu_state_this();
   asserts(cs->irq_depth == 1, "uthread_park: not at interrupt depth 1");
 
   spinlock_lock(&cs->scheduler.lock);
   struct thread *curr = cs->scheduler.current_thread;
-  asserts(curr != nullptr && !curr->proc->is_kernel,
+  asserts(curr != nullptr && curr->proc->uid != 0,
           "uthread_park: no current user thread");
   curr->status = status;
   if (requeue) {

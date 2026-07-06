@@ -2,7 +2,6 @@
 
 #include <stdint.h>
 
-#include "allocator.h"
 #include "debug.h"
 #include "gdt.h"
 #include "interrupts.h"
@@ -31,11 +30,6 @@ static void map_mmio_page(struct address_space *as, uint64_t phys) {
     return;
   uint64_t base = phys & ~((uint64_t)PAGE_SIZE - 1);
   as_flag(as, base, base + PAGE_SIZE, PAGE_R | PAGE_W | PAGE_UC);
-
-  struct frame_info *fi = frame_for(base);
-  if (fi != nullptr) {
-    fi->kind = FRAME_MMIO;
-  }
 }
 
 // Walk the MADT and mark every device MMIO region it advertises as UC in the

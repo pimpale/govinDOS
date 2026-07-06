@@ -23,6 +23,9 @@
 #define SYS_RING_CREATE 8
 #define SYS_RING_ENTER 9
 #define SYS_RING_WAIT 10
+#define SYS_VM_PROTECT 11
+#define SYS_VM_SHARE 12
+#define SYS_VM_UNSHARE 13
 
 #define VM_PROT_READ 1
 #define VM_PROT_WRITE 2
@@ -53,17 +56,22 @@ struct ring_cqe {
 
 // int 0x80 ABI: rax = nr, args in rcx/rdx/r8/r9, result in rax; the
 // kernel preserves all other registers.
-static inline uint64_t sys2(uint64_t nr, uint64_t a0, uint64_t a1) {
+static inline uint64_t sys3(uint64_t nr, uint64_t a0, uint64_t a1,
+                            uint64_t a2) {
   uint64_t ret;
   register uint64_t rc __asm__("rcx") = a0;
   register uint64_t rd __asm__("rdx") = a1;
+  register uint64_t r8 __asm__("r8") = a2;
   __asm__ volatile("int $0x80"
-                   : "=a"(ret), "+r"(rc), "+r"(rd)
+                   : "=a"(ret), "+r"(rc), "+r"(rd), "+r"(r8)
                    : "a"(nr)
                    : "memory");
   return ret;
 }
 
+static inline uint64_t sys2(uint64_t nr, uint64_t a0, uint64_t a1) {
+  return sys3(nr, a0, a1, 0);
+}
 static inline uint64_t sys1(uint64_t nr, uint64_t a0) { return sys2(nr, a0, 0); }
 static inline uint64_t sys0(uint64_t nr) { return sys2(nr, 0, 0); }
 
@@ -104,15 +112,57 @@ static void test_memory(void) {
   print_hex(base);
 
   const char *msg = "pe: printing from vm_map'd page\n";
+  const char *msg2 = "pe: printing from a read-only page\n";
   char *pg = (char *)base;
+  char *pg2 = (char *)(base + 4096);
   uint64_t len = str_len(msg);
+  uint64_t len2 = str_len(msg2);
   for (uint64_t i = 0; i < len; i++) {
     pg[i] = msg[i];
   }
+  for (uint64_t i = 0; i < len2; i++) {
+    pg2[i] = msg2[i]; // seeded while still RW; read back after RO below
+  }
   sys2(SYS_DEBUG_WRITE, base, len);
 
+  // vm_protect: drop the second page to read-only in our own view.
+  // Reads (debug_write) still work through it.
+  print("pe: vm_protect(page2, RO) rc=");
+  print_hex(sys3(SYS_VM_PROTECT, base + 4096, 4096, VM_PROT_READ));
+  sys2(SYS_DEBUG_WRITE, base + 4096, len2);
+
+  // Guard view (prot=0): the kernel must now refuse even reads there.
+  print("pe: vm_protect(page2, none) rc=");
+  print_hex(sys3(SYS_VM_PROTECT, base + 4096, 4096, 0));
+  print("pe: debug_write through guarded page rc=");
+  print_hex(sys2(SYS_DEBUG_WRITE, base + 4096, 16));
+
+  // Restore and unmap. Partial unmap must be rejected (blocks are the
+  // unit); exact unmap succeeds.
+  print("pe: vm_protect(page2, RW) rc=");
+  print_hex(sys3(SYS_VM_PROTECT, base + 4096, 4096,
+                 VM_PROT_READ | VM_PROT_WRITE));
+  print("pe: partial vm_unmap rc=");
+  print_hex(sys2(SYS_VM_UNMAP, base, 4096));
   print("pe: vm_unmap rc=");
   print_hex(sys2(SYS_VM_UNMAP, base, 8192));
+
+  // Double free must fail.
+  print("pe: double vm_unmap rc=");
+  print_hex(sys2(SYS_VM_UNMAP, base, 8192));
+
+  // Share error paths (there is no second process to rendezvous with, so
+  // only the failure modes are reachable from here; the success path is
+  // covered by the kernel's boot-time selftest).
+  uint64_t blk = sys2(SYS_VM_MAP, 4096, VM_PROT_READ);
+  print("pe: vm_share to bogus pid rc=");
+  print_hex(sys3(SYS_VM_SHARE, blk, 0xdead, VM_PROT_READ));
+  print("pe: vm_share to self rc=");
+  print_hex(sys3(SYS_VM_SHARE, blk, sys0(SYS_GETPID), VM_PROT_READ));
+  print("pe: vm_unshare of owned block rc=");
+  print_hex(sys1(SYS_VM_UNSHARE, blk));
+  print("pe: cleanup vm_unmap rc=");
+  print_hex(sys2(SYS_VM_UNMAP, blk, 4096));
 
   // The kernel must refuse to touch non-PAGE_U memory on our behalf
   // (expect SYSERR_FAULT, ...fffe).

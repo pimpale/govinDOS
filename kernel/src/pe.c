@@ -7,7 +7,7 @@
 #include "stdlib/stdio.h"
 #include "stdlib/string.h"
 #include "thread.h"
-#include "uaccess.h"
+#include "umem.h"
 
 // Minimal on-disk PE32+ structures (only the fields we read).
 

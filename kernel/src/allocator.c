@@ -1,5 +1,4 @@
 #include "stdlib/math.h"
-#include "stdlib/string.h"
 
 #include "allocator.h"
 #include "debug.h"
@@ -8,9 +7,6 @@
 struct buddy_allocator_s *g_allocator = nullptr;
 struct spinlock g_allocator_lock = SPINLOCK_INITIALIZER;
 
-struct frame_info *g_frames = nullptr;
-uint64_t g_n_frames = 0;
-
 static inline void *page_to_mem(uint64_t page_id) {
   return (void *)(page_id * PAGE_SIZE);
 }
@@ -18,26 +14,6 @@ static inline void *page_to_mem(uint64_t page_id) {
 void allocator_require(void) {
   asserts(g_allocator != nullptr,
           "kstdlib: allocator used before initialization\n");
-}
-
-struct frame_info *frame_for(uint64_t pa) {
-  uint64_t pfn = pa / PAGE_SIZE;
-  if (pfn >= g_n_frames) {
-    return nullptr;
-  }
-  return &g_frames[pfn];
-}
-
-unsigned frame_get(uint64_t pa) {
-  struct frame_info *fi = frame_for(pa);
-  asserts(fi != nullptr, "frame_get: pa out of range\n");
-  return __atomic_add_fetch(&fi->refcount, 1, __ATOMIC_SEQ_CST);
-}
-
-unsigned frame_put(uint64_t pa) {
-  struct frame_info *fi = frame_for(pa);
-  asserts(fi != nullptr, "frame_put: pa out of range\n");
-  return __atomic_sub_fetch(&fi->refcount, 1, __ATOMIC_SEQ_CST);
 }
 
 void allocator_init(uint64_t n_mmap, const struct efi_memory_descriptor *mmap) {
@@ -85,48 +61,6 @@ void allocator_init(uint64_t n_mmap, const struct efi_memory_descriptor *mmap) {
 
   buddy_ready(ba);
   g_allocator = ba;
-
-  // Now build the frame metadata table. Its backing comes from the buddy
-  // (so it has to come up after buddy_ready), and we then mark the frames
-  // backing both the buddy and the table itself as FRAME_KERNEL so they
-  // are never confused for free / available frames by future bookkeeping.
-  uint64_t frame_info_bytes = n_pages * sizeof(struct frame_info);
-  uint64_t fi_pages = (frame_info_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
-  uint64_t fi_page_id = 0;
-  buddy_status_t s = buddy_page_alloc(ba, fi_pages, &fi_page_id);
-  asserts(s == BUDDY_STATUS_SUCCESS,
-          "allocator: out of memory for frame_info\n");
-
-  g_frames = page_to_mem(fi_page_id);
-  g_n_frames = n_pages;
-  memset(g_frames, 0, frame_info_bytes);
-
-  // Tag pages we know about. Buddy-tracked free pages stay at the
-  // memset default (kind = FRAME_FREE, refcount = 0).
-  for (uint64_t i = 0; i < n_mmap; i++) {
-    if (mmap[i].type == EFI_CONVENTIONAL_MEMORY) {
-      continue;
-    }
-    uint64_t start_pfn = mmap[i].physical_start / PAGE_SIZE;
-    for (uint64_t j = 0; j < mmap[i].pages; j++) {
-      uint64_t pfn = start_pfn + j;
-      if (pfn < g_n_frames) {
-        g_frames[pfn].kind = FRAME_RESERVED;
-      }
-    }
-  }
-  for (uint64_t i = 0; i < pages_for_allocator; i++) {
-    uint64_t pfn = allocator_start_page_id + i;
-    if (pfn < g_n_frames) {
-      g_frames[pfn].kind = FRAME_KERNEL;
-    }
-  }
-  for (uint64_t i = 0; i < fi_pages; i++) {
-    uint64_t pfn = fi_page_id + i;
-    if (pfn < g_n_frames) {
-      g_frames[pfn].kind = FRAME_KERNEL;
-    }
-  }
 }
 
 static void *malloc_unlocked(size_t size) {

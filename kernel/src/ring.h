@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 struct thread;
+struct ring;
 
 // io_uring-style submission/completion rings — the "long syscall" path.
 //
@@ -69,6 +70,16 @@ static_assert(sizeof(struct ring_shared) <= 4096, "ring must fit one page");
 // thread).
 uint64_t ring_create(struct thread *curr);          // -> shared base | err
 uint64_t ring_enter(struct thread *curr);           // doorbell -> 0 | err
+
+// Teardown (reaper only): stop the worker kthread — waking it if parked,
+// waiting out any in-flight op — then free the kernel-side ring struct.
+// Does NOT free the shared page; that is an ordinary ublock owned by the
+// process, freed by its owner's teardown path.
+void ring_destroy(struct ring *r);
+
+// The shared block backing this ring (struct ring is opaque; the reaper
+// needs the base to free the ublock after ring_destroy).
+struct ring_shared *ring_shared_of(struct ring *r);
 // If completions beyond `user_cq_head` already exist (or on error),
 // returns the syscall result for the live frame. Otherwise parks the
 // calling thread (caller must have saved its frame with rax preloaded

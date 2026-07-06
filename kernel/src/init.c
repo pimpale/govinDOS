@@ -15,10 +15,12 @@
 #include "serial.h"
 #include "smp.h"
 
+#include "reaper.h"
 #include "stdlib/stdio.h"
 #include "stdlib/stdlib.h"
 #include "thread.h"
 #include "uaccess.h"
+#include "umem.h"
 
 #include <efi/efi.h>
 #include <efi/types.h>
@@ -48,6 +50,83 @@ static void spawner_thread(void *arg) {
   for (uint64_t i = 0; i < n; i++) {
     kthread_spawn(hello_thread, (void *)i);
   }
+}
+
+// Regression test for the paging merge pass: a guard punch fragments the
+// kernel tree; reverting it must fold the tables back. Punch inside a
+// 2 MiB buddy block: the buddy aligns blocks to their size, so that
+// block's PD entry is untouched by anything else (boot-time stack guards
+// live in other 2 MiB regions) and the punch is guaranteed to split at
+// least the PT — the test can't pass vacuously.
+static void paging_merge_selftest(void) {
+  uint64_t baseline = as_table_count(g_as_kernel);
+  uint8_t *blk = malloc(2 * 1024 * 1024);
+  asserts(blk != nullptr, "merge selftest: alloc failed");
+  uint64_t pg = (uint64_t)blk + PAGE_SIZE;
+  as_flag(g_as_kernel, pg, pg + PAGE_SIZE, 0);
+  as_flush(g_as_kernel);
+  uint64_t split = as_table_count(g_as_kernel);
+  asserts(split > baseline, "merge selftest: guard punch did not split");
+  as_flag(g_as_kernel, pg, pg + PAGE_SIZE, PAGE_KERNEL_PRISTINE);
+  as_flush(g_as_kernel);
+  uint64_t merged = as_table_count(g_as_kernel);
+  asserts(merged == baseline, "merge selftest: revert did not re-merge");
+  free(blk);
+  printf("paging: merge selftest ok (tables %llu -> %llu -> %llu)\n", baseline,
+         split, merged);
+}
+
+// Boot-time test of the ublock model across two processes: isolation
+// (PAGE_U only in the owner's tree), sharing, per-view protect, and
+// revoke-on-free. Runs before the scheduler ever dispatches these
+// processes, so process_destroy's drain is trivially satisfied.
+static void umem_selftest(void) {
+  struct process *a = process_create_user(9001);
+  struct process *b = process_create_user(9002);
+
+  uint8_t *blk = umem_alloc(a, 2 * PAGE_SIZE, PAGE_R | PAGE_W);
+  asserts(blk != nullptr, "umem selftest: alloc failed");
+  asserts(blk[0] == 0 && blk[2 * PAGE_SIZE - 1] == 0,
+          "umem selftest: block not zeroed");
+
+  // Isolation: PAGE_U in the owner's tree only; everywhere else the block
+  // is plain kernel memory.
+  asserts(user_range_ok(a, (uint64_t)blk, 2 * PAGE_SIZE, true),
+          "umem selftest: owner cannot access own block");
+  asserts(!user_range_ok(b, (uint64_t)blk, PAGE_SIZE, false),
+          "umem selftest: stranger can access foreign block");
+
+  // Sharing: read-only view for b.
+  asserts(umem_share(a, (uint64_t)blk, b->pid, PAGE_R) == 0,
+          "umem selftest: share failed");
+  asserts(user_range_ok(b, (uint64_t)blk, 2 * PAGE_SIZE, false),
+          "umem selftest: sharer cannot read shared block");
+  asserts(!user_range_ok(b, (uint64_t)blk, PAGE_SIZE, true),
+          "umem selftest: read-only sharer can write");
+
+  // Per-view flags: owner guards a sub-range; sharer's view unaffected.
+  asserts(umem_protect(a, (uint64_t)blk, PAGE_SIZE, 0) == 0,
+          "umem selftest: protect failed");
+  asserts(!user_range_ok(a, (uint64_t)blk, PAGE_SIZE, false),
+          "umem selftest: owner guard view not applied");
+  asserts(user_range_ok(b, (uint64_t)blk, PAGE_SIZE, false),
+          "umem selftest: owner's protect leaked into sharer view");
+
+  // Owner free revokes the sharer and restores pristine everywhere.
+  asserts(umem_free(a, (uint64_t)blk, 0) == 0, "umem selftest: free failed");
+  asserts(!user_range_ok(b, (uint64_t)blk, PAGE_SIZE, false),
+          "umem selftest: revoke left sharer access");
+  asserts(!user_range_ok(a, (uint64_t)blk, PAGE_SIZE, false),
+          "umem selftest: free left owner access");
+
+  // Full-block restore + merge: both trees back to template shape.
+  uint64_t tmpl = as_table_count(g_as_template);
+  asserts(as_table_count(a->as) == tmpl && as_table_count(b->as) == tmpl,
+          "umem selftest: trees did not merge back to template shape");
+
+  process_destroy(a);
+  process_destroy(b);
+  printf("umem: selftest ok\n");
 }
 
 // C userspace test program compiled to PE32+ (userspace/hello.c),
@@ -134,6 +213,25 @@ efi_status_t efi_main(efi_handle_t handle, struct efi_system_table *system) {
   // threading_cpu_enter() as soon as they finish cpu_setup, which
   // requires g_kernel_process to exist.
   threading_init();
+
+  // User-memory bookkeeping (ublock registry + uid accounts).
+  umem_init();
+
+  // Guard punch + revert must return the kernel tree to its exact shape.
+  paging_merge_selftest();
+
+  // Seal the template BEFORE the first kthread_spawn: user ASes clone
+  // from this frozen snapshot, which must contain the boot-static kernel
+  // mappings (incl. per-CPU stack guards) but never a kthread-stack guard
+  // — those are punched and restored in g_as_kernel only.
+  g_as_template = as_clone(g_as_kernel);
+
+  // Two-process isolation / share / revoke test (needs the template).
+  umem_selftest();
+
+  // Reaper before anything can die: dead threads (and, via the last
+  // thread, dead processes) are torn down on its kthread.
+  reaper_init();
 
   // Spawn a single bootstrap thread. Round-robin places it on CPU 0
   // (the BSP, last to enter the scheduler); the other CPUs get nothing

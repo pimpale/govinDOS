@@ -5,13 +5,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "allocator.h"
-#include "buddy_allocator/buddy_allocator.h"
 #include "cpu_state.h"
 #include "debug.h"
 #include "irq.h"
 #include "lapic.h"
-#include "spinlock.h"
 #include "stdlib/stdlib.h"
 #include "stdlib/string.h"
 
@@ -57,9 +54,35 @@ struct address_space {
   pte_t *root;
   uint64_t min_dirty; // lowest dirty VA (inclusive)
   uint64_t max_dirty; // highest dirty VA (exclusive)
+  // Guards all tree mutation (as_flag/as_flush/as_clone-source/as_free).
+  // Reads (walk/as_getinfo) stay lock-free: entries are 8-byte aligned
+  // stores, so a racing reader sees either the old or the new PTE — the
+  // same guarantee the hardware walker gets.
+  _Atomic bool mut_lock;
 };
 
 struct address_space *g_as_kernel = nullptr;
+struct address_space *g_as_template = nullptr;
+
+static void tlb_service_local(void);
+
+// AS mutation lock. Held across mutate + flush; as_flush waits for remote
+// shootdown acks with IRQs off while holding it, so waiters spinning here
+// (also IRQs off) MUST keep servicing the in-flight shootdown — they may
+// be the target the holder is waiting on. Same deadlock shape as the old
+// as_flush counter bug; see the need_mask comment below.
+static void as_lock(struct address_space *as) {
+  irq_disable();
+  while (atomic_exchange_explicit(&as->mut_lock, true, memory_order_acquire)) {
+    tlb_service_local();
+    __asm__ volatile("pause");
+  }
+}
+
+static void as_unlock(struct address_space *as) {
+  atomic_store_explicit(&as->mut_lock, false, memory_order_release);
+  irq_enable();
+}
 
 // ---------------------------------------------------------------------------
 // Page-table page allocation
@@ -77,23 +100,10 @@ static pte_t *pt_alloc(void) {
   pte_t *p = malloc(PAGE_SIZE);
   asserts(p != nullptr, "paging: out of memory allocating page table\n");
   memset(p, 0, PAGE_SIZE);
-
-  struct frame_info *fi = frame_for((uint64_t)p);
-  if (fi != nullptr) {
-    fi->kind = FRAME_PAGETABLE;
-    fi->refcount = 1;
-  }
   return p;
 }
 
-static void pt_free(pte_t *p) {
-  struct frame_info *fi = frame_for((uint64_t)p);
-  if (fi != nullptr) {
-    fi->kind = FRAME_FREE;
-    fi->refcount = 0;
-  }
-  free(p);
-}
+static void pt_free(pte_t *p) { free(p); }
 
 // ---------------------------------------------------------------------------
 // Flag translation
@@ -271,6 +281,95 @@ static pte_t walk(const pte_t *root, uint64_t addr) {
 }
 
 // ---------------------------------------------------------------------------
+// Merge (the inverse of split_huge)
+// ---------------------------------------------------------------------------
+
+// Try to collapse the child table under parent[idx(addr, parent_level)]
+// into a single entry of the parent:
+//   - all 512 entries absent            -> parent slot := 0
+//   - all 512 entries present leaves with identical flag bits and
+//     contiguous, parent-aligned translation -> parent slot := huge leaf
+//     (parent_level <= 3 only; PML4 entries cannot be leaves)
+// Returns true if a merge happened. Like split_huge, a merge preserves
+// translation and permissions but changes TLB granularity, so the covered
+// span is marked dirty.
+static bool try_merge_child(struct address_space *as, pte_t *parent,
+                            int parent_level, uint64_t addr) {
+  size_t idx = level_idx(addr, parent_level);
+  pte_t e = parent[idx];
+  if (!(e & PTE_P) || (e & PTE_PS)) {
+    return false; // absent or already a leaf: no child table to merge
+  }
+  pte_t *child = (pte_t *)(e & PTE_ADDR);
+  int child_level = parent_level - 1;
+  uint64_t step = LEVEL_SIZE[child_level];
+
+  bool all_absent = true;
+  bool all_leaf = true;
+  pte_t first = child[0];
+  for (size_t i = 0; i < 512 && (all_absent || all_leaf); i++) {
+    pte_t c = child[i];
+    if (!(c & PTE_P)) {
+      all_leaf = false;
+      continue;
+    }
+    all_absent = false;
+    if ((child_level >= 2 && !(c & PTE_PS)) ||
+        (c & ~PTE_ADDR) != (first & ~PTE_ADDR) ||
+        (c & PTE_ADDR) != (first & PTE_ADDR) + i * step) {
+      all_leaf = false;
+    }
+  }
+
+  uint64_t span = addr & ~(LEVEL_SIZE[parent_level] - 1);
+  if (all_absent) {
+    parent[idx] = 0;
+    pt_free(child);
+    mark_dirty(as, span, span + LEVEL_SIZE[parent_level]);
+    return true;
+  }
+  if (all_leaf && parent_level <= 3) {
+    uint64_t base = first & PTE_ADDR;
+    if ((base & (LEVEL_SIZE[parent_level] - 1)) != 0) {
+      return false; // contiguous but misaligned: can't express as a huge
+    }
+    // 4 KiB PTEs carry no PS (bit 7 is PAT there, always 0 for us); the
+    // merged leaf needs it. For child_level >= 2 the entries had PS
+    // already and it's preserved via the flag bits.
+    parent[idx] = base | (first & ~PTE_ADDR) | PTE_PS;
+    pt_free(child);
+    mark_dirty(as, span, span + LEVEL_SIZE[parent_level]);
+    return true;
+  }
+  return false;
+}
+
+// Merge upward along the walk of `addr`. as_flag installs maximal leaves,
+// so only the boundary tables of a flagged range can newly become
+// homogeneous — calling this on the range's first and last page covers
+// every merge opportunity the operation created. Stops at the first level
+// that doesn't merge: a non-mergeable child leaves a table pointer in its
+// parent, which makes the parent non-uniform by definition.
+static void try_merge_path(struct address_space *as, uint64_t addr) {
+  pte_t *tables[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+  tables[4] = as->root;
+  int lowest = 4;
+  for (int l = 4; l >= 2; l--) {
+    pte_t e = tables[l][level_idx(addr, l)];
+    if (!(e & PTE_P) || (e & PTE_PS)) {
+      break;
+    }
+    tables[l - 1] = (pte_t *)(e & PTE_ADDR);
+    lowest = l - 1;
+  }
+  for (int pl = lowest + 1; pl <= 4; pl++) {
+    if (!try_merge_child(as, tables[pl], pl, addr)) {
+      break;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Recursive tree helpers (clone + free)
 // ---------------------------------------------------------------------------
 
@@ -320,6 +419,7 @@ struct address_space *as_identity_mapping(void) {
   as->root = pt_alloc();
   as->min_dirty = DIRTY_EMPTY_MIN;
   as->max_dirty = DIRTY_EMPTY_MAX;
+  atomic_store_explicit(&as->mut_lock, false, memory_order_relaxed);
 
   // Identity map the first 512 GiB with 1 GiB huge pages. Flags: R|W|X,
   // kernel-only, WB. NX is deliberately *not* set because the kernel
@@ -337,14 +437,21 @@ struct address_space *as_identity_mapping(void) {
 struct address_space *as_clone(struct address_space *src) {
   struct address_space *as = malloc(sizeof(*as));
   asserts(as != nullptr, "paging: failed to allocate address_space\n");
+  as_lock(src);
   as->root = clone_table(4, src->root);
+  as_unlock(src);
   as->min_dirty = DIRTY_EMPTY_MIN;
   as->max_dirty = DIRTY_EMPTY_MAX;
+  atomic_store_explicit(&as->mut_lock, false, memory_order_relaxed);
   return as;
 }
 
 void as_free(struct address_space *as) {
+  // Caller guarantees no CPU has this AS current (see the drain in the
+  // reaper) and no concurrent mutators remain; the lock is for form.
+  as_lock(as);
   free_table(4, as->root);
+  as_unlock(as);
   free(as);
 }
 
@@ -363,6 +470,26 @@ int as_getinfo(const struct address_space *as, uint64_t addr,
   return 0;
 }
 
+static uint64_t count_tables(int level, const pte_t *table) {
+  uint64_t n = 1;
+  if (level > 1) {
+    for (size_t i = 0; i < 512; i++) {
+      pte_t e = table[i];
+      if ((e & PTE_P) && !(e & PTE_PS)) {
+        n += count_tables(level - 1, (const pte_t *)(e & PTE_ADDR));
+      }
+    }
+  }
+  return n;
+}
+
+uint64_t as_table_count(struct address_space *as) {
+  as_lock(as);
+  uint64_t n = count_tables(4, as->root);
+  as_unlock(as);
+  return n;
+}
+
 // ---------------------------------------------------------------------------
 // Mutation
 // ---------------------------------------------------------------------------
@@ -378,6 +505,7 @@ int as_flag(struct address_space *as, uint64_t addr, uint64_t end,
   pte_t leaf_base = leaf_flags_to_pte(flags);
   bool present = (leaf_base & PTE_P) != 0;
 
+  as_lock(as);
   uint64_t a = addr;
   while (a < end) {
     uint64_t remaining = end - a;
@@ -394,6 +522,12 @@ int as_flag(struct address_space *as, uint64_t addr, uint64_t end,
   }
 
   mark_dirty(as, addr, end);
+
+  // Interior tables were overwritten with maximal leaves; only the two
+  // boundary paths can have newly become mergeable.
+  try_merge_path(as, addr);
+  try_merge_path(as, end - PAGE_SIZE);
+  as_unlock(as);
   return 0;
 }
 
@@ -477,9 +611,14 @@ void paging_handle_tlb_shootdown(void) {
   x86_lapic_eoi();
 }
 
+void paging_service_shootdown(void) { tlb_service_local(); }
+
 int as_flush(struct address_space *as) {
-  if (!has_dirty(as))
+  as_lock(as);
+  if (!has_dirty(as)) {
+    as_unlock(as);
     return 0;
+  }
 
   asserts(g_cpu_state_table_len <= 64, "as_flush: need_mask is 64 bits");
 
@@ -535,5 +674,6 @@ int as_flush(struct address_space *as) {
   irq_enable();
 
   clear_dirty(as);
+  as_unlock(as);
   return 0;
 }

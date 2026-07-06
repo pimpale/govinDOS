@@ -65,12 +65,23 @@ typedef thread *thread_ptr;
 
 struct process {
   uint64_t pid;
-  struct address_space *as;   // == g_as_kernel for the kernel process
-  bool is_kernel;
-  // Owner of this process, for the eventual multi-user model. uid 0 is
-  // the kernel process. Checked (via frame_info.owner_id for now) when a
-  // process frees user memory; more enforcement comes with real users.
+  // The kernel process runs on g_as_kernel; every user process gets its
+  // own as_clone(g_as_template). All ASes share the identity layout
+  // (SASOS) — isolation is which tree carries PAGE_U leaves for a block.
+  struct address_space *as;
+  // Owner of this process, for the multi-user model. uid 0 is the kernel
+  // process. User memory is charged to this uid (umem.c accounts).
   uint64_t uid;
+
+  // Live threads belonging to this process. Incremented at spawn,
+  // decremented by the reaper after a dead thread's teardown; the reaper
+  // destroys the process when it hits zero (kernel process excepted).
+  _Atomic uint64_t nthreads;
+
+  // User memory (umem.c, guarded by its lock): blocks this process owns,
+  // and blocks other processes have shared with it.
+  struct vec_ublock_ptr *blocks;
+  struct vec_ublock_ptr *shared_in;
 };
 
 // Singleton process every kernel thread belongs to. Allocated by
@@ -118,8 +129,9 @@ void thread_enter(void (*entry)(void *), void *arg);
 // frame has been saved. That is what keeps the single-kernel-stack-per-CPU
 // model sound, including under future preemption.
 
-// Create a user process. Shares the kernel's single address space (SASOS);
-// protection comes from PAGE_U mappings, not separate page tables.
+// Create a user process. Same identity address layout as everything else
+// (SASOS), but its own page tree cloned from g_as_template: isolation is
+// which tree carries PAGE_U leaves, enforced by a per-process CR3.
 struct process *process_create_user(uint64_t uid);
 
 // Spawn a user thread that starts at `entry` in ring 3 on `user_stack_top`.

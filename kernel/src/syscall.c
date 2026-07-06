@@ -9,6 +9,7 @@
 #include "thread.h"
 #include "trap_frame.h"
 #include "uaccess.h"
+#include "umem.h"
 
 // serial-backed character sink used by printf (stdio.c)
 extern void putchar_(char c);
@@ -28,19 +29,38 @@ static uint64_t sys_debug_write(struct thread *curr, uint64_t uptr,
   return len;
 }
 
-static uint64_t sys_vm_map(struct thread *curr, uint64_t len, uint64_t prot) {
-  if (len == 0 || len > (64ull << 20) || (prot & ~7ull) != 0 ||
-      !(prot & VM_PROT_READ)) {
-    return SYSERR_INVAL;
+// Translate user VM_PROT_* bits to paging flags. Callers validate the
+// bits first; prot 0 (vm_protect's guard view) maps to empty flags.
+static paging_flags_t vm_prot_to_flags(uint64_t prot) {
+  paging_flags_t flags = 0;
+  if (prot & VM_PROT_READ) {
+    flags |= PAGE_R;
   }
-  paging_flags_t flags = PAGE_R;
   if (prot & VM_PROT_WRITE) {
     flags |= PAGE_W;
   }
   if (prot & VM_PROT_EXEC) {
     flags |= PAGE_X;
   }
-  void *base = umem_alloc(curr->proc, len, flags);
+  return flags;
+}
+
+// prot must be within the known bits and, unless allow_none, include R.
+static bool vm_prot_ok(uint64_t prot, bool allow_none) {
+  if ((prot & ~7ull) != 0) {
+    return false;
+  }
+  if (prot == 0) {
+    return allow_none;
+  }
+  return (prot & VM_PROT_READ) != 0;
+}
+
+static uint64_t sys_vm_map(struct thread *curr, uint64_t len, uint64_t prot) {
+  if (len == 0 || len > (64ull << 20) || !vm_prot_ok(prot, false)) {
+    return SYSERR_INVAL;
+  }
+  void *base = umem_alloc(curr->proc, len, vm_prot_to_flags(prot));
   if (base == nullptr) {
     return SYSERR_NOMEM;
   }
@@ -50,6 +70,35 @@ static uint64_t sys_vm_map(struct thread *curr, uint64_t len, uint64_t prot) {
 static uint64_t sys_vm_unmap(struct thread *curr, uint64_t base,
                              uint64_t len) {
   if (umem_free(curr->proc, base, len) != 0) {
+    return SYSERR_PERM;
+  }
+  return 0;
+}
+
+static uint64_t sys_vm_protect(struct thread *curr, uint64_t base,
+                               uint64_t len, uint64_t prot) {
+  if (!vm_prot_ok(prot, true)) {
+    return SYSERR_INVAL;
+  }
+  if (umem_protect(curr->proc, base, len, vm_prot_to_flags(prot)) != 0) {
+    return SYSERR_PERM;
+  }
+  return 0;
+}
+
+static uint64_t sys_vm_share(struct thread *curr, uint64_t base, uint64_t pid,
+                             uint64_t prot) {
+  if (!vm_prot_ok(prot, false)) {
+    return SYSERR_INVAL;
+  }
+  if (umem_share(curr->proc, base, pid, vm_prot_to_flags(prot)) != 0) {
+    return SYSERR_PERM;
+  }
+  return 0;
+}
+
+static uint64_t sys_vm_unshare(struct thread *curr, uint64_t base) {
+  if (umem_unshare(curr->proc, base) != 0) {
     return SYSERR_PERM;
   }
   return 0;
@@ -65,7 +114,6 @@ void syscall_entry(struct trap_frame *tf) {
 
   uint64_t nr = tf->rax;
   uint64_t a0 = tf->rcx, a1 = tf->rdx, a2 = tf->r8, a3 = tf->r9;
-  (void)a2;
   (void)a3;
 
   switch (nr) {
@@ -87,6 +135,18 @@ void syscall_entry(struct trap_frame *tf) {
 
   case SYS_VM_UNMAP:
     tf->rax = sys_vm_unmap(curr, a0, a1);
+    return;
+
+  case SYS_VM_PROTECT:
+    tf->rax = sys_vm_protect(curr, a0, a1, a2);
+    return;
+
+  case SYS_VM_SHARE:
+    tf->rax = sys_vm_share(curr, a0, a1, a2);
+    return;
+
+  case SYS_VM_UNSHARE:
+    tf->rax = sys_vm_unshare(curr, a0);
     return;
 
   case SYS_EXIT:

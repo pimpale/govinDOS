@@ -36,7 +36,7 @@ extern void thread_bootstrap(void);
 //
 // IF is left 0 because the scheduler enters us with IRQs masked (depth=1
 // from the top-of-iteration irq_disable in scheduler_loop). The portable
-// thread_trampoline balances that with irq_enable before invoking user code.
+// thread_enter balances that with irq_enable before invoking user code.
 void arch_thread_init_kernel(struct thread *t,
                              void (*entry)(void *),
                              void *arg) {
@@ -141,4 +141,11 @@ void arch_thread_install(struct thread *t) {
       t->proc->as != cs->current_as) {
     as_switch(t->proc->as);
   }
+
+  // Load-bearing invariant (memory-design §3): kthread stacks are only
+  // ever touched while g_as_kernel is current — their guard pages exist
+  // in no other AS, so violating this silently disables overflow
+  // detection. We are about to switch onto this thread's stack.
+  asserts(t->proc->uid != 0 || cs->current_as == g_as_kernel,
+          "kthread dispatched on a non-kernel address space");
 }

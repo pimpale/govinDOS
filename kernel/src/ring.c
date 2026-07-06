@@ -10,18 +10,25 @@
 #include "syscall.h"
 #include "thread.h"
 #include "uaccess.h"
+#include "umem.h"
 
 // serial-backed character sink used by printf (stdio.c)
 extern void putchar_(char c);
 
-// Kernel-private ring state. The lock guards only the two sleeper slots;
-// the ring indices themselves are lock-free acquire/release.
+// Kernel-private ring state. The lock guards the two sleeper slots and
+// the dying handshake; the ring indices themselves are lock-free
+// acquire/release.
 struct ring {
   struct ring_shared *sh;
   struct process *proc;
   struct spinlock lock;
+  struct thread *worker;          // the worker kthread, for teardown
   struct thread *worker_sleeping; // worker parked waiting for SQEs
   struct thread *waiter;          // owning thread parked in ring_wait
+  // Set by ring_destroy. Checked by the worker at the top of its loop and
+  // again under the lock before sleeping, so a destroy can never slip
+  // between "queue is empty" and "park forever".
+  _Atomic bool dying;
 };
 
 static int64_t ring_execute(struct ring *r, const struct ring_sqe *sqe) {
@@ -80,14 +87,20 @@ static void ring_complete(struct ring *r, uint64_t user_data, int64_t result) {
 static void ring_worker(void *arg) {
   struct ring *r = arg;
   struct ring_shared *sh = r->sh;
-  while (true) {
+  while (!atomic_load_explicit(&r->dying, memory_order_acquire)) {
     uint32_t head = atomic_load_explicit(&sh->sq_head, memory_order_relaxed);
     if (head == atomic_load_explicit(&sh->sq_tail, memory_order_acquire)) {
       // Empty. Publish sleep intent and re-check under the lock so a
       // doorbell (ring_enter) between check and block can't be lost:
       // enter takes the same lock, so either it sees our slot, or we see
-      // its tail update.
+      // its tail update. Same protocol for dying: ring_destroy sets it
+      // before taking this lock, so either we see it here or it sees our
+      // sleep slot and wakes us.
       spinlock_lock(&r->lock);
+      if (atomic_load_explicit(&r->dying, memory_order_acquire)) {
+        spinlock_unlock(&r->lock);
+        break;
+      }
       if (head == atomic_load_explicit(&sh->sq_tail, memory_order_acquire)) {
         r->worker_sleeping = thread_current();
         spinlock_unlock(&r->lock);
@@ -104,6 +117,7 @@ static void ring_worker(void *arg) {
     int64_t result = ring_execute(r, &sqe);
     ring_complete(r, sqe.user_data, result);
   }
+  // Returning reaps this kthread via thread_enter -> thread_exit.
 }
 
 uint64_t ring_create(struct thread *curr) {
@@ -114,9 +128,12 @@ uint64_t ring_create(struct thread *curr) {
   if (r == nullptr) {
     return SYSERR_NOMEM;
   }
-  // The shared page is user memory (FRAME_USER-tagged, PAGE_U mapped).
-  // TODO: the owner could vm_unmap it out from under the worker; a
-  // FRAME_RING kind or a refcount would close that once it matters.
+  // The shared page is an ordinary ublock owned by the process (PAGE_U in
+  // its AS; plain kernel memory everywhere else, which is how the worker
+  // kthread reaches it from g_as_kernel).
+  // TODO: the owner could vm_unmap it out from under the worker; making
+  // the ring block owner-unfreeable (or refcounting it) would close that
+  // once it matters.
   struct ring_shared *sh =
       umem_alloc(curr->proc, sizeof(struct ring_shared), PAGE_R | PAGE_W);
   if (sh == nullptr) {
@@ -129,8 +146,33 @@ uint64_t ring_create(struct thread *curr) {
   r->proc = curr->proc;
   spinlock_init(&r->lock);
   curr->ring = r;
-  kthread_spawn(ring_worker, r);
+  r->worker = kthread_spawn(ring_worker, r);
   return (uint64_t)sh;
+}
+
+struct ring_shared *ring_shared_of(struct ring *r) { return r->sh; }
+
+void ring_destroy(struct ring *r) {
+  // Stop the worker before the shared page can be freed: it may be
+  // mid-execution (even blocked in a device) with live pointers into sh.
+  atomic_store_explicit(&r->dying, true, memory_order_release);
+  spinlock_lock(&r->lock);
+  struct thread *w = r->worker_sleeping;
+  r->worker_sleeping = nullptr;
+  spinlock_unlock(&r->lock);
+  if (w != nullptr) {
+    thread_unblock(w);
+  }
+  // Wait for the worker to finish any in-flight op and fully deschedule.
+  // A worker blocked in a device op is woken by that device eventually,
+  // completes the op, and exits at the loop top. Runs in the reaper, so
+  // yielding here is fine — and the worker's TCB can't be freed under us:
+  // the reaper (us) is the only thing that frees TCBs.
+  while (r->worker->status != THREAD_DEAD ||
+         atomic_load_explicit(&r->worker->on_cpu, memory_order_acquire)) {
+    yield();
+  }
+  free(r);
 }
 
 uint64_t ring_enter(struct thread *curr) {

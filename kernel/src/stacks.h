@@ -14,4 +14,11 @@ enum stack_type {
 
 void *stacks_alloc_kernel(enum stack_type purpose);
 
+// Release a stack returned by stacks_alloc_kernel, given its top. Restores
+// the guard page to the pristine kernel mapping (in g_as_kernel — the only
+// AS the guard was ever punched in; kthread stacks are touched exclusively
+// while g_as_kernel is current) before handing the block back to the buddy,
+// per the pristinity invariant.
+void stacks_free_kernel(void *stack_top, enum stack_type purpose);
+
 #endif // stacks_h_INCLUDED
