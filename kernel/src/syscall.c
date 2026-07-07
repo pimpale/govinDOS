@@ -2,11 +2,11 @@
 
 #include <stdint.h>
 
+#include "channel.h"
 #include "cpu_state.h"
 #include "debug.h"
-#include "dummydev.h"
-#include "ring.h"
-#include "session.h"
+#include "irq.h"
+#include "process.h"
 #include "thread.h"
 #include "trap_frame.h"
 #include "uaccess.h"
@@ -77,9 +77,16 @@ static uint64_t sys_vm_unmap(struct thread *curr, uint64_t base,
 }
 
 static uint64_t sys_vm_protect(struct thread *curr, uint64_t base,
-                               uint64_t len, uint64_t prot) {
+                               uint64_t len, uint64_t prot, uint64_t pid) {
   if (!vm_prot_ok(prot, true)) {
     return SYSERR_INVAL;
+  }
+  if (pid != 0 && pid != curr->proc->pid) {
+    // Parent applying view flags (W^X on a written image) to its own
+    // embryo — the one window where another process's views are yours
+    // to set.
+    return proc_sys_vm_protect_for(curr, base, len, vm_prot_to_flags(prot),
+                                   pid);
   }
   if (umem_protect(curr->proc, base, len, vm_prot_to_flags(prot)) != 0) {
     return SYSERR_PERM;
@@ -87,35 +94,39 @@ static uint64_t sys_vm_protect(struct thread *curr, uint64_t base,
   return 0;
 }
 
-static uint64_t sys_vm_share(struct thread *curr, uint64_t base, uint64_t pid,
-                             uint64_t prot) {
+static uint64_t sys_vm_share(struct thread *curr, uint64_t base,
+                             uint64_t target, uint64_t prot) {
+  // Signed target: a user pid maps the block into that process on the
+  // spot; a negative id turns the block into a kernel channel of that
+  // scheme (prot is meaningless there — the layout is kernel ABI).
+  if ((int64_t)target < 0) {
+    return channel_scheme_create(curr->proc, base, (int64_t)target);
+  }
   if (!vm_prot_ok(prot, false)) {
     return SYSERR_INVAL;
   }
-  if (umem_share(curr->proc, base, pid, vm_prot_to_flags(prot)) != 0) {
-    return SYSERR_PERM;
-  }
-  return 0;
+  return umem_share(curr->proc, base, target, vm_prot_to_flags(prot));
 }
 
-static uint64_t sys_vm_unshare(struct thread *curr, uint64_t base) {
-  if (umem_unshare(curr->proc, base) != 0) {
-    return SYSERR_PERM;
-  }
-  return 0;
+void syscall_entry_from_user(struct trap_frame *tf) {
+  irq_enter();
+  syscall_entry(tf);
+  irq_exit();
 }
 
 void syscall_entry(struct trap_frame *tf) {
   struct thread *curr = thread_current();
   asserts(curr != nullptr, "syscall: no current thread");
 
-  // Kernel threads have in-kernel APIs for all of this; the parking ops
-  // in particular assume a user thread whose state fits in a trap frame.
-  bool from_user = (tf->cs & 3) == 3;
+  // Death checkpoint: a killed thread dies at its next kernel entry.
+  // (Racy read; the authoritative re-check for parking paths is under
+  // the umem lock in channel_block_wait.)
+  if (curr->proc->state == PROC_DEAD) {
+    uthread_park_exit();
+  }
 
   uint64_t nr = tf->rax;
   uint64_t a0 = tf->rcx, a1 = tf->rdx, a2 = tf->r8, a3 = tf->r9;
-  (void)a3;
 
   switch (nr) {
   case SYS_DEBUG_WRITE:
@@ -139,7 +150,7 @@ void syscall_entry(struct trap_frame *tf) {
     return;
 
   case SYS_VM_PROTECT:
-    tf->rax = sys_vm_protect(curr, a0, a1, a2);
+    tf->rax = sys_vm_protect(curr, a0, a1, a2, a3);
     return;
 
   case SYS_VM_SHARE:
@@ -147,105 +158,51 @@ void syscall_entry(struct trap_frame *tf) {
     return;
 
   case SYS_VM_UNSHARE:
-    tf->rax = sys_vm_unshare(curr, a0);
+    tf->rax = umem_unshare(curr->proc, a0) == 0 ? 0 : SYSERR_PERM;
+    return;
+
+  case SYS_VM_MOVE:
+    tf->rax = proc_sys_vm_move(curr, a0, a1);
+    return;
+
+  case SYS_BLOCK_DOORBELL:
+    tf->rax = channel_block_doorbell(curr, a0);
+    return;
+
+  case SYS_BLOCK_WAIT:
+    // May park (frame saved first, success value 0 baked in — a waker
+    // that isn't plain success overwrites the saved rax) or return
+    // immediately through the live frame.
+    tf->rax = 0;
+    arch_uthread_save_frame(curr, tf);
+    tf->rax = channel_block_wait(curr, a0, a1);
+    return;
+
+  case SYS_PROC_CREATE:
+    tf->rax = proc_sys_create(curr);
+    return;
+
+  case SYS_THREAD_SPAWN:
+    tf->rax = proc_sys_thread_spawn(curr, a0, a1, a2, a3);
+    return;
+
+  case SYS_PROC_KILL:
+    tf->rax = proc_sys_kill(curr, a0);
+    return;
+
+  case SYS_PROC_REAP:
+    tf->rax = proc_sys_reap(curr, a0);
     return;
 
   case SYS_EXIT:
-    if (!from_user) {
-      tf->rax = SYSERR_PERM;
-      return;
-    }
     uthread_park_exit();
 
   case SYS_YIELD:
-    if (!from_user) {
-      tf->rax = SYSERR_PERM;
-      return;
-    }
     // The saved frame is what we resume from — bake the return value in
     // before capturing it.
     tf->rax = 0;
     arch_uthread_save_frame(curr, tf);
     uthread_park_yield();
-
-  case SYS_DUMMY_READ:
-    if (!from_user) {
-      tf->rax = SYSERR_PERM;
-      return;
-    }
-    // Result is delivered into the saved frame's rax by the device
-    // worker (thread_deliver_wait_result) before it unblocks us.
-    arch_uthread_save_frame(curr, tf);
-    dummydev_read_user(curr);
-
-  case SYS_RING_CREATE:
-    tf->rax = ring_create(curr);
-    return;
-
-  case SYS_RING_ENTER:
-    tf->rax = ring_enter(curr);
-    return;
-
-  case SYS_RING_WAIT:
-    if (!from_user) {
-      tf->rax = SYSERR_PERM;
-      return;
-    }
-    // May park (frame must be saved first, with the return value baked
-    // in) or return immediately through the live frame.
-    tf->rax = 0;
-    arch_uthread_save_frame(curr, tf);
-    tf->rax = ring_wait_user(curr, (uint32_t)a0);
-    return;
-
-  case SYS_SESSION_LISTEN:
-    if (!from_user) {
-      tf->rax = SYSERR_PERM;
-      return;
-    }
-    tf->rax = session_listen(curr, a0, a1);
-    return;
-
-  case SYS_SESSION_ACCEPT:
-    if (!from_user) {
-      tf->rax = SYSERR_PERM;
-      return;
-    }
-    // Blocks until a client connects. Frame saved first so the delivered
-    // base lands in rax on resume; returns immediately if a client is
-    // already pending.
-    tf->rax = 0;
-    arch_uthread_save_frame(curr, tf);
-    tf->rax = session_accept(curr);
-    return;
-
-  case SYS_SESSION_CONNECT:
-    if (!from_user) {
-      tf->rax = SYSERR_PERM;
-      return;
-    }
-    tf->rax = 0;
-    arch_uthread_save_frame(curr, tf);
-    tf->rax = session_connect(curr, a0);
-    return;
-
-  case SYS_SESSION_DOORBELL:
-    if (!from_user) {
-      tf->rax = SYSERR_PERM;
-      return;
-    }
-    tf->rax = session_doorbell(curr, a0);
-    return;
-
-  case SYS_SESSION_WAIT:
-    if (!from_user) {
-      tf->rax = SYSERR_PERM;
-      return;
-    }
-    tf->rax = 0;
-    arch_uthread_save_frame(curr, tf);
-    tf->rax = session_wait(curr, a0, (uint32_t)a1);
-    return;
 
   default:
     tf->rax = SYSERR_NOSYS;

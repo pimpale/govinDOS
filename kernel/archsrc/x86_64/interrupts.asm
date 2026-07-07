@@ -3,8 +3,10 @@ default rel
 
 [SECTION .text]
 [EXTERN interrupt_handler]
+[EXTERN syscall_entry_from_user]
 [GLOBAL interrupts_fill_idt]
 [GLOBAL interrupts_load_idt]
+[GLOBAL syscall_entry_stub]
 
 ; ----- ISR stubs -------------------------------------------------------------
 ;
@@ -84,6 +86,85 @@ interrupts_load_idt:
         ret
 .end:
 
+; ----- SYSCALL entry ----------------------------------------------------------
+;
+; IA32_LSTAR points here (cpu_setup.c). On entry from ring 3:
+;   rcx = user rip, r11 = user rflags (both saved by the CPU),
+;   rsp = still the USER stack, IF cleared by IA32_FMASK.
+; SYSCALL does not switch stacks, so the stub does: IA32_KERNEL_GS_BASE
+; holds this CPU's syscall_anchor (cpu_state.h) — gs:[0] scratch slot,
+; gs:[8] kernel RSP0 top (the same per-CPU stack interrupt entries use;
+; safe because IRQs stay masked for the whole syscall).
+;
+; The stub forges the exact stack image _isr_handler builds — a struct
+; trap_frame — so syscall_entry, frame-save parking, and the iretq resume
+; path are shared with the interrupt path verbatim. Two ABI quirks vs the
+; old int-gate path, both architectural to SYSCALL:
+;   - the first argument arrives in r10 and is stored into the frame's
+;     rcx slot (SYSCALL clobbered rcx with the return rip);
+;   - user rcx/r11 are not preserved (they return as rip/rflags).
+;
+; User CS/SS are not read from anywhere: SYSCALL only enters from ring 3
+; flat segments, so the frame gets the constants (0x2B/0x23, gdt.h).
+syscall_entry_stub:
+        swapgs
+        mov  [gs:0], rsp      ; stash user rsp
+        mov  rsp, [gs:8]      ; switch to this CPU's kernel stack
+        push qword 0x23       ; ss  = GDT_SEL_USER_DS
+        push qword [gs:0]     ; rsp (user)
+        swapgs                ; gs done — restore user gs base
+        push r11              ; rflags (CPU saved it here)
+        push qword 0x2B       ; cs  = GDT_SEL_USER_CS64
+        push rcx              ; rip (CPU saved it here)
+        push qword 0          ; error code slot (keeps trap_frame shape)
+        push rdx
+        push r8
+        push r9
+        push r15
+        push r14
+        push r13
+        push r12
+        push r11
+        push r10
+        push rdi
+        push rsi
+        push rbp
+        push r10              ; rcx slot <- r10: arg0 travels in r10
+        push rbx
+        push rax
+
+        mov  rcx, rsp         ; 1st arg: pointer to trap frame
+        mov  rbx, rsp         ; callee-saved stash (user rbx is in the frame)
+        and  rsp, -16
+        sub  rsp, 32          ; MS x64 shadow space
+        call syscall_entry_from_user
+        mov  rsp, rbx
+
+        ; Restore user state from the frame (the handler may have written
+        ; results into it) and return via SYSRET.
+        pop  rax
+        pop  rbx
+        add  rsp, 8           ; rcx slot: rcx is about to be the return rip
+        pop  rbp
+        pop  rsi
+        pop  rdi
+        pop  r10
+        add  rsp, 8           ; r11 slot: r11 is about to be rflags
+        pop  r12
+        pop  r13
+        pop  r14
+        pop  r15
+        pop  r9
+        pop  r8
+        pop  rdx
+        add  rsp, 8           ; error code
+        pop  rcx              ; rip
+        add  rsp, 8           ; cs (SYSRET loads it from IA32_STAR)
+        pop  r11              ; rflags
+        pop  rsp              ; user rsp — kernel stack abandoned (reused
+                              ; fresh by the next entry, like a parked exit)
+        o64 sysret
+
 ; ----- Common backend --------------------------------------------------------
 
 _isr_handler:
@@ -152,11 +233,8 @@ idt:
 %else
         db 0          ; no IST
 %endif
-%if i = 80h
-        db 11101110b  ; attributes (usermode)
-%else
-        db 10001110b  ; attributes (kernelmode)
-%endif
+        db 10001110b  ; attributes (kernelmode; syscalls enter via SYSCALL,
+                      ; so a user `int NN` on any vector just #GPs)
         dw 0xbeef     ; isr 16..31
         dd 0xcafebabe ; isr 32..63
         dd 0          ; reserved

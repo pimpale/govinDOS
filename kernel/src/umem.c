@@ -4,11 +4,13 @@
 
 #include "allocator.h"
 #include "buddy_allocator/buddy_allocator.h"
+#include "channel.h"
 #include "debug.h"
 #include "irq.h"
 #include "spinlock.h"
 #include "stdlib/stdlib.h"
 #include "stdlib/string.h"
+#include "syscall.h"
 
 // ---------------------------------------------------------------------------
 // The umem lock
@@ -36,7 +38,7 @@ static inline void umem_relax(void) {
 #endif
 }
 
-static void umem_lock(void) {
+void umem_lock(void) {
   irq_disable();
   while (atomic_exchange_explicit(&g_umem_lock, true, memory_order_acquire)) {
     paging_service_shootdown();
@@ -44,7 +46,7 @@ static void umem_lock(void) {
   }
 }
 
-static void umem_unlock(void) {
+void umem_unlock(void) {
   atomic_store_explicit(&g_umem_lock, false, memory_order_release);
   irq_enable();
 }
@@ -156,6 +158,42 @@ static void remove_proc(vec_process_ptr *v, const struct process *p) {
   asserts(false, "umem: process missing from list");
 }
 
+// Index of the edge sharing to `p`, or -1.
+static int32_t find_edge(vec_share_edge *v, const struct process *p) {
+  for (uint32_t i = 0; i < vec_share_edge_len(v); i++) {
+    share_edge e;
+    vec_share_edge_get(v, i, &e);
+    if (e.to == p) {
+      return (int32_t)i;
+    }
+  }
+  return -1;
+}
+
+static void remove_edge(vec_share_edge *v, const struct process *p) {
+  int32_t i = find_edge(v, p);
+  asserts(i >= 0, "umem: share edge missing");
+  vec_share_edge_swap_and_pop(v, (uint32_t)i);
+}
+
+ublock *umem_owned_locked(struct process *p, uint64_t base) {
+  int32_t i = find_block(p->blocks, base);
+  if (i < 0) {
+    return nullptr;
+  }
+  ublock *b;
+  vec_ublock_ptr_get(p->blocks, (uint32_t)i, &b);
+  return b;
+}
+
+ublock *umem_view_locked(struct process *p, uint64_t addr, uint64_t len) {
+  ublock *b = find_containing(p->blocks, addr, len);
+  if (b == nullptr) {
+    b = find_containing(p->shared_in, addr, len);
+  }
+  return b;
+}
+
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
@@ -212,12 +250,12 @@ void *umem_alloc(struct process *p, size_t len, paging_flags_t prot) {
   // Mandatory: blocks recycle across processes and users.
   memset(base, 0, bytes);
 
-  ublock *b = malloc(sizeof(*b));
+  ublock *b = calloc(1, sizeof(*b));
   asserts(b != nullptr, "umem: ublock alloc failed");
   b->base = (uint64_t)base;
   b->order = order;
   b->owner = p;
-  vec_process_ptr_new(&b->sharers);
+  vec_share_edge_new(&b->sharers);
 
   // The block is invisible to free/protect until pushed, so the flag can
   // happen outside the lock; flush before the base escapes to the caller.
@@ -232,21 +270,22 @@ void *umem_alloc(struct process *p, size_t len, paging_flags_t prot) {
 
 // Restore every view of `b` to pristine and flush, drop it from all
 // sharer lists, and hand it back to the buddy. Caller holds the umem
-// lock and has already unlinked b from its owner's list. When
-// `skip_owner_as` (owner is exiting), the owner's AS is drained and
-// about to be freed — flagging it would be wasted work.
-static void block_release_locked(ublock *b, bool skip_owner_as) {
+// lock and has already unlinked b from its owner's list.
+static void block_release_locked(ublock *b) {
+  // Single teardown authority: parked peers wake SYSERR_DEAD exactly
+  // where the views are torn out, and a kchan endpoint dies with its
+  // block — error-on-park and fault-on-touch can never disagree.
+  channel_block_torn(b, true);
+
   uint64_t end = b->base + ublock_bytes(b);
-  if (!skip_owner_as) {
-    as_flag(b->owner->as, b->base, end, PAGE_KERNEL_PRISTINE);
-    as_flush(b->owner->as);
-  }
-  for (uint32_t i = 0; i < vec_process_ptr_len(b->sharers); i++) {
-    struct process *s;
-    vec_process_ptr_get(b->sharers, i, &s);
-    as_flag(s->as, b->base, end, PAGE_KERNEL_PRISTINE);
-    as_flush(s->as);
-    remove_block(s->shared_in, b);
+  as_flag(b->owner->as, b->base, end, PAGE_KERNEL_PRISTINE);
+  as_flush(b->owner->as);
+  for (uint32_t i = 0; i < vec_share_edge_len(b->sharers); i++) {
+    share_edge e;
+    vec_share_edge_get(b->sharers, i, &e);
+    as_flag(e.to->as, b->base, end, PAGE_KERNEL_PRISTINE);
+    as_flush(e.to->as);
+    remove_block(e.to->shared_in, b);
   }
   account_uncharge(b->owner->uid, ublock_bytes(b));
 
@@ -256,7 +295,7 @@ static void block_release_locked(ublock *b, bool skip_owner_as) {
   spinlock_unlock(&g_allocator_lock);
   asserts(s == BUDDY_STATUS_SUCCESS, "umem: buddy rejected block free");
 
-  vec_process_ptr_delete(&b->sharers);
+  vec_share_edge_delete(&b->sharers);
   free(b);
 }
 
@@ -281,7 +320,7 @@ int umem_free(struct process *p, uint64_t base, size_t len) {
     }
   }
   vec_ublock_ptr_swap_and_pop(p->blocks, (uint32_t)i);
-  block_release_locked(b, false);
+  block_release_locked(b);
   umem_unlock();
   return 0;
 }
@@ -290,8 +329,8 @@ int umem_free(struct process *p, uint64_t base, size_t len) {
 // Per-view flags / sharing
 // ---------------------------------------------------------------------------
 
-int umem_protect(struct process *p, uint64_t base, size_t len,
-                 paging_flags_t prot) {
+int umem_protect_locked(struct process *p, uint64_t base, size_t len,
+                        paging_flags_t prot) {
   if (base % PAGE_SIZE != 0 || len == 0 || len % PAGE_SIZE != 0) {
     return -1;
   }
@@ -299,40 +338,52 @@ int umem_protect(struct process *p, uint64_t base, size_t len,
   if (__builtin_add_overflow(base, (uint64_t)len, &end)) {
     return -1;
   }
-  umem_lock();
-  ublock *b = find_containing(p->blocks, base, len);
+  ublock *b = umem_view_locked(p, base, len);
   if (b == nullptr) {
-    b = find_containing(p->shared_in, base, len);
-  }
-  if (b == nullptr) {
-    umem_unlock();
     return -1;
   }
   as_flag(p->as, base, end, prot == 0 ? 0 : (prot | PAGE_U));
   as_flush(p->as);
-  umem_unlock();
   return 0;
 }
 
-int umem_share(struct process *p, uint64_t base, uint64_t target_pid,
-               paging_flags_t prot) {
+int umem_protect(struct process *p, uint64_t base, size_t len,
+                 paging_flags_t prot) {
   umem_lock();
-  int32_t i = find_block(p->blocks, base);
+  int rc = umem_protect_locked(p, base, len, prot);
+  umem_unlock();
+  return rc;
+}
+
+uint64_t umem_share(struct process *p, uint64_t base, uint64_t target_pid,
+                    paging_flags_t prot) {
+  umem_lock();
+  ublock *b = umem_owned_locked(p, base);
   struct process *target = proc_lookup(target_pid);
-  if (i < 0 || target == nullptr || target == p) {
+  if (b == nullptr || target == nullptr || target == p || b->kch != nullptr) {
     umem_unlock();
-    return -1;
+    return SYSERR_INVAL;
   }
-  ublock *b;
-  vec_ublock_ptr_get(p->blocks, (uint32_t)i, &b);
-  if (find_block(target->shared_in, base) >= 0) {
+  if (find_edge(b->sharers, target) >= 0) {
     umem_unlock();
-    return -1; // already shared to this process
+    return SYSERR_EXIST;
   }
-  vec_process_ptr_push(b->sharers, &target);
+  // Going from one sharer to several breaks any channel identity parked
+  // waiters relied on (data-plane calls need exactly one sharer): wake
+  // them out with SYSERR_DEAD rather than strand them.
+  if (vec_share_edge_len(b->sharers) == 1) {
+    channel_block_torn(b, false);
+  }
+  share_edge e = {.to = target, .notified = false};
+  vec_share_edge_push(b->sharers, &e);
   vec_ublock_ptr_push(target->shared_in, &b);
   as_flag(target->as, b->base, b->base + ublock_bytes(b), prot | PAGE_U);
   as_flush(target->as);
+
+  // Announce on the target's shares channel (or leave the edge's notified
+  // bit clear for replay when the channel exists / has room).
+  channel_edge_notify(
+      b, vec_share_edge_at(b->sharers, vec_share_edge_len(b->sharers) - 1));
   umem_unlock();
   return 0;
 }
@@ -347,7 +398,10 @@ int umem_unshare(struct process *p, uint64_t base) {
   ublock *b;
   vec_ublock_ptr_get(p->shared_in, (uint32_t)i, &b);
   vec_ublock_ptr_swap_and_pop(p->shared_in, (uint32_t)i);
-  remove_proc(b->sharers, p);
+  remove_edge(b->sharers, p);
+  // The channel (if the peers treated it as one) is gone: wake parked
+  // peers with SYSERR_DEAD. The block itself lives on with its owner.
+  channel_block_torn(b, false);
   as_flag(p->as, b->base, b->base + ublock_bytes(b), PAGE_KERNEL_PRISTINE);
   as_flush(p->as);
   umem_unlock();
@@ -355,33 +409,98 @@ int umem_unshare(struct process *p, uint64_t base) {
 }
 
 // ---------------------------------------------------------------------------
-// Process exit
+// Reap-step primitives (process.c drives these, one bounded step per
+// SYS_PROC_REAP call — destruction mirrors construction)
 // ---------------------------------------------------------------------------
 
-void umem_destroy_process(struct process *p) {
-  umem_lock();
-
-  // Drop shared-in memberships. No flag/flush of p->as: it is drained
-  // (no CPU has it current) and about to be as_free'd.
-  while (vec_ublock_ptr_len(p->shared_in) > 0) {
-    ublock *b;
-    vec_ublock_ptr_get(p->shared_in, 0, &b);
-    vec_ublock_ptr_swap_and_pop(p->shared_in, 0);
-    remove_proc(b->sharers, p);
+bool umem_reap_one_block_locked(struct process *p) {
+  if (vec_ublock_ptr_len(p->blocks) == 0) {
+    return false;
   }
+  ublock *b;
+  vec_ublock_ptr_get(p->blocks, 0, &b);
+  vec_ublock_ptr_swap_and_pop(p->blocks, 0);
+  // The zombie's own AS is restored too (block_release_locked): it still
+  // exists until the reap's as_free step, and a killed-but-still-running
+  // thread of the zombie could be touching it right now — pristinity
+  // must hold before the block recycles.
+  block_release_locked(b);
+  return true;
+}
 
-  // Owner death revokes: every sharer's view is torn down and the blocks
-  // go back to the buddy.
-  while (vec_ublock_ptr_len(p->blocks) > 0) {
-    ublock *b;
-    vec_ublock_ptr_get(p->blocks, 0, &b);
-    vec_ublock_ptr_swap_and_pop(p->blocks, 0);
-    block_release_locked(b, true);
+bool umem_reap_one_view_locked(struct process *p) {
+  if (vec_ublock_ptr_len(p->shared_in) == 0) {
+    return false;
   }
+  ublock *b;
+  vec_ublock_ptr_get(p->shared_in, 0, &b);
+  vec_ublock_ptr_swap_and_pop(p->shared_in, 0);
+  remove_edge(b->sharers, p);
+  // The owner's side of the channel wakes SYSERR_DEAD — it was parked
+  // for a doorbell that will never come.
+  channel_block_torn(b, false);
+  as_flag(p->as, b->base, b->base + ublock_bytes(b), PAGE_KERNEL_PRISTINE);
+  as_flush(p->as);
+  return true;
+}
 
-  remove_proc(g_procs, p);
-  umem_unlock();
-
+void umem_reap_finish_locked(struct process *p) {
+  asserts(vec_ublock_ptr_len(p->blocks) == 0 &&
+              vec_ublock_ptr_len(p->shared_in) == 0,
+          "umem: reap finish with resources left");
   vec_ublock_ptr_delete(&p->blocks);
   vec_ublock_ptr_delete(&p->shared_in);
+}
+
+// ---------------------------------------------------------------------------
+// Ownership transfer (SYS_VM_MOVE; tree checks live in process.c)
+// ---------------------------------------------------------------------------
+
+uint64_t umem_move_locked(ublock *b, struct process *from, struct process *to,
+                          bool src_as_live) {
+  uint64_t bytes = ublock_bytes(b);
+  if (from->uid != to->uid) {
+    // Charge follows the owner: reserve the new charge before releasing
+    // the old so a failure leaves everything untouched.
+    if (!account_charge(to->uid, bytes)) {
+      return SYSERR_NOMEM;
+    }
+    account_uncharge(from->uid, bytes);
+  }
+
+  // Ownership is channel identity: whoever was parked on this block was
+  // waiting on a peer that no longer exists.
+  channel_block_torn(b, false);
+
+  // If the receiver already had a shared-in view, the owner view below
+  // replaces it (and its edge).
+  int32_t si = find_block(to->shared_in, b->base);
+  if (si >= 0) {
+    vec_ublock_ptr_swap_and_pop(to->shared_in, (uint32_t)si);
+    remove_edge(b->sharers, to);
+  }
+
+  remove_block(from->blocks, b);
+  vec_ublock_ptr_push(to->blocks, &b);
+  b->owner = to;
+
+  if (src_as_live) {
+    as_flag(from->as, b->base, b->base + bytes, PAGE_KERNEL_PRISTINE);
+    as_flush(from->as);
+  }
+  as_flag(to->as, b->base, b->base + bytes, PAGE_R | PAGE_W | PAGE_U);
+  as_flush(to->as);
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Registry maintenance (process.c, under the umem lock)
+// ---------------------------------------------------------------------------
+
+struct process *umem_proc_lookup_locked(uint64_t pid) {
+  return proc_lookup(pid);
+}
+
+void umem_proc_unregister_locked(struct process *p) {
+  remove_proc(g_procs, p);
 }

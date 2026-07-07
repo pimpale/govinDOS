@@ -5,7 +5,6 @@
 
 #define KERNEL_INTERRUPT_STACK_SIZE (16 * 1024)
 #define KERNEL_BOOTSTRAP_STACK_SIZE (1024 * 1024)
-#define KERNEL_TASK_STACK_SIZE (1024 * 1024)
 
 static size_t stack_size_for(enum stack_type purpose) {
   switch (purpose) {
@@ -13,8 +12,6 @@ static size_t stack_size_for(enum stack_type purpose) {
     return KERNEL_INTERRUPT_STACK_SIZE;
   case STACK_TYPE_KERNEL_BOOTSTRAP:
     return KERNEL_BOOTSTRAP_STACK_SIZE;
-  case STACK_TYPE_KERNEL_TASK:
-    return KERNEL_TASK_STACK_SIZE;
   default:
     fatal("unrecognized stack type");
   }
@@ -31,30 +28,15 @@ void *stacks_alloc_kernel(enum stack_type purpose) {
   uint8_t *base = calloc(1, total_size);
   asserts(base != nullptr, "failed to allocate kernel stack");
 
-  // Guard punches go to g_as_kernel only. Per-CPU (interrupt/bootstrap)
-  // stacks are allocated before g_as_template is sealed, so their guards
-  // land in every later clone; task stacks are only ever touched while
-  // g_as_kernel is current (scheduler CR3 policy), so theirs need not.
+  // Guard punch in g_as_kernel. All of these stacks are allocated during
+  // bring-up, before the first user AS is cloned, so the guards are part
+  // of the boot-static skeleton every clone inherits — and they are
+  // never freed, so g_as_kernel stays boot-static afterwards (which is
+  // what lets user ASes clone the live kernel tree safely).
   as_flag(g_as_kernel, (uint64_t)(uintptr_t)base,
           (uint64_t)(uintptr_t)(base + PAGE_SIZE), 0);
 
   as_flush(g_as_kernel);
 
   return base + total_size;
-}
-
-void stacks_free_kernel(void *stack_top, enum stack_type purpose) {
-  asserts(g_as_template == nullptr || purpose == STACK_TYPE_KERNEL_TASK,
-          "stacks: per-CPU stacks are never freed post-seal");
-  size_t total_size = stack_size_for(purpose);
-  uint8_t *base = (uint8_t *)stack_top - total_size;
-
-  // Pristinity invariant: restore the guard page to the boot mapping and
-  // flush before the buddy can recycle the block. The merge pass folds the
-  // fragmented tables back into the surrounding hugepage.
-  as_flag(g_as_kernel, (uint64_t)(uintptr_t)base,
-          (uint64_t)(uintptr_t)(base + PAGE_SIZE), PAGE_KERNEL_PRISTINE);
-  as_flush(g_as_kernel);
-
-  free(base);
 }

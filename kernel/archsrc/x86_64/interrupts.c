@@ -10,7 +10,6 @@
 #include "panic.h"
 #include "scheduler.h"
 #include "stdlib/stdio.h"
-#include "syscall.h"
 #include "thread.h"
 #include "trap_frame.h"
 
@@ -19,7 +18,6 @@
 #define INT_GENERAL_PROTECTION 0x0D
 #define INT_PAGE_FAULT 0x0E
 #define INT_MACHINE_CHECK 0x12
-#define INT_SYSCALL 0x80
 
 static inline uint64_t read_cr2(void) {
   uint64_t v;
@@ -73,6 +71,20 @@ static const char *exception_name(uint64_t vector) {
 // contents, but the pointer signature makes the aliasing explicit — writes
 // through `tf` (e.g. the syscall result into tf->rax) land in the actual
 // on-stack frame that the asm restore path pops.
+// Death checkpoint on the way back to ring 3: an interrupt is a killed
+// thread's "next kernel entry". The trap frame was pushed by the ISR
+// stub on the per-CPU stack; save it into the TCB (it is the thread's
+// complete state) and let the dispatch cull free the TCB.
+static void cull_if_killed(struct trap_frame *tf) {
+  if ((tf->cs & 3) != 3) {
+    return;
+  }
+  struct thread *curr = thread_current();
+  if (curr != nullptr && curr->proc->state == PROC_DEAD) {
+    uthread_park_exit(); // never returns
+  }
+}
+
 uint64_t interrupt_handler(struct trap_frame *tf, uint64_t vector,
                            uint64_t error, uint64_t rip) {
   // Bump the per-CPU IRQ depth without touching IF (hardware already
@@ -83,19 +95,14 @@ uint64_t interrupt_handler(struct trap_frame *tf, uint64_t vector,
   switch (vector) {
   case VECTOR_TLB_SHOOTDOWN:
     paging_handle_tlb_shootdown();
+    cull_if_killed(tf);
     irq_exit();
     return 0;
   case VECTOR_RESCHED:
     // Wake-up only. The HLT'd scheduler loop resumes after the IRET,
     // sees the new queue entry on its next iteration, and dispatches it.
     x86_lapic_eoi();
-    irq_exit();
-    return 0;
-  case INT_SYSCALL:
-    // May not return: ops that park the calling user thread abandon this
-    // stack and jump to the scheduler loop, taking the depth-1 with them
-    // (the scheduler's post-switch irq_enable consumes it).
-    syscall_entry(tf);
+    cull_if_killed(tf);
     irq_exit();
     return 0;
   default:
@@ -113,7 +120,7 @@ uint64_t interrupt_handler(struct trap_frame *tf, uint64_t vector,
     struct thread *curr = thread_current();
     printf("user %s: killing pid=%llu tid=%llu rip=%016llX cr2=%016llX\n",
            exception_name(vector), curr->proc->pid, curr->tid, rip, cr2);
-    uthread_park_exit(); // never returns; reaper handles teardown
+    uthread_park_exit(); // never returns; the scheduler loop reaps the TCB
   }
 
   const char *what = exception_name(vector);

@@ -40,6 +40,10 @@ void VEC_FN(_pop)(VEC_T *vec, VEC_DTYPE *dest);
 
 void VEC_FN(_get)(const VEC_T *vec, uint32_t i, VEC_DTYPE *dest);
 
+// Pointer to element i, for in-place mutation. Invalidated by any push
+// (growth may realloc) — do not hold across mutating calls.
+VEC_DTYPE *VEC_FN(_at)(VEC_T *vec, uint32_t i);
+
 // swaps i with the last element and then pops, deleting the data
 void VEC_FN(_swap_and_pop)(VEC_T *vec, uint32_t i);
 

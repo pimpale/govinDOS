@@ -1,10 +1,20 @@
 # IPC & process design: channels, kernel schemes, fault reflection, threads, process trees
 
-Status: **designed 2026-07-07, not yet implemented.** Companion to
-[memory-design.md](memory-design.md) (implemented); builds directly on its
-ublock/revoke/pristinity model. Where this document contradicts details of
-that one (notably the reaper kthread in its §7 and the eager teardown
-walks in its §6), this one is the plan.
+Status: **implemented 2026-07-07** — §§1, 2, 4, 5 all landed (channels +
+schemes -1/-2/-3, process trees, zombies + reap, kernel-thread deletion,
+`g_as_template` collapse); **§3 fault reflection remains unimplemented**
+(its own session, as planned). §7 records where the implementation
+deliberately diverges. Companion to [memory-design.md](memory-design.md);
+builds directly on its ublock/revoke/pristinity model. Where this
+document contradicts details of that one (notably the reaper kthread in
+its §7 and the eager teardown walks in its §6), this one is what's
+implemented — the reaper kthread is gone.
+
+Implementation map: `channel.c/h` (channels, kernel ring ABI, schemes,
+waiter slots, wait-groups), `process.c/h` (tree, embryo, kill, zombies,
+reap steps), `umem.c/h` (share edges, revoke authority, VM_MOVE
+mechanics, live-pid index), `syscall.c/h` (dispatch; SYSCALL/SYSRET),
+`userspace/hello.c` (init + the ring-3 test suite for all of it).
 
 ## 0. Decisions log
 
@@ -585,3 +595,76 @@ Steps 1–3 are order-independent among themselves; step 4 needs 2 (the
 reap model replaces the reaper kthread) and unlocks the template
 collapse; step 5 is pure addition on hooks steps 1 and 2 leave in
 place.
+
+In practice steps 2 and 4 were one changeset: the reaper is itself a
+kthread, and kill must enumerate every park site, so the legacy
+rings/dummydev (and their kthreads) had to go with it.
+
+## 7. Implementation notes and deliberate divergences (2026-07-07)
+
+- **SYSCALL/SYSRET replaced `int 0x80`** (requested during
+  implementation). User ABI: rax = nr, args in **r10**, rdx, r8, r9;
+  rcx/r11 are architecturally clobbered (return rip/rflags). The entry
+  stub (interrupts.asm) forges the same `struct trap_frame` the ISR path
+  builds and stores r10 into its rcx slot, so the dispatcher and the
+  frame-save park/resume machinery are shared verbatim. Kernel stack
+  reached via swapgs + `cpu_state.syscall_anchor`; vector 0x80's gate is
+  DPL 0 now (a user `int NN` just #GPs and kills the thread).
+- **The kernel ring header has a fourth index: user-owned `cq_head`**
+  (CQEs consumed). §2's header listed only cq_count/sq_head/sq_tail, but
+  CQ-full accounting and level-state replay need the kernel to know what
+  the user has consumed; the doorbell doubles as the consumption ack for
+  every scheme. Concrete ABI (channel.h): 64-byte header, 32-byte
+  SQE/CQE, `nslots = 32 << order` each, SQ at 64, CQ after it. Every SQE
+  completes with a CQE echoing `{op, a, b}` + status; event types have
+  bit 63 set.
+- **Reap step 3 frees the whole AS in one call**, not K page-table nodes
+  per call — as_free isn't incremental yet. Bounded by the AS's table
+  count, which sharer/owner teardown in earlier steps has already pruned.
+  Revisit if page trees ever get big enough to matter.
+- **Reap also gates on culled TCBs** (`nthreads == 0`, SYSERR_AGAIN
+  otherwise): killed threads die at their next kernel entry or at
+  dispatch (the scheduler culls dead-process threads before installing
+  them), and the process struct must outlive every TCB.
+- **All death cascades.** The doc said kill is recursive; the
+  implementation treats natural death (last thread exits) identically —
+  descendants never outlive their ancestor, embryos included. Unifying
+  the two keeps "the dead subtree is closed" unconditional, which the
+  post-order reap cursor relies on.
+- **VM_MOVE**: the receiver's view arrives R|W (parent applies W^X via
+  VM_PROTECT-with-pid afterwards); kernel-channel blocks refuse to move
+  (a scheme endpoint is owner-bound identity); sharer edges survive the
+  move; a receiver's pre-existing shared-in view is subsumed. Any move
+  wakes parked waiters SYSERR_DEAD — ownership is channel identity.
+- **Sharing a single-sharer block to a second pid** also wakes parked
+  waiters SYSERR_DEAD (the channel identity those waiters relied on is
+  gone; data-plane calls need exactly one sharer).
+- **Sharer-charged bookkeeping is not wired**: uid accounts still charge
+  block bytes to the owner only (limits default to unlimited), so §1's
+  SYSERR_NOMEM-on-share is currently unreachable. The quota section (§0)
+  remains open anyway.
+- **Wait-groups**: the two dedup bits are implemented as
+  `pending`/`armed` plus the CQ index of the outstanding KEV_READY
+  (consumption is FIFO, so `index < cq_head` retires it on the next
+  ack). KEV_DEAD is level state too — a dead registration lingers on the
+  group until its event posts. Destroying a *group* silently detaches
+  its registrations (the listener itself is gone; the sides become
+  parkable again). `ADD` enforces `2·(nregs+1) <= nslots`; command
+  completions share the CQ with events, so a submitter who keeps the SQ
+  saturated can still delay (never lose) event delivery.
+- **SYS_THREAD_SPAWN carries an `arg`** (4th syscall argument) delivered
+  in the child thread's first argument register — how init hands a
+  child its bootstrap-channel address without any other channel yet.
+- **init**: loaded by the kernel from the embedded PE blob (pe.c's one
+  remaining caller); its death is a kernel panic. hello.c is init and
+  the whole ring-3 test suite: it builds children per §5 (embryo, move,
+  share-image-RX — SASOS makes the entry pointer valid cross-AS —
+  pre-seeded bootstrap channel, spawn) and exercises channels, revoke
+  wakes, kill, tree events, reap, and wait-group multiplexing.
+- **Live-pid index** is the linear registry vec from umem.c (processes
+  are few; binary search when it hurts). Sharer entries and shared_in
+  still hold `struct process *` / `ublock *` pointers rather than
+  `(pid, base)` pairs — safe today because zombies keep their structs
+  until reaped and every edge is unlinked by then; the doc's healed-lazy
+  pair scheme becomes necessary only if anything ever caches references
+  across the reap boundary.

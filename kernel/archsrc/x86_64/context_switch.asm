@@ -2,9 +2,7 @@
 default rel
 
 [GLOBAL switch_context]
-[GLOBAL thread_bootstrap]
 [GLOBAL uthread_resume]
-[EXTERN thread_enter]
 [EXTERN uthread_resume_prepare]
 
 [SECTION .text]
@@ -40,34 +38,11 @@ switch_context:
     pop     r14
     pop     r13
     pop     r12
-    pop     rsi                  ; bootstrap-frame payload: arg
-    pop     rdi                  ; bootstrap-frame payload: entry
+    pop     rsi
+    pop     rdi                  ; resume-frame payload: struct thread * (uthread_resume)
     pop     rbx
     pop     rbp
     ret
-
-; ----------------------------------------------------------------------------
-; thread_bootstrap: ret target of a forged stack frame for a fresh thread.
-;
-; arch_thread_init_kernel sets up the stack so the switch_context restore
-; lands here with:
-;     rdi = entry function pointer
-;     rsi = arg
-;
-; This shim translates Sys-V style argument regs into Win64 (rcx, rdx),
-; allocates the 32-byte shadow space + an 8-byte slot for 16-byte SP
-; alignment at call entry, then tail-calls thread_enter. The
-; trampoline never returns (it calls thread_exit), so the halt loop is
-; just defensive.
-; ----------------------------------------------------------------------------
-thread_bootstrap:
-    mov     rcx, rdi             ; entry
-    mov     rdx, rsi             ; arg
-    sub     rsp, 40              ; 32 shadow + 8 align (call adds 8 -> 16-aligned in callee)
-    call    thread_enter
-.spin:
-    hlt
-    jmp     .spin
 
 ; ----------------------------------------------------------------------------
 ; uthread_resume: ret target of the forged frame in arch_thread.resume_stack.
@@ -86,7 +61,7 @@ thread_bootstrap:
 ; ----------------------------------------------------------------------------
 uthread_resume:
     mov     rcx, rdi             ; arg0 = struct thread *
-    sub     rsp, 40              ; shadow space + alignment, as thread_bootstrap
+    sub     rsp, 40              ; 32 shadow + 8 align (call adds 8 -> 16-aligned in callee)
     call    uthread_resume_prepare
     mov     rsp, rax             ; rsp = &t->arch.uframe
 

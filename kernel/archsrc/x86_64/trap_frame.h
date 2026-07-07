@@ -57,11 +57,12 @@ static_assert(sizeof(struct trap_frame) == 21 * 8,
 // paths; `struct thread` stays opaque here.
 // ---------------------------------------------------------------------------
 
-// Initialize a fresh user thread: zeroed GPRs, rip/rsp at the given user
-// entry/stack, user CS/SS, IF set. Also forges the TCB-resident resume
-// frame so the scheduler's switch_context lands in uthread_resume.
+// Initialize a fresh user thread: zeroed GPRs except `arg` in the first
+// argument register, rip/rsp at the given user entry/stack, user CS/SS,
+// IF set. Also forges the TCB-resident resume frame so the scheduler's
+// switch_context lands in uthread_resume.
 void arch_thread_init_user(struct thread *t, uint64_t entry,
-                           uint64_t user_stack_top);
+                           uint64_t user_stack_top, uint64_t arg);
 
 // Copy the live trap frame (on the per-CPU interrupt stack) into the TCB
 // and re-arm the resume frame. Must be called before parking a user
@@ -71,9 +72,5 @@ void arch_uthread_save_frame(struct thread *t, const struct trap_frame *tf);
 // Set the syscall return value a parked user thread will see when it
 // resumes (its saved rax). Used by wakers that complete a blocked syscall.
 void arch_uthread_set_result(struct thread *t, uint64_t v);
-
-// Set the argument register (Win64 rcx) a freshly spawned user thread reads
-// at its ring-3 entry point. Used by uthread_spawn_arg.
-void arch_uthread_set_arg(struct thread *t, uint64_t arg);
 
 #endif // trap_frame_h_INCLUDED

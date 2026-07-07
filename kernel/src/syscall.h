@@ -3,53 +3,66 @@
 
 #include <stdint.h>
 
-// System call ABI (int 0x80 era).
+// System call ABI (SYSCALL/SYSRET).
 //
-// User side is plain Win64: rax = syscall number, args in rcx, rdx, r8,
-// r9 (max 4), result in rax. `int 0x80` clobbers nothing, so a user stub
-// is literally `mov eax, N ; int 0x80 ; ret` and behaves like any Win64
-// call (kernel restores every register except rax).
+// User side: rax = syscall number, args in r10, rdx, r8, r9 (max 4),
+// result in rax; rcx and r11 are clobbered (SYSCALL overwrites them with
+// the return rip/rflags — architectural, not a choice). Everything else
+// is preserved. r10 stands in for the Win64 rcx argument slot exactly as
+// in the Linux convention, and the entry stub (interrupts.asm) stores it
+// into the trap frame's rcx slot, so kernel-side the convention is plain
+// Win64: arguments live in the frame's rcx/rdx/r8/r9.
 //
-// Kernel-internal convention: arguments live in the trap frame's
-// rcx/rdx/r8/r9 slots. A future SYSCALL/SYSRET entry stub shuffles
-// r10 -> frame.rcx (SYSCALL clobbers rcx) and the dispatcher never
-// notices the difference.
-//
-// Design rule: short syscalls must not block. The deliberate exceptions
-// (SYS_DUMMY_READ, SYS_RING_WAIT, SYS_YIELD) park the calling user thread
-// via the TCB-frame save — anything long-running belongs on the ring.
+// Design rule: kernel work is bounded and non-blocking. The deliberate
+// exceptions (SYS_BLOCK_WAIT, SYS_YIELD) park the calling user thread
+// via the TCB-frame save — anything long-running is a registration +
+// event on a channel (ipc-process-design.md §2), and anything long-lived
+// in teardown is the parent's reap loop (§4).
 
 #define SYS_DEBUG_WRITE 0 // (ptr, len)             -> bytes written
 #define SYS_EXIT        1 // ()                     -> never returns
 #define SYS_YIELD       2 // ()                     -> 0
 #define SYS_GETUID      3 // ()                     -> uid
 #define SYS_GETPID      4 // ()                     -> pid
-#define SYS_VM_MAP      5 // (len, prot)            -> base
-#define SYS_VM_UNMAP    6 // (base, len)            -> 0
-#define SYS_DUMMY_READ  7 // ()                     -> value (blocks)
-#define SYS_RING_CREATE 8 // ()                     -> ring base
-#define SYS_RING_ENTER  9 // ()                     -> 0 (doorbell)
-#define SYS_RING_WAIT  10 // (my_cq_head)           -> 0 (blocks if empty)
 
 // Memory blocks are the vm_map unit (power-of-two pages). vm_protect
-// re-flags a page-aligned sub-range of a block in the caller's own view;
-// prot 0 makes it inaccessible. vm_share maps a whole owned block into
-// another process; the owner freeing the block (or dying) revokes it.
-#define SYS_VM_PROTECT 11 // (base, len, prot)      -> 0
-#define SYS_VM_SHARE   12 // (base, pid, prot)      -> 0
-#define SYS_VM_UNSHARE 13 // (base)                 -> 0
+// re-flags a page-aligned sub-range of a block in the caller's own view
+// (or, with a pid, an own embryo's view — the parent applying W^X to the
+// image it wrote); prot 0 makes it inaccessible. vm_share maps a whole
+// owned block into another process (positive target) or turns it into a
+// kernel channel (negative scheme id); the owner freeing the block (or
+// dying + being reaped) revokes every view. vm_move transfers ownership
+// along tree edges only: down into an own embryo, up out of an own
+// zombie child.
+#define SYS_VM_MAP     5 // (len, prot)             -> base
+#define SYS_VM_UNMAP   6 // (base, len)             -> 0
+#define SYS_VM_PROTECT 7 // (base, len, prot[, pid])-> 0
+#define SYS_VM_SHARE   8 // (base, target, prot)    -> 0 (target signed)
+#define SYS_VM_UNSHARE 9 // (base)                  -> 0
+#define SYS_VM_MOVE   10 // (base, pid)             -> 0
 
-// Ring sessions (process <-> process rings; ipc-process-design.md §1). The
-// shared block's base address is the session handle. DOORBELL/WAIT are
-// role-inferred from curr->proc. LISTEN declares consent + block size once;
-// ACCEPT and CONNECT are a blocking rendezvous.
-#define SYS_SESSION_LISTEN   14 // (order, max_sessions)  -> 0
-#define SYS_SESSION_ACCEPT   15 // ()                     -> base (blocks)
-#define SYS_SESSION_CONNECT  16 // (server_pid)           -> base (blocks)
-#define SYS_SESSION_DOORBELL 17 // (base)                 -> 0
-#define SYS_SESSION_WAIT     18 // (base, seen)           -> 0 (blocks if caught up)
+// Shared-block channels (ipc-process-design.md §1). The block's base
+// address is the channel name; DOORBELL/WAIT roles are inferred from the
+// caller.
+#define SYS_BLOCK_DOORBELL 11 // (base)           -> 0 (never blocks)
+#define SYS_BLOCK_WAIT     12 // (addr, expected) -> 0 (may park; SYSERR_DEAD on revoke)
 
-#define SYS_MAX        19
+// Process trees (ipc-process-design.md §5): parent-driven creation
+// (embryo -> VM_MOVE/VM_PROTECT -> first THREAD_SPAWN seals), recursive
+// kill, and the parent-driven reap loop that replaces all deferred
+// kernel teardown.
+#define SYS_PROC_CREATE  13 // ()                        -> pid (embryo)
+#define SYS_THREAD_SPAWN 14 // (pid, entry, stack, arg)  -> tid (pid: self or own embryo)
+#define SYS_PROC_KILL    15 // (pid)                     -> 0 (own descendant; subtree dies)
+#define SYS_PROC_REAP    16 // (pid)                     -> REAP_* | SYSERR_AGAIN (own dead child)
+
+#define SYS_MAX          17
+
+// SYS_PROC_REAP results: one more bounded step done / the subtree is
+// fully gone. SYSERR_AGAIN means culling/drain hasn't caught up — call
+// again.
+#define REAP_DONE 0
+#define REAP_MORE 1
 
 // vm_map prot bits (user-facing; translated to paging flags internally).
 #define VM_PROT_READ  1u
@@ -63,14 +76,20 @@
 #define SYSERR_NOMEM ((uint64_t) - 4)
 #define SYSERR_EXIST ((uint64_t) - 5)
 #define SYSERR_PERM  ((uint64_t) - 6)
-#define SYSERR_DEAD  ((uint64_t) - 7) // session peer died (delivered to a parked waiter)
+#define SYSERR_DEAD  ((uint64_t) - 7) // channel peer revoked/died (wakes a parked waiter)
+#define SYSERR_AGAIN ((uint64_t) - 8) // bounded step made no progress; retry
 
 struct trap_frame;
 
-// Entry from the arch interrupt path for vector 0x80. Runs at IRQ depth 1
-// on the per-CPU interrupt stack. Writes the result into tf->rax and
-// returns — except for ops that park the calling thread, in which case it
-// never returns and control resumes in the scheduler loop.
+// Dispatcher. Runs at IRQ depth 1 on the per-CPU RSP0 stack. Writes the
+// result into tf->rax and returns — except for ops that park the calling
+// thread, in which case it never returns and control resumes in the
+// scheduler loop.
 void syscall_entry(struct trap_frame *tf);
+
+// Entry from the SYSCALL stub (interrupts.asm), ring 3 only: brackets
+// syscall_entry in the irq_enter/irq_exit the interrupt path gets from
+// interrupt_handler (IA32_FMASK cleared IF before we got here).
+void syscall_entry_from_user(struct trap_frame *tf);
 
 #endif // syscall_h_INCLUDED

@@ -6,7 +6,7 @@
 #include "debug.h"
 #include "irq.h"
 #include "paging.h"
-#include "reaper.h"
+#include "process.h"
 #include "scheduler_arch.h"
 #include "spinlock.h"
 #include "thread.h"
@@ -66,8 +66,6 @@ void scheduler_enqueue(struct thread *t) {
 }
 
 [[noreturn]] void scheduler_loop(struct scheduler *scheduler) {
-  asserts(g_kernel_process != nullptr,
-          "threading_cpu_enter: threading_init not called");
   while (true) {
     // Top of iteration: claim an extra IRQ-disable so the depth stays
     // pinned >0 across the inner unlock and the subsequent switch into
@@ -77,6 +75,18 @@ void scheduler_enqueue(struct thread *t) {
     irq_disable();
     spinlock_lock(&scheduler->lock);
     struct thread *next = scheduler_pop_local_locked(scheduler);
+
+    // Dispatch cull: a thread whose process died (kill, or the cascade
+    // from an ancestor) is reaped here instead of being run — this is
+    // where queued-runnable and unhooked-parked victims all land. Done
+    // before install so the dying AS is never re-entered.
+    if (next != nullptr && next->proc->state == PROC_DEAD) {
+      next->status = THREAD_DEAD;
+      spinlock_unlock(&scheduler->lock);
+      process_thread_exited(next); // takes the umem lock; none held here
+      irq_enable();
+      continue;
+    }
 
     if (next == nullptr) {
       // idle if there is no thread to run.
@@ -88,11 +98,10 @@ void scheduler_enqueue(struct thread *t) {
       atomic_store_explicit(&scheduler->idle, true, memory_order_relaxed);
       spinlock_unlock(&scheduler->lock);
 
-      // Idle on the kernel AS (load-bearing rule, memory-design §3): a
-      // dying process's AS must drain off every CPU for the reaper's
-      // as_free, and an idle CPU must never HLT holding it. Also what
-      // keeps kthread-stack guard pages g_as_kernel-only sound. IRQs are
-      // still off here, so we can't migrate mid-check.
+      // Idle on the kernel AS (load-bearing rule): a zombie's AS must
+      // drain off every CPU before a reap step may as_free it, and an
+      // idle CPU must never HLT holding it. IRQs are still off here, so
+      // we can't migrate mid-check.
       struct cpu_state *cs = cpu_state_this();
       if (cs->current_as != g_as_kernel) {
         as_switch(g_as_kernel);
@@ -130,12 +139,13 @@ void scheduler_enqueue(struct thread *t) {
       scheduler->current_thread = nullptr;
       atomic_store_explicit(&prev->on_cpu, false, memory_order_release);
 
-      // Dead threads go to the reaper (stack/TCB/ring teardown, and
-      // process teardown when the last thread of a process dies). Only
-      // after the on_cpu release store: the reaper must see a finished
-      // context save.
+      // A thread that exited (or was fault-killed) is reaped inline —
+      // user threads are stackless in the kernel, so this is a TCB free
+      // plus, for the last thread of a live process, the process's
+      // death. Only after the on_cpu release store: the save must be
+      // complete before the TCB can be freed.
       if (prev->status == THREAD_DEAD) {
-        reaper_submit(prev);
+        process_thread_exited(prev);
       }
       irq_enable();
     }

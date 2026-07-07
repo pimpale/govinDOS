@@ -11,15 +11,53 @@
 #include "stacks.h"
 #include "stdlib/stdlib.h"
 
+static uint64_t rdmsr64(uint32_t msr) {
+  uint32_t eax, edx;
+  __asm__ volatile("rdmsr" : "=a"(eax), "=d"(edx) : "c"(msr));
+  return ((uint64_t)edx << 32) | eax;
+}
+
+static void wrmsr64(uint32_t msr, uint64_t val) {
+  __asm__ volatile("wrmsr"
+                   :
+                   : "c"(msr), "a"((uint32_t)val), "d"((uint32_t)(val >> 32)));
+}
+
+#define IA32_EFER           0xC0000080u
+#define IA32_STAR           0xC0000081u
+#define IA32_LSTAR          0xC0000082u
+#define IA32_FMASK          0xC0000084u
+#define IA32_KERNEL_GS_BASE 0xC0000102u
+
 static void enable_nxe(void) {
   // EFER.NXE (bit 11). Without this, any PTE with bit 63 set faults as
   // a reserved-bit violation rather than as #PF on instruction fetch.
   // UEFI usually sets this, but we own this MSR from here on.
-  const uint32_t IA32_EFER = 0xC0000080;
-  uint32_t eax, edx;
-  __asm__ volatile("rdmsr" : "=a"(eax), "=d"(edx) : "c"(IA32_EFER));
-  eax |= (1u << 11);
-  __asm__ volatile("wrmsr" : : "a"(eax), "d"(edx), "c"(IA32_EFER));
+  wrmsr64(IA32_EFER, rdmsr64(IA32_EFER) | (1u << 11));
+}
+
+// SYSCALL entry point, interrupts.asm.
+extern void syscall_entry_stub(void);
+
+// Per-CPU SYSCALL/SYSRET setup. The GDT layout was chosen for this from
+// the start (gdt.h): SYSCALL loads CS/SS = STAR[47:32]+0/+8 = kernel
+// CS/DS; SYSRET loads CS/SS = STAR[63:48]+16/+8 = user CS64/DS.
+static void enable_syscall(struct cpu_state *cs) {
+  wrmsr64(IA32_EFER, rdmsr64(IA32_EFER) | 1u); // EFER.SCE
+  wrmsr64(IA32_STAR, ((uint64_t)GDT_SEL_USER_CS32 << 48) |
+                         ((uint64_t)GDT_SEL_KERNEL_CS << 32));
+  wrmsr64(IA32_LSTAR, (uint64_t)syscall_entry_stub);
+  // Cleared in RFLAGS on entry: IF (the stub runs IRQs-off like an
+  // interrupt gate), TF/AC/NT (no user-controlled trap/alignment state
+  // in the kernel), DF (the C ABI assumes it clear).
+  wrmsr64(IA32_FMASK, 0x100 | 0x200 | 0x400 | 0x4000 | 0x40000);
+  // gs-relative anchor for the stub's manual stack switch. The user
+  // GS base (plain IA32_GS_BASE) stays whatever ring 3 set; the stub
+  // brackets its two gs loads in swapgs. (An NMI landing between them
+  // would see the kernel GS base, but the NMI handler never touches gs
+  // and is fatal anyway.)
+  cs->syscall_anchor.kernel_rsp0_top = (uint64_t)cs->stacks.kernel_rsp0_top;
+  wrmsr64(IA32_KERNEL_GS_BASE, (uint64_t)&cs->syscall_anchor);
 }
 
 // Mark the 4 KiB MMIO frame containing `phys` as R|W|UC in the kernel AS.
@@ -103,6 +141,9 @@ void cpu_setup() {
 
   // 0. enable nxe (we don't use this yet but we will ig)
   enable_nxe();
+
+  // 0.5. SYSCALL/SYSRET (the only syscall path — there is no int gate).
+  enable_syscall(this_cpu_state);
 
   // 1. Construct and load this CPU's GDT (also installs the TSS so that
   //    IST-using exceptions and ring transitions have a stack to switch to).

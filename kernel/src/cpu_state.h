@@ -28,6 +28,16 @@ struct cpu_stacks {
 // one big struct to hold all the per-cpu data.
 // Don't try to make global variables out of this
 struct cpu_state {
+  // SYSCALL entry anchor. IA32_KERNEL_GS_BASE points at this member so
+  // the entry stub (interrupts.asm) can stash the user RSP and find this
+  // CPU's RSP0 with gs-relative loads — SYSCALL, unlike an interrupt
+  // gate, does not switch stacks. Field offsets are asm ABI: gs:[0] is
+  // the scratch slot, gs:[8] the kernel stack top (same stack the TSS
+  // RSP0 names). Written during cpu_setup, read only by the stub.
+  struct {
+    uint64_t scratch_user_rsp;
+    uint64_t kernel_rsp0_top;
+  } syscall_anchor;
   // logical id
   uint64_t logical_id;
   // hardware id

@@ -59,6 +59,11 @@ void VEC_FN(_get)(const VEC_T *vec, uint32_t i, VEC_DTYPE *dest) {
   *dest = vec->pData[i];
 }
 
+VEC_DTYPE *VEC_FN(_at)(VEC_T *vec, uint32_t i) {
+  assert(i < vec->len);
+  return &vec->pData[i];
+}
+
 void VEC_FN(_swap_and_pop)(VEC_T *vec, uint32_t i) {
   assert(vec->len > 0);
   assert(i < vec->len);

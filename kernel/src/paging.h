@@ -52,18 +52,11 @@ typedef uint32_t paging_flags_t;
 // Lifecycle / singletons
 // ---------------------------------------------------------------------------
 
-// The kernel address space.
-// will be set in cpu_setup.c
+// The kernel address space. Set during BSP bring-up (cpu_setup.c) and
+// boot-static after it: the only post-boot skeleton mutations were
+// kthread-stack guard punches, and kernel threads no longer exist. User
+// process address spaces are cloned directly from it.
 extern struct address_space *g_as_kernel;
-
-// Frozen snapshot of the kernel skeleton, sealed at the end of boot (after
-// the per-CPU stacks and their static guard pages, before any kthread or
-// user process exists). User process address spaces are cloned from this,
-// never from live g_as_kernel: g_as_kernel accumulates kthread-stack guard
-// punches over time, and a clone taken mid-flight would keep a stale
-// non-present page after that kthread's stack is freed and recycled.
-// Set once in init.c; never mutated afterwards.
-extern struct address_space *g_as_template;
 
 /////////////////////////////////////////////////////////////
 // AS Data Manipulation (No side effects apart from allocation/deallocation)

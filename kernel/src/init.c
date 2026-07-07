@@ -2,20 +2,19 @@
 
 #include "acpi.h"
 #include "allocator.h"
+#include "channel.h"
 #include "cpu_hwid.h"
 #include "cpu_setup.h"
 #include "debug.h"
-#include "dummydev.h"
-#include "enumerate_cpus.h"
 #include "get_mmap.h"
-#include "interrupts.h"
 #include "paging.h"
 #include "pe.h"
+#include "process.h"
 #include "scheduler.h"
 #include "serial.h"
 #include "smp.h"
+#include "syscall.h"
 
-#include "reaper.h"
 #include "stdlib/stdio.h"
 #include "stdlib/stdlib.h"
 #include "thread.h"
@@ -27,29 +26,18 @@
 
 #define AP_TRAMPOLINE_BASE 0x8000
 
-// Smoke test for the scheduler: prints a few times, yielding between
-// prints so other threads (and the idle loop) get to run.
-static void hello_thread(void *arg) {
-  uint64_t n = (uint64_t)arg;
-  for (uint64_t i = 0; i < 5; i++) {
-    printf("thread %llu tick %llu (cpu %llu)\n", n, i, cpu_state_whoami());
-    yield();
-  }
-}
-
-// IPI-wakeup test: spawns N hello_threads from inside a running thread.
-// The expected sequence is that this thread runs on whichever CPU got it
-// (round-robin starts at 0), while the other CPUs have already entered
-// their scheduler loops, found their queues empty, and HLT'd. The
-// spawned threads round-robin onto all CPUs including the idle ones —
-// proving the wakeup IPI works if those CPUs actually run them.
-static void spawner_thread(void *arg) {
-  uint64_t n = (uint64_t)arg;
-  printf("spawner on cpu %llu about to spawn %llu workers\n",
-         cpu_state_whoami(), n);
-  for (uint64_t i = 0; i < n; i++) {
-    kthread_spawn(hello_thread, (void *)i);
-  }
+// Synchronous teardown for boot-test processes (no threads ever ran, so
+// no culling or draining can be pending): kill the subtree, then run the
+// reap loop to completion — which also regression-tests the reap steps
+// themselves at every boot.
+static void destroy_test_process(struct process *p) {
+  process_kill_subtree(p);
+  uint64_t rc;
+  do {
+    rc = process_reap_step(p);
+    asserts(rc == REAP_MORE || rc == REAP_DONE,
+            "destroy_test_process: reap stalled");
+  } while (rc != REAP_DONE);
 }
 
 // Regression test for the paging merge pass: a guard punch fragments the
@@ -78,11 +66,11 @@ static void paging_merge_selftest(void) {
 
 // Boot-time test of the ublock model across two processes: isolation
 // (PAGE_U only in the owner's tree), sharing, per-view protect, and
-// revoke-on-free. Runs before the scheduler ever dispatches these
-// processes, so process_destroy's drain is trivially satisfied.
+// revoke-on-free. Runs before the scheduler ever dispatches anything, so
+// the reap loop in destroy_test_process finishes without retries.
 static void umem_selftest(void) {
-  struct process *a = process_create_user(9001);
-  struct process *b = process_create_user(9002);
+  struct process *a = process_create(nullptr, 9001);
+  struct process *b = process_create(nullptr, 9002);
 
   uint8_t *blk = umem_alloc(a, 2 * PAGE_SIZE, PAGE_R | PAGE_W);
   asserts(blk != nullptr, "umem selftest: alloc failed");
@@ -119,33 +107,155 @@ static void umem_selftest(void) {
   asserts(!user_range_ok(a, (uint64_t)blk, PAGE_SIZE, false),
           "umem selftest: free left owner access");
 
-  // Full-block restore + merge: both trees back to template shape.
-  uint64_t tmpl = as_table_count(g_as_template);
-  asserts(as_table_count(a->as) == tmpl && as_table_count(b->as) == tmpl,
-          "umem selftest: trees did not merge back to template shape");
+  // Full-block restore + merge: both trees back to the kernel skeleton's
+  // shape (user ASes are clones of boot-static g_as_kernel).
+  uint64_t skel = as_table_count(g_as_kernel);
+  asserts(as_table_count(a->as) == skel && as_table_count(b->as) == skel,
+          "umem selftest: trees did not merge back to skeleton shape");
 
-  process_destroy(a);
-  process_destroy(b);
+  destroy_test_process(a);
+  destroy_test_process(b);
   printf("umem: selftest ok\n");
 }
 
-// C userspace test program compiled to PE32+ (userspace/hello.c),
-// embedded by user_pe_blob.asm until a filesystem exists.
+// Boot-time test of the channel plumbing that doesn't need running
+// threads: shares-channel creation, KEV_SHARE posting (both the
+// immediate path and the replay of edges that predate the channel), and
+// endpoint teardown through process death.
+static void channel_selftest(void) {
+  struct process *a = process_create(nullptr, 9003); // sharer
+  struct process *b = process_create(nullptr, 9004); // shares-channel owner
+
+  // Share BEFORE b has a shares channel: the edge holds the pending
+  // notification (level state), to be replayed at channel creation.
+  uint8_t *early = umem_alloc(a, PAGE_SIZE, PAGE_R | PAGE_W);
+  asserts(early != nullptr, "channel selftest: alloc failed");
+  asserts(umem_share(a, (uint64_t)early, b->pid, PAGE_R) == 0,
+          "channel selftest: share failed");
+
+  uint8_t *ch = umem_alloc(b, PAGE_SIZE, PAGE_R | PAGE_W);
+  asserts(ch != nullptr, "channel selftest: channel alloc failed");
+  asserts(channel_scheme_create(b, (uint64_t)ch, KSCHEME_SHARES) == 0,
+          "channel selftest: scheme create failed");
+
+  volatile struct kring_hdr *h = (volatile struct kring_hdr *)ch;
+  const struct kcqe *cq =
+      (const struct kcqe *)(ch + KRING_HDR_SIZE +
+                            KRING_NSLOTS(0) * sizeof(struct ksqe));
+  asserts(h->nslots == KRING_NSLOTS(0), "channel selftest: bad nslots");
+  asserts(h->cq_count == 1, "channel selftest: replay did not post");
+  asserts(cq[0].type == KEV_SHARE && cq[0].a == a->pid &&
+              cq[0].b == ((uint64_t)early | 0),
+          "channel selftest: bad replayed KEV_SHARE");
+
+  // Share with the channel live: immediate notification.
+  uint8_t *late = umem_alloc(a, 2 * PAGE_SIZE, PAGE_R | PAGE_W);
+  asserts(late != nullptr, "channel selftest: alloc failed");
+  asserts(umem_share(a, (uint64_t)late, b->pid, PAGE_R | PAGE_W) == 0,
+          "channel selftest: live share failed");
+  asserts(h->cq_count == 2, "channel selftest: live share did not post");
+  asserts(cq[1].type == KEV_SHARE && cq[1].a == a->pid &&
+              cq[1].b == ((uint64_t)late | 1),
+          "channel selftest: bad live KEV_SHARE");
+
+  // Rules: one shares channel per process; no scheme on a shared block.
+  uint8_t *spare = umem_alloc(b, PAGE_SIZE, PAGE_R | PAGE_W);
+  asserts(channel_scheme_create(b, (uint64_t)spare, KSCHEME_SHARES) ==
+              SYSERR_EXIST,
+          "channel selftest: second shares channel allowed");
+  asserts(channel_scheme_create(a, (uint64_t)early, KSCHEME_SHARES) ==
+              SYSERR_INVAL,
+          "channel selftest: scheme on a shared block allowed");
+
+  // Teardown through the ordinary death paths: a's blocks revoke out of
+  // b's AS, b's channel block dies with its kchan endpoint.
+  destroy_test_process(a);
+  destroy_test_process(b);
+  printf("channel: selftest ok\n");
+}
+
+// Boot-time test of the tree machinery that doesn't need running
+// threads: embryo creation, VM_MOVE down (construction) and up
+// (reap-time claim), the tree channel's KEV_CHILD_DEAD (replay path),
+// and the subtree reap cursor.
+static void process_selftest(void) {
+  struct process *parent = process_create(nullptr, 9005);
+  struct process *child = process_create(parent, 9005);
+  asserts(child->state == PROC_EMBRYO, "process selftest: not an embryo");
+
+  // Move a block down into the embryo: parent view gone, child view RW.
+  uint8_t *blk = umem_alloc(parent, PAGE_SIZE, PAGE_R | PAGE_W);
+  blk[42] = 0x42; // survives the move (same physical identity address)
+  umem_lock();
+  ublock *b = umem_owned_locked(parent, (uint64_t)blk);
+  asserts(b != nullptr && umem_move_locked(b, parent, child, true) == 0,
+          "process selftest: move down failed");
+  umem_unlock();
+  asserts(!user_range_ok(parent, (uint64_t)blk, PAGE_SIZE, false),
+          "process selftest: mover kept a view");
+  asserts(user_range_ok(child, (uint64_t)blk, PAGE_SIZE, true),
+          "process selftest: movee got no view");
+  asserts(blk[42] == 0x42, "process selftest: move lost contents");
+
+  // Tree channel + death: create the channel first, then kill the child
+  // — the event must post immediately (the replay path is exercised by
+  // the death being level state until consumed).
+  uint8_t *tch = umem_alloc(parent, PAGE_SIZE, PAGE_R | PAGE_W);
+  asserts(channel_scheme_create(parent, (uint64_t)tch, KSCHEME_TREE) == 0,
+          "process selftest: tree channel create failed");
+  process_kill_subtree(child);
+  volatile struct kring_hdr *h = (volatile struct kring_hdr *)tch;
+  const struct kcqe *cq =
+      (const struct kcqe *)(tch + KRING_HDR_SIZE +
+                            KRING_NSLOTS(0) * sizeof(struct ksqe));
+  asserts(h->cq_count == 1 && cq[0].type == KEV_CHILD_DEAD &&
+              cq[0].a == child->pid,
+          "process selftest: no KEV_CHILD_DEAD");
+
+  // Claim the block back up out of the zombie before reaping frees it.
+  umem_lock();
+  b = umem_owned_locked(child, (uint64_t)blk);
+  asserts(b != nullptr && umem_move_locked(b, child, parent, true) == 0,
+          "process selftest: move up failed");
+  umem_unlock();
+  asserts(user_range_ok(parent, (uint64_t)blk, PAGE_SIZE, true),
+          "process selftest: claim got no view");
+  asserts(blk[42] == 0x42, "process selftest: claim lost contents");
+
+  // Reap the zombie child, then tear down the parent (whose subtree is
+  // now just itself).
+  uint64_t rc;
+  do {
+    rc = process_reap_step(child);
+    asserts(rc == REAP_MORE || rc == REAP_DONE,
+            "process selftest: reap stalled");
+  } while (rc != REAP_DONE);
+  asserts(umem_free(parent, (uint64_t)blk, 0) == 0,
+          "process selftest: claimed block not owned");
+  destroy_test_process(parent);
+  printf("process: selftest ok\n");
+}
+
+// init: the root of the process tree, loaded from the embedded PE image
+// (userspace/hello.c) — the one image the kernel ever loads itself; all
+// further processes are built by their parents in userspace. init's
+// death is a panic (process.c).
 extern uint8_t user_pe_blob[];
 extern uint8_t user_pe_blob_end[];
 
-static void pe_test_setup(void) {
-  struct process *p = process_create_user(1001);
+static void init_setup(void) {
+  struct process *p = process_create(nullptr, 1);
+  process_set_init(p);
   uint64_t entry = 0;
   int rc = pe_load(p, user_pe_blob, (size_t)(user_pe_blob_end - user_pe_blob),
                    &entry);
-  asserts(rc == 0, "pe_test: load failed");
+  asserts(rc == 0, "init: PE load failed");
 
   void *stack = umem_alloc(p, 4 * PAGE_SIZE, PAGE_R | PAGE_W);
-  asserts(stack != nullptr, "pe_test: stack alloc failed");
+  asserts(stack != nullptr, "init: stack alloc failed");
 
-  printf("pe_test: pid=%llu uid=%llu entry=%016llX\n", p->pid, p->uid, entry);
-  uthread_spawn(p, entry, (uint64_t)stack + 4 * PAGE_SIZE);
+  printf("init: pid=%llu uid=%llu entry=%016llX\n", p->pid, p->uid, entry);
+  process_spawn_thread(p, entry, (uint64_t)stack + 4 * PAGE_SIZE, 0);
 }
 
 [[noreturn]] static void ap_main() {
@@ -205,14 +315,9 @@ efi_status_t efi_main(efi_handle_t handle, struct efi_system_table *system) {
   cpu_setup_bsp(rsdp);
 
   // Initialize per-CPU runqueues before bringing up APs — APs will call
-  // threading_cpu_enter() as soon as they finish cpu_setup, which needs
+  // scheduler_loop() as soon as they finish cpu_setup, which needs
   // cs->scheduler.lock + queue to be live.
   scheduler_init();
-
-  // Initialize threading before bringing up APs — APs will call
-  // threading_cpu_enter() as soon as they finish cpu_setup, which
-  // requires g_kernel_process to exist.
-  threading_init();
 
   // User-memory bookkeeping (ublock registry + uid accounts).
   umem_init();
@@ -220,32 +325,17 @@ efi_status_t efi_main(efi_handle_t handle, struct efi_system_table *system) {
   // Guard punch + revert must return the kernel tree to its exact shape.
   paging_merge_selftest();
 
-  // Seal the template BEFORE the first kthread_spawn: user ASes clone
-  // from this frozen snapshot, which must contain the boot-static kernel
-  // mappings (incl. per-CPU stack guards) but never a kthread-stack guard
-  // — those are punched and restored in g_as_kernel only.
-  g_as_template = as_clone(g_as_kernel);
-
-  // Two-process isolation / share / revoke test (needs the template).
+  // Boot selftests. All per-CPU kernel stacks (and their guard punches)
+  // exist by now, so g_as_kernel is in its final boot-static shape and
+  // user ASes can clone it directly.
   umem_selftest();
+  channel_selftest();
+  process_selftest();
 
-  // Reaper before anything can die: dead threads (and, via the last
-  // thread, dead processes) are torn down on its kthread.
-  reaper_init();
-
-  // Spawn a single bootstrap thread. Round-robin places it on CPU 0
-  // (the BSP, last to enter the scheduler); the other CPUs get nothing
-  // and HLT. The spawner then enqueues 8 workers from inside its
-  // running context, which round-robin onto all CPUs including the
-  // ones currently HLT'd. Their wakeup proves the IPI path works.
-  kthread_spawn(spawner_thread, (void *)8);
-
-  // Fake blocking device (spawns its producer kthread).
-  dummydev_init();
-
-  // Ring-3 test suite: a real C program (userspace/hello.c), compiled to
-  // PE32+, rebased at load time. Exercises the whole syscall surface.
-  pe_test_setup();
+  // The root of the process tree. Everything else is spawned from
+  // userspace, parents building children (hello.c doubles as init and
+  // the ring-3 test suite).
+  init_setup();
 
   uint64_t bsp_id = cpu_hwid();
 

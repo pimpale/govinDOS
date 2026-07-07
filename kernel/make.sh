@@ -109,22 +109,22 @@ make() {
   compile_c src/spinlock.c
   compile_c src/scheduler.c
   compile_c src/thread.c
+  compile_c src/process.c
   compile_c src/syscall.c
   compile_c src/uaccess.c
   compile_c src/umem.c
-  compile_c src/reaper.c
-  compile_c src/dummydev.c
-  compile_c src/ring.c
-  compile_c src/session.c
+  compile_c src/channel.c
   compile_c src/pe.c
   compile_c src/stdlib/stdio.c
   compile_c src/stdlib/stdlib.c
   compile_c src/stdlib/string.c
   # generic-data-structure instantiations
   compile_c src/instances/list_dtype_thread_ptr.c
+  compile_c src/instances/vec_dtype_thread_ptr.c
   compile_c src/instances/vec_dtype_ublock_ptr.c
   compile_c src/instances/vec_dtype_process_ptr.c
-  compile_c src/instances/vec_dtype_session_ptr.c
+  compile_c src/instances/vec_dtype_share_edge.c
+  compile_c src/instances/vec_dtype_kreg_ptr.c
   # architecture specific
   compile_c archsrc/x86_64/impl_stack_protector.c
   compile_c archsrc/x86_64/serial.c
