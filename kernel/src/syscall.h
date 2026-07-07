@@ -39,7 +39,17 @@
 #define SYS_VM_SHARE   12 // (base, pid, prot)      -> 0
 #define SYS_VM_UNSHARE 13 // (base)                 -> 0
 
-#define SYS_MAX        14
+// Ring sessions (process <-> process rings; ipc-process-design.md §1). The
+// shared block's base address is the session handle. DOORBELL/WAIT are
+// role-inferred from curr->proc. LISTEN declares consent + block size once;
+// ACCEPT and CONNECT are a blocking rendezvous.
+#define SYS_SESSION_LISTEN   14 // (order, max_sessions)  -> 0
+#define SYS_SESSION_ACCEPT   15 // ()                     -> base (blocks)
+#define SYS_SESSION_CONNECT  16 // (server_pid)           -> base (blocks)
+#define SYS_SESSION_DOORBELL 17 // (base)                 -> 0
+#define SYS_SESSION_WAIT     18 // (base, seen)           -> 0 (blocks if caught up)
+
+#define SYS_MAX        19
 
 // vm_map prot bits (user-facing; translated to paging flags internally).
 #define VM_PROT_READ  1u
@@ -53,6 +63,7 @@
 #define SYSERR_NOMEM ((uint64_t) - 4)
 #define SYSERR_EXIST ((uint64_t) - 5)
 #define SYSERR_PERM  ((uint64_t) - 6)
+#define SYSERR_DEAD  ((uint64_t) - 7) // session peer died (delivered to a parked waiter)
 
 struct trap_frame;
 

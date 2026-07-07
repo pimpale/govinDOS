@@ -9,6 +9,7 @@
 #include "irq.h"
 #include "paging.h"
 #include "scheduler.h"
+#include "session.h"
 #include "spinlock.h"
 #include "stacks.h"
 #include "stdlib/stdlib.h"
@@ -32,6 +33,7 @@ extern void arch_thread_install(struct thread *t);
 extern void arch_thread_init_user(struct thread *t, uint64_t entry,
                                   uint64_t user_stack_top);
 extern void arch_uthread_set_result(struct thread *t, uint64_t v);
+extern void arch_uthread_set_arg(struct thread *t, uint64_t arg);
 
 struct process *g_kernel_process = nullptr;
 
@@ -68,6 +70,7 @@ struct process *process_create_user(uint64_t uid) {
   p->as = as_clone(g_as_template);
   p->uid = uid;
   umem_process_register(p);
+  session_process_init(p);
   return p;
 }
 
@@ -94,14 +97,20 @@ struct thread *kthread_spawn(void (*entry)(void *), void *arg) {
   return t;
 }
 
-struct thread *uthread_spawn(struct process *proc, uint64_t entry,
-                             uint64_t user_stack_top) {
+struct thread *uthread_spawn_arg(struct process *proc, uint64_t entry,
+                                 uint64_t user_stack_top, uint64_t arg) {
   asserts(proc != nullptr && proc->uid != 0,
           "uthread_spawn: needs a user process");
   struct thread *t = alloc_thread(proc, false);
   arch_thread_init_user(t, entry, user_stack_top);
+  arch_uthread_set_arg(t, arg);
   scheduler_enqueue(t);
   return t;
+}
+
+struct thread *uthread_spawn(struct process *proc, uint64_t entry,
+                             uint64_t user_stack_top) {
+  return uthread_spawn_arg(proc, entry, user_stack_top, 0);
 }
 
 struct thread *thread_current(void) {

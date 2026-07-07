@@ -109,6 +109,13 @@ void arch_uthread_set_result(struct thread *t, uint64_t v) {
   t->arch.uframe.rax = v;
 }
 
+void arch_uthread_set_arg(struct thread *t, uint64_t arg) {
+  // Win64 first integer argument register; read at ring-3 entry before the
+  // callee prologue can clobber it. The resume frame already reads uframe at
+  // resume time, so no re-forge is needed.
+  t->arch.uframe.rcx = arg;
+}
+
 // Called by uthread_resume (asm) on the thread's resume_stack, IRQs off.
 // The scheduler switched into us holding one irq_disable level; iretq will
 // set IF from the saved user rflags, so drop the depth without sti.

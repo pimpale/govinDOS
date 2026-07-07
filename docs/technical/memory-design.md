@@ -251,6 +251,13 @@ sharer to owner and transfer the uid charge) without reshaping anything.
 
 ## 7. Teardown paths
 
+> **Superseded in part by [ipc-process-design.md](ipc-process-design.md)**
+> (2026-07-07): the reaper *kthread* described below is implemented and
+> working, but the follow-up design eliminates kernel threads entirely —
+> teardown moves to bounded work items on a scheduler-drained queue, and
+> `g_as_template` collapses back into `g_as_kernel` once kthread-stack
+> guard punches no longer exist. This section describes the current code.
+
 ### Process exit (last thread dead)
 
 1. For each `shared_in` block: remove `p` from its sharer list (its AS is

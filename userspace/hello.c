@@ -26,17 +26,28 @@
 #define SYS_VM_PROTECT 11
 #define SYS_VM_SHARE 12
 #define SYS_VM_UNSHARE 13
+#define SYS_SESSION_LISTEN 14
+#define SYS_SESSION_ACCEPT 15
+#define SYS_SESSION_CONNECT 16
+#define SYS_SESSION_DOORBELL 17
+#define SYS_SESSION_WAIT 18
 
 #define VM_PROT_READ 1
 #define VM_PROT_WRITE 2
 
 // Ring ABI (mirror of kernel/src/ring.h — offsets are fixed contract).
+#define RING_SQ_HEAD_OFF 0
 #define RING_SQ_TAIL_OFF 4
 #define RING_CQ_HEAD_OFF 8
 #define RING_CQ_TAIL_OFF 12
 #define RING_SQ_OFF 64
 #define RING_CQ_OFF 832
 #define RING_MASK 15
+
+// Bootstrap arg (passed by the kernel in rcx to _start). 0 = legacy single-
+// process suite; this magic = session server; anything else = session client
+// connecting to the server whose pid is the arg value.
+#define SESSION_SERVER_MAGIC 0x5E510001ull
 
 #define RING_OP_NOP 0
 #define RING_OP_DEBUG_WRITE 1

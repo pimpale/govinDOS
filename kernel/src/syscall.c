@@ -6,6 +6,7 @@
 #include "debug.h"
 #include "dummydev.h"
 #include "ring.h"
+#include "session.h"
 #include "thread.h"
 #include "trap_frame.h"
 #include "uaccess.h"
@@ -195,6 +196,55 @@ void syscall_entry(struct trap_frame *tf) {
     tf->rax = 0;
     arch_uthread_save_frame(curr, tf);
     tf->rax = ring_wait_user(curr, (uint32_t)a0);
+    return;
+
+  case SYS_SESSION_LISTEN:
+    if (!from_user) {
+      tf->rax = SYSERR_PERM;
+      return;
+    }
+    tf->rax = session_listen(curr, a0, a1);
+    return;
+
+  case SYS_SESSION_ACCEPT:
+    if (!from_user) {
+      tf->rax = SYSERR_PERM;
+      return;
+    }
+    // Blocks until a client connects. Frame saved first so the delivered
+    // base lands in rax on resume; returns immediately if a client is
+    // already pending.
+    tf->rax = 0;
+    arch_uthread_save_frame(curr, tf);
+    tf->rax = session_accept(curr);
+    return;
+
+  case SYS_SESSION_CONNECT:
+    if (!from_user) {
+      tf->rax = SYSERR_PERM;
+      return;
+    }
+    tf->rax = 0;
+    arch_uthread_save_frame(curr, tf);
+    tf->rax = session_connect(curr, a0);
+    return;
+
+  case SYS_SESSION_DOORBELL:
+    if (!from_user) {
+      tf->rax = SYSERR_PERM;
+      return;
+    }
+    tf->rax = session_doorbell(curr, a0);
+    return;
+
+  case SYS_SESSION_WAIT:
+    if (!from_user) {
+      tf->rax = SYSERR_PERM;
+      return;
+    }
+    tf->rax = 0;
+    arch_uthread_save_frame(curr, tf);
+    tf->rax = session_wait(curr, a0, (uint32_t)a1);
     return;
 
   default:

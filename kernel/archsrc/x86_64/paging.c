@@ -64,8 +64,6 @@ struct address_space {
 struct address_space *g_as_kernel = nullptr;
 struct address_space *g_as_template = nullptr;
 
-static void tlb_service_local(void);
-
 // AS mutation lock. Held across mutate + flush; as_flush waits for remote
 // shootdown acks with IRQs off while holding it, so waiters spinning here
 // (also IRQs off) MUST keep servicing the in-flight shootdown — they may
@@ -74,7 +72,7 @@ static void tlb_service_local(void);
 static void as_lock(struct address_space *as) {
   irq_disable();
   while (atomic_exchange_explicit(&as->mut_lock, true, memory_order_acquire)) {
-    tlb_service_local();
+    paging_service_shootdown();
     __asm__ volatile("pause");
   }
 }
@@ -593,7 +591,7 @@ static _Atomic bool g_tlb_busy;
 // safe to call from any IRQs-off spin loop. The request fields are
 // stable while our bit is set: the initiator doesn't release the slot
 // (or rewrite the fields) until need_mask hits zero.
-static void tlb_service_local(void) {
+void paging_service_shootdown(void) {
   uint64_t me = cpu_state_whoami();
   uint64_t bit = 1ull << me;
   if ((atomic_load_explicit(&g_tlb_req.need_mask, memory_order_acquire) &
@@ -607,11 +605,9 @@ static void tlb_service_local(void) {
 }
 
 void paging_handle_tlb_shootdown(void) {
-  tlb_service_local();
+  paging_service_shootdown();
   x86_lapic_eoi();
 }
-
-void paging_service_shootdown(void) { tlb_service_local(); }
 
 int as_flush(struct address_space *as) {
   as_lock(as);
@@ -632,7 +628,7 @@ int as_flush(struct address_space *as) {
   // the IPI cannot be delivered here.
   irq_disable();
   while (atomic_exchange_explicit(&g_tlb_busy, true, memory_order_acquire)) {
-    tlb_service_local();
+    paging_service_shootdown();
     __asm__ volatile("pause");
   }
 

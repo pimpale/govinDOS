@@ -72,4 +72,8 @@ void arch_uthread_save_frame(struct thread *t, const struct trap_frame *tf);
 // resumes (its saved rax). Used by wakers that complete a blocked syscall.
 void arch_uthread_set_result(struct thread *t, uint64_t v);
 
+// Set the argument register (Win64 rcx) a freshly spawned user thread reads
+// at its ring-3 entry point. Used by uthread_spawn_arg.
+void arch_uthread_set_arg(struct thread *t, uint64_t arg);
+
 #endif // trap_frame_h_INCLUDED

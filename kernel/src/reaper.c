@@ -7,6 +7,7 @@
 #include "paging.h"
 #include "ring.h"
 #include "scheduler.h"
+#include "session.h"
 #include "spinlock.h"
 #include "stacks.h"
 #include "stdlib/stdio.h"
@@ -35,6 +36,12 @@ void process_destroy(struct process *p) {
   asserts(p != g_kernel_process, "reaper: kernel process cannot die");
   asserts(atomic_load(&p->nthreads) == 0,
           "reaper: destroying a process with live threads");
+
+  // Tear down sessions first: mark them dying, remove them from the peers'
+  // lists, and wake any peer thread parked on one with an error. Runs before
+  // umem teardown frees the client-owned session blocks. p's own threads are
+  // all dead, so only peers can be parked.
+  session_process_teardown(p);
 
   // Drain: no CPU may still have this AS current when we free its page
   // tree. All the process's threads are dead, so each CPU leaves the AS

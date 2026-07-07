@@ -82,6 +82,11 @@ struct process {
   // and blocks other processes have shared with it.
   struct vec_ublock_ptr *blocks;
   struct vec_ublock_ptr *shared_in;
+
+  // Session/IPC state (session.c): listener consent + the sessions this
+  // process participates in. Allocated for user processes at creation, torn
+  // down first in process death. nullptr for the kernel process.
+  struct proc_ipc *ipc;
 };
 
 // Singleton process every kernel thread belongs to. Allocated by
@@ -138,6 +143,13 @@ struct process *process_create_user(uint64_t uid);
 // Caller must have mapped entry/stack PAGE_U beforehand.
 struct thread *uthread_spawn(struct process *proc, uint64_t entry,
                              uint64_t user_stack_top);
+
+// As uthread_spawn, but passes `arg` to the entry point in the Win64 first
+// argument register (rcx). Lets the kernel hand a freshly spawned process a
+// single bootstrap word (e.g. a role selector or a peer pid) with no shared
+// memory. uthread_spawn is this with arg == 0.
+struct thread *uthread_spawn_arg(struct process *proc, uint64_t entry,
+                                 uint64_t user_stack_top, uint64_t arg);
 
 // Currently running thread on this CPU. Only meaningful from contexts
 // that cannot migrate (IRQs off / interrupt context).
