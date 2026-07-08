@@ -52,4 +52,19 @@ void x86_lapic_send_fixed(uint8_t apic_id, uint8_t vector);
 // will refuse further same- or lower-priority interrupts.
 void x86_lapic_eoi(void);
 
+// One-time LAPIC-timer calibration against PIT channel 2 (polled through
+// port 0x61 — no interrupt wiring needed). Must run on the BSP, with its
+// LAPIC software-enabled, before any CPU arms the timer; the APIC timer
+// clocks off the shared bus clock, so one measurement serves all CPUs.
+void x86_lapic_timer_calibrate(void);
+
+// Arm this CPU's LAPIC timer as a one-shot: `vector` is delivered here
+// in `us` microseconds (clamped to the 32-bit count range). Re-arming
+// replaces the pending shot. Requires x86_lapic_timer_calibrate.
+void x86_lapic_timer_arm_oneshot(uint8_t vector, uint64_t us);
+
+// Disarm this CPU's LAPIC timer. A shot already accepted by the CPU may
+// still be delivered; handlers must tolerate that as spurious.
+void x86_lapic_timer_stop(void);
+
 #endif // lapic_h_INCLUDED

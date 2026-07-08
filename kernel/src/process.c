@@ -169,8 +169,9 @@ static uint64_t reap_step_locked(struct process *target) {
   if (!z->as_freed) {
     // No CPU may still have the page tree loaded. Idle CPUs switch to
     // g_as_kernel and dispatch switches per-thread, so with the threads
-    // culled this drains promptly (a CPU-bound hostile thread is held
-    // off by the nthreads gate above until preemption lands).
+    // culled this drains promptly (a CPU-bound hostile thread is forced
+    // through its death checkpoint by the preemption timer within one
+    // quantum, so the nthreads gate above clears in bounded time).
     for (size_t i = 0; i < g_cpu_state_table_len; i++) {
       if (g_cpu_state_table[i].current_as == z->as) {
         return SYSERR_AGAIN;

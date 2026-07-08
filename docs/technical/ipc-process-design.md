@@ -389,7 +389,7 @@ Rules and non-features, from the design discussion:
   `SYSERR_DEAD`/`EV_DEAD` on the transport, kill is a kernel verb that
   runs no user code.)
 - Unpreempted refault loops are a CPU hog like any ring-3 spin; user
-  preemption (already planned) is the mitigation.
+  preemption (implemented 2026-07-08, see §7) is the mitigation.
 - Pristinity guarantees the failure is *loud*: revoked pages are
   present-U=0, so ring 3 deterministically faults and never silently
   reads recycled data.
@@ -547,8 +547,8 @@ killing a process kills its descendants, embryos included (which also
 answers the orphaned-embryo problem — an embryo has no threads, so
 nthreads-driven death can never fire for it; tree death is what reaps
 it). Kill delivery: mark dying; parked threads get an error/dead result;
-running threads die at next kernel entry (CPU-bound hostile children
-need timer preemption, which is already planned).
+running threads die at next kernel entry (for CPU-bound hostile children
+the quantum timer bounds that entry to one quantum — see §7).
 
 **Nothing ever reparents.** Death follows tree edges down; reaping
 follows them up; the tree is never restructured. A dead parent's
@@ -602,6 +602,26 @@ rings/dummydev (and their kthreads) had to go with it.
 
 ## 7. Implementation notes and deliberate divergences (2026-07-07)
 
+- **Timer preemption is implemented (2026-07-08).** A LAPIC one-shot
+  (VECTOR_PREEMPT=0xFB) is armed by the scheduler loop before every
+  dispatch (fresh 10 ms quantum per dispatch) and disarmed on the idle
+  path, so idle is tickless. Expiry from ring 3 is an involuntary
+  SYS_YIELD: the handler EOIs, runs the death checkpoint, saves the trap
+  frame into the TCB and parks-requeued — the same path as a voluntary
+  yield, so nothing downstream can tell the difference. The kernel is
+  never preempted: IA32_FMASK masks IF for the whole syscall path, so a
+  mid-syscall expiry stays pending until sysret and lands one
+  instruction into ring 3 (syscalls are implicit critical sections;
+  worst-case preemption latency = longest syscall). A shot landing in
+  the scheduler loop's own IF=1 windows is treated as spurious. The
+  timer is calibrated once on the BSP against polled PIT channel 2 (the
+  APIC timer clocks off the shared bus clock). Preemption at arbitrary
+  ring-3 instructions is what forced eager FPU handling: fxsave64 into a
+  512-byte TCB area at every frame save, fxrstor64 at resume. x87/SSE
+  only — userspace stays -mgeneral-regs-only / AVX-free until XSAVE
+  lands. This also closed the last reap gap: a CPU-bound thread of a
+  killed process now hits its death checkpoint within one quantum, so
+  nthreads/AS-drain gates clear in bounded time.
 - **SYSCALL/SYSRET replaced `int 0x80`** (requested during
   implementation). User ABI: rax = nr, args in **r10**, rdx, r8, r9;
   rcx/r11 are architecturally clobbered (return rip/rflags). The entry

@@ -17,9 +17,16 @@ struct arch_thread {
   // resume_stack below.
   uint64_t kernel_rsp;
 
-  // Lazily-allocated XSAVE area for FPU/SSE/AVX state. NULL until first
-  // FPU use. Size is variable (CPUID-dependent), known to arch code.
-  void *xsave_area;
+  // x87/SSE state (FXSAVE64 layout, fixed 512 bytes, 16-byte aligned —
+  // the TCB is page-granular from the buddy allocator, so the member
+  // alignment is honored). Saved eagerly by arch_uthread_save_frame and
+  // restored by uthread_resume_prepare: the kernel itself is built
+  // -mgeneral-regs-only and cannot dirty FPU state, so the park/resume
+  // boundary is the only place user FPU state can change hands. With
+  // preemption landing at arbitrary user instructions, every register in
+  // here is live — no ABI carve-out applies. AVX (XSAVE) is a future
+  // upgrade; until then userspace must not use YMM+ state.
+  alignas(16) uint8_t fxsave_area[512];
 
   // --- user threads only (kernel threads leave these zeroed) ---
 

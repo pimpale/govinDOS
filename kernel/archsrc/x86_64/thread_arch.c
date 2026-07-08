@@ -38,6 +38,18 @@ static void uthread_reset_resume_frame(struct thread *t) {
   t->arch.kernel_rsp = (uint64_t)sp;
 }
 
+// Architectural reset state for a fresh thread's FPU: FCW = 0x037F (all
+// x87 exceptions masked, 64-bit precision), MXCSR = 0x1F80 (all SSE
+// exceptions masked), FTW = 0 (fxsave's abbreviated tag encoding: all
+// x87 registers empty), everything else zero. The first resume fxrstors
+// this instead of inheriting whatever the previously-running thread left
+// in the hardware.
+static void fxsave_area_init(uint8_t *area) {
+  memset(area, 0, 512);
+  *(uint16_t *)(area + 0) = 0x037F;  // FCW
+  *(uint32_t *)(area + 24) = 0x1F80; // MXCSR
+}
+
 void arch_thread_init_user(struct thread *t, uint64_t entry,
                            uint64_t user_stack_top, uint64_t arg) {
   memset(&t->arch.uframe, 0, sizeof(t->arch.uframe));
@@ -50,12 +62,18 @@ void arch_thread_init_user(struct thread *t, uint64_t entry,
   t->arch.uframe.rsp = user_stack_top;
   // IF=1 (ring 3 always runs with interrupts on), reserved bit 1.
   t->arch.uframe.rflags = 0x202;
-  t->arch.xsave_area = nullptr;
+  fxsave_area_init(t->arch.fxsave_area);
   uthread_reset_resume_frame(t);
 }
 
 void arch_uthread_save_frame(struct thread *t, const struct trap_frame *tf) {
   t->arch.uframe = *tf;
+  // The GPRs above plus the FPU/SSE registers are the thread's complete
+  // user state (the kernel, built -mgeneral-regs-only, cannot touch the
+  // latter, so saving here and restoring at resume is sufficient). With
+  // preemption this frame save can land mid-arbitrary-instruction-stream,
+  // so no register is dead by ABI convention — save them all.
+  __asm__ volatile("fxsave64 %0" : "=m"(t->arch.fxsave_area));
   uthread_reset_resume_frame(t);
 }
 
@@ -68,7 +86,8 @@ void arch_uthread_set_result(struct thread *t, uint64_t v) {
 // set IF from the saved user rflags, so drop the depth without sti.
 struct trap_frame *uthread_resume_prepare(struct thread *t) {
   irq_exit();
-  // Future: restore FSBASE from t->user_tls_base, XRSTOR t->arch.xsave_area.
+  __asm__ volatile("fxrstor64 %0" : : "m"(t->arch.fxsave_area));
+  // Future: restore FSBASE from t->user_tls_base.
   return &t->arch.uframe;
 }
 
@@ -84,8 +103,8 @@ struct trap_frame *uthread_resume_prepare(struct thread *t) {
 //     of which thread is current.
 //   - Update FSBASE for the user TLS pointer (only needed once userspace
 //     threads exist; t->user_tls_base will drive it).
-//   - Restore FPU/SSE/AVX state — left lazy until the FPU is actually
-//     touched by user code.
+//   - Restore FPU/SSE state — uthread_resume_prepare fxrstors it on the
+//     way back into ring 3, which is the only exit from here.
 void arch_thread_install(struct thread *t) {
   struct cpu_state *cs = &g_cpu_state_table[cpu_state_whoami()];
 

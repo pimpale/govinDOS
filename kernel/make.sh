@@ -54,7 +54,8 @@ assemble_bin() {
 # with the same toolchain as the kernel. -fixed:no keeps the .reloc
 # section: every process loads at a fresh address in the single AS, so
 # the kernel loader must be able to rebase. -mgeneral-regs-only because
-# the kernel doesn't preserve FPU/SSE state across switches yet.
+# the kernel preserves x87/SSE across switches (fxsave/fxrstor) but not
+# AVX — user code must stay off YMM+ state until XSAVE lands.
 build_userspace() {
   mkdir -p bin/userspace
   clang-22 \

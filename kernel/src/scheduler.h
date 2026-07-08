@@ -11,11 +11,23 @@
 #undef LIST_DTYPE
 
 // IDT vector for the cross-CPU reschedule IPI. Value is arbitrary as long
-// as it doesn't collide with any other installed vector (currently only
-// VECTOR_TLB_SHOOTDOWN=0xFD and the syscall 0x80 are claimed). The
+// as it doesn't collide with any other installed vector (currently
+// VECTOR_TLB_SHOOTDOWN=0xFD and VECTOR_PREEMPT=0xFB are the others). The
 // handler is a no-op + EOI; its only job is to wake a HLT'd CPU so its
 // scheduler loop iterates and picks up newly-enqueued work.
 #define VECTOR_RESCHED 0xFC
+
+// IDT vector for the per-CPU preemption timer (LAPIC one-shot). Armed by
+// the scheduler loop just before every dispatch, so each thread gets a
+// full quantum; disarmed on the idle path. Kernel code runs IRQs-off
+// (IA32_FMASK masks the whole syscall path), so the shot can only land
+// in ring 3 — or in the scheduler loop's own brief IF=1 windows, where
+// the handler treats it as spurious.
+#define VECTOR_PREEMPT 0xFB
+
+// Length of one dispatch quantum. A thread that neither parks nor blocks
+// for this long is preempted as if it had called SYS_YIELD.
+#define SCHED_QUANTUM_US 10000
 
 // Per-CPU scheduler state. Embedded by value in struct cpu_state, so
 // scheduler.h is included by cpu_state.h.

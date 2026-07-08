@@ -16,6 +16,16 @@
 #define LAPIC_REG_SVR 0x0F0 // spurious interrupt vector
 #define LAPIC_REG_ICR_LOW 0x300
 #define LAPIC_REG_ICR_HIGH 0x310
+#define LAPIC_REG_LVT_TIMER 0x320
+#define LAPIC_REG_TIMER_ICR 0x380 // initial count (write starts countdown)
+#define LAPIC_REG_TIMER_CCR 0x390 // current count (read-only)
+#define LAPIC_REG_TIMER_DCR 0x3E0 // divide configuration
+
+// LVT bit 16 masks delivery (the counter still counts). Timer mode lives
+// in LVT bits 17..18; 00 = one-shot, the only mode used here.
+#define LAPIC_LVT_MASKED (1u << 16)
+// Divide-by-1 encoding for the DCR (bits 0, 1 and 3 set).
+#define LAPIC_TIMER_DIV_1 0xBu
 
 // SVR bit 8 = APIC software enable. Must be set for the LAPIC to deliver
 // any interrupts (including IPIs). Spurious vector in bits 0..7 — pick
@@ -128,3 +138,74 @@ void x86_lapic_send_fixed(uint8_t apic_id, uint8_t vector) {
 }
 
 void x86_lapic_eoi(void) { lapic_write(LAPIC_REG_EOI, 0); }
+
+// ----- LAPIC timer -----------------------------------------------------------
+
+// APIC-timer ticks per millisecond, measured once on the BSP. The timer
+// clocks off the bus clock, which is shared by every CPU, so a single
+// global measurement serves all of them.
+static uint64_t g_lapic_timer_ticks_per_ms = 0;
+
+// PIT bits, used only during calibration (the PIT is otherwise unused —
+// its IRQ is never routed; everything below is polled).
+#define PIT_HZ 1193182u
+#define PIT_PORT_CH2_DATA 0x42
+#define PIT_PORT_CMD 0x43
+#define PIT_PORT_NMI_STS 0x61 // ch2 gate (bit 0), speaker (bit 1), out (bit 5)
+
+void x86_lapic_timer_calibrate(void) {
+  // Run the LAPIC counter against a 10 ms one-shot on PIT channel 2.
+  // Channel 2 is the only PIT channel whose gate and output are visible
+  // through port 0x61, so it can be polled with no interrupt wiring. In
+  // mode 0 the output sits low from the moment the count is loaded and
+  // goes high at terminal count. Bit 1 stays low: speaker disconnected.
+  const uint16_t pit_count = (uint16_t)(PIT_HZ / 100); // 10 ms
+  uint8_t gate = inb(PIT_PORT_NMI_STS) & ~0x03u;
+  outb(PIT_PORT_NMI_STS, gate); // gate low: loaded count holds
+  outb(PIT_PORT_CMD, 0xB0);     // ch2, lobyte/hibyte, mode 0, binary
+  outb(PIT_PORT_CH2_DATA, (uint8_t)pit_count);
+  outb(PIT_PORT_CH2_DATA, (uint8_t)(pit_count >> 8));
+
+  lapic_write(LAPIC_REG_TIMER_DCR, LAPIC_TIMER_DIV_1);
+  // Masked: we poll the count, no interrupt wanted.
+  lapic_write(LAPIC_REG_LVT_TIMER, LAPIC_LVT_MASKED);
+
+  outb(PIT_PORT_NMI_STS, gate | 0x01);           // gate high: PIT counts
+  lapic_write(LAPIC_REG_TIMER_ICR, 0xFFFFFFFFu); // LAPIC counts
+  while ((inb(PIT_PORT_NMI_STS) & 0x20) == 0) {
+    __asm__ volatile("pause");
+  }
+  uint32_t remaining = lapic_read(LAPIC_REG_TIMER_CCR);
+  lapic_write(LAPIC_REG_TIMER_ICR, 0); // stop
+  outb(PIT_PORT_NMI_STS, gate);        // gate back low
+
+  g_lapic_timer_ticks_per_ms = (0xFFFFFFFFu - (uint64_t)remaining) / 10;
+  asserts(g_lapic_timer_ticks_per_ms > 0, "lapic: timer calibration failed");
+  printf("lapic: timer calibrated, %llu ticks/ms\n",
+         g_lapic_timer_ticks_per_ms);
+}
+
+void x86_lapic_timer_arm_oneshot(uint8_t vector, uint64_t us) {
+  asserts(g_lapic_timer_ticks_per_ms > 0, "lapic: timer not calibrated");
+  uint64_t ticks = g_lapic_timer_ticks_per_ms * us / 1000;
+  if (ticks == 0) {
+    ticks = 1;
+  }
+  if (ticks > 0xFFFFFFFFu) {
+    ticks = 0xFFFFFFFFu;
+  }
+  lapic_write(LAPIC_REG_TIMER_DCR, LAPIC_TIMER_DIV_1);
+  lapic_write(LAPIC_REG_LVT_TIMER, vector); // one-shot, unmasked
+  // Writing the initial count (re)starts the countdown, replacing any
+  // pending shot — the per-dispatch re-arm relies on exactly that.
+  lapic_write(LAPIC_REG_TIMER_ICR, (uint32_t)ticks);
+}
+
+void x86_lapic_timer_stop(void) {
+  // Initial count 0 stops the countdown. Masking the LVT on top guards
+  // the window where the count reached zero but delivery hasn't happened;
+  // a shot already accepted into the IRR still lands and must be treated
+  // as spurious by its handler.
+  lapic_write(LAPIC_REG_TIMER_ICR, 0);
+  lapic_write(LAPIC_REG_LVT_TIMER, LAPIC_LVT_MASKED);
+}

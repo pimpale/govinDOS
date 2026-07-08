@@ -16,3 +16,11 @@ void scheduler_arch_wake_cpu(uint64_t hw_id) {
     // wider; callers above 0xFF won't be reachable on legacy APIC.
     x86_lapic_send_fixed((uint8_t)hw_id, VECTOR_RESCHED);
 }
+
+void scheduler_arch_preempt_arm(uint64_t us) {
+    x86_lapic_timer_arm_oneshot(VECTOR_PREEMPT, us);
+}
+
+void scheduler_arch_preempt_disarm(void) {
+    x86_lapic_timer_stop();
+}

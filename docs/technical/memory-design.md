@@ -123,9 +123,9 @@ dying ASes off CPUs naturally — and is what makes guard scoping sound: RSP
 may only point into a kthread stack while `g_as_kernel` is current.
 `arch_thread_install` (CR3 switch) already runs before `switch_context` moves
 RSP onto the kthread stack, and the symmetric path back lands on the per-CPU
-scheduler stack first. Planned preemption preserves it: a timer IRQ during a
-kthread stays on that stack with `g_as_kernel` current; during user code it
-takes the per-CPU stack. Assert it cheaply at kthread dispatch:
+scheduler stack first. Preemption (implemented 2026-07-08) preserves it: the
+quantum timer can only fire in ring 3 (the kernel runs IRQs-off), and its
+handler takes the per-CPU interrupt stack like any other ring-3 entry. Assert it cheaply at kthread dispatch:
 `g_cpu_state_table[me].current_as == g_as_kernel` — if this rule is ever
 violated, stack-overflow detection silently disappears, so it must be loud.
 

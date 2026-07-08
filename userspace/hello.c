@@ -11,10 +11,11 @@
 // exercised from this side.
 //
 // Freestanding: no libc, no imports (the loader rejects import tables).
-// Built with -mgeneral-regs-only — the kernel does not save FPU/SSE
-// state across context switches yet. Child code must not write globals:
-// its view of the image is read-execute (per-view W^X), so it works in
-// stack locals only.
+// Built with -mgeneral-regs-only — the kernel preserves x87/SSE across
+// switches (fxsave at park, fxrstor at resume) but not AVX, so YMM+
+// state must stay unused. Child code must not write globals: its view
+// of the image is read-execute (per-view W^X), so it works in stack
+// locals only.
 
 #include <stdint.h>
 
@@ -272,6 +273,20 @@ static void child_spin_main(uint64_t arg) {
   }
 }
 
+// First thread of the preemption-test child: burns CPU in ring 3 and
+// never enters the kernel again. Only the quantum timer can pull it in,
+// so killing AND reaping it proves preemption end to end — the reap
+// needs the thread culled at a kernel entry and the AS drained off its
+// CPU, neither of which can happen while it sits in ring 3.
+static void child_burn_main(uint64_t arg) {
+  (void)arg;
+  print("burner: spinning in ring 3, no more syscalls\n");
+  volatile uint64_t sink = 0;
+  while (1) {
+    sink++;
+  }
+}
+
 // Build a child process the parent-driven way and return its pid.
 // entry runs on our shared image; boot_ch (may be 0) is its argument.
 static uint64_t spawn_child(void (*entry)(uint64_t), uint64_t boot_ch) {
@@ -431,7 +446,7 @@ static void test_wait_group(uint64_t tch, uint32_t *tree_seen) {
   for (uint64_t i = 0; i <= sizeof(hello2) - 1; i++) {
     msg[i] = hello2[i];
   }
-  uint64_t c3 = spawn_child(child_main, boot_ch);
+  uint64_t c4 = spawn_child(child_main, boot_ch);
   group_submit(g, &g_sq, KGROUP_ADD, boot_ch, 0xC0FFEE);
 
   __atomic_store_n(req, 1, __ATOMIC_RELEASE);
@@ -456,7 +471,7 @@ static void test_wait_group(uint64_t tch, uint32_t *tree_seen) {
   // channel: KEV_READY{7EE} in the group, KEV_CHILD_DEAD underneath.
   group_await(g, &g_seen, KEV_READY_LO, 0x7EE);
   await_child_death(tch, tree_seen);
-  reap_child(c3);
+  reap_child(c4);
 
   // DEL the tree registration and drop the group; the tree channel is
   // directly parkable again (which _start relies on).
@@ -523,7 +538,20 @@ static void test_process_tree(uint64_t tch, uint32_t *tree_seen_out) {
   print("init: kill self rc=");
   print_hex(sys1(SYS_PROC_KILL, sys0(SYS_GETPID)));
 
-  // --- Child 3: multiplex through a wait-group --------------------------
+  // --- Child 3: kill a CPU-bound process (preemption test) --------------
+  // The burner never syscalls, so before timer preemption this could
+  // never terminate: the victim would spin in ring 3 forever, its thread
+  // never culled and its AS pinned on whatever CPU ran it.
+  uint64_t c3 = spawn_child(child_burn_main, 0);
+  for (int i = 0; i < 64; i++) {
+    sys0(SYS_YIELD); // let the burner get dispatched somewhere
+  }
+  print("init: proc_kill(burner) rc=");
+  print_hex(sys1(SYS_PROC_KILL, c3));
+  await_child_death(tch, &tree_seen);
+  reap_child(c3);
+
+  // --- Child 4: multiplex through a wait-group --------------------------
   test_wait_group(tch, &tree_seen);
 
   *tree_seen_out = tree_seen;

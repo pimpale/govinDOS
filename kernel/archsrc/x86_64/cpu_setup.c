@@ -36,6 +36,24 @@ static void enable_nxe(void) {
   wrmsr64(IA32_EFER, rdmsr64(IA32_EFER) | (1u << 11));
 }
 
+static void enable_sse(void) {
+  // FPU/SSE for userspace (the kernel itself is -mgeneral-regs-only and
+  // never executes SIMD; fxsave64/fxrstor64 at thread park/resume are the
+  // only FPU touches). CR0: MP set, EM/TS clear — a real FPU, and no
+  // lazy-switch #NM traps, since the park/resume save is eager. CR4:
+  // OSFXSR enables fxsave/fxrstor and unmasks SSE instructions;
+  // OSXMMEXCPT makes an unmasked SSE exception #XM instead of #UD.
+  // UEFI x64 already runs with SSE on, but we own these registers now.
+  uint64_t cr0, cr4;
+  __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
+  cr0 |= 1u << 1;                       // MP
+  cr0 &= ~((1u << 2) | (1u << 3));      // ~EM, ~TS
+  __asm__ volatile("mov %0, %%cr0" : : "r"(cr0));
+  __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
+  cr4 |= (1u << 9) | (1u << 10);        // OSFXSR, OSXMMEXCPT
+  __asm__ volatile("mov %0, %%cr4" : : "r"(cr4));
+}
+
 // SYSCALL entry point, interrupts.asm.
 extern void syscall_entry_stub(void);
 
@@ -129,6 +147,13 @@ void cpu_setup_bsp(const struct acpi_rsdp *rsdp) {
 
   // prepare the idt vector to be loaded
   interrupts_fill_idt();
+
+  // Calibrate the LAPIC timer (preemption quanta) before any AP can
+  // reach its scheduler loop and arm it. Needs the BSP's LAPIC
+  // software-enabled first; cpu_setup() re-enables it later along with
+  // every other CPU's, which is idempotent.
+  x86_lapic_enable();
+  x86_lapic_timer_calibrate();
 }
 
 void cpu_setup() {
@@ -141,6 +166,10 @@ void cpu_setup() {
 
   // 0. enable nxe (we don't use this yet but we will ig)
   enable_nxe();
+
+  // 0.25. FPU/SSE control bits (user threads own the FPU; preemption
+  //       means their SIMD state is live at any instruction boundary).
+  enable_sse();
 
   // 0.5. SYSCALL/SYSRET (the only syscall path — there is no int gate).
   enable_syscall(this_cpu_state);

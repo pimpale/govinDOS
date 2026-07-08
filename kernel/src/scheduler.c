@@ -107,6 +107,12 @@ void scheduler_enqueue(struct thread *t) {
         as_switch(g_as_kernel);
       }
 
+      // No thread, no quantum: a one-shot left over from a thread that
+      // parked before its quantum expired must not wake the hlt below.
+      // (A shot already accepted by the CPU can still land; its handler
+      // no-ops in kernel mode, a harmless spurious wake.)
+      scheduler_arch_preempt_disarm();
+
       // Balance the top-of-iteration irq_disable: hlt needs IRQs on to
       // wake from anything.
       irq_enable();
@@ -124,6 +130,13 @@ void scheduler_enqueue(struct thread *t) {
       scheduler->current_thread = next;
       arch_thread_install(next);
       spinlock_unlock(&scheduler->lock);
+
+      // Fresh full quantum for every dispatch (re-arming replaces any
+      // earlier shot). IRQs are off from here until the thread's iretq
+      // sets IF from its saved ring-3 rflags, so the shot can only land
+      // in user code — kernel paths stay unpreempted, which is what
+      // keeps the single-kernel-stack-per-CPU model sound.
+      scheduler_arch_preempt_arm(SCHED_QUANTUM_US);
 
       // Hand control to next thread with IRQs still off (depth=1 from
       // the top-of-iteration irq_disable). The thread side balances its
