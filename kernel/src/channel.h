@@ -20,64 +20,11 @@
 // kchan endpoint per kernel channel — all guarded by the umem lock, all
 // torn down by the umem revoke path (channel_block_torn).
 
-// ---------------------------------------------------------------------------
-// Kernel ring ABI (kernel channels only)
-// ---------------------------------------------------------------------------
-//
-// Header at offset 0, then sq[nslots], then cq[nslots], all 32-byte
-// entries; nslots = 32 << block order. The kernel keeps authoritative
-// indices in the kchan endpoint and never trusts the in-block copies:
-// cq_count/sq_head are mirrors it writes for the user's convenience, and
-// the user-owned sq_tail/cq_head are read once per doorbell/post and
-// bounds-checked. All indices are monotonic u32, masked on use.
-//
-// cq_head (user-owned, CQEs consumed) is what makes level-state replay
-// work: the kernel only posts into free slots (cq_count - cq_head <
-// nslots), and a doorbell after consuming is the ack that lets pending
-// events (unnotified share edges, dead children) replay into the freed
-// slots. A lying cq_head only ever starves the liar's own channel.
-
-struct kring_hdr {
-  _Atomic uint32_t cq_count; // kernel-owned mirror: CQEs posted
-  _Atomic uint32_t cq_head;  // user-owned: CQEs consumed
-  _Atomic uint32_t sq_head;  // kernel-owned mirror: SQEs consumed
-  _Atomic uint32_t sq_tail;  // user-owned: SQEs published
-  uint32_t nslots;           // kernel-written at creation; sq and cq size
-  uint8_t pad[64 - 20];
-};
-
-struct ksqe {
-  uint64_t op;
-  uint64_t a, b, c;
-};
-
-struct kcqe {
-  uint64_t type; // completion: the SQE's op; event: KEV_*
-  uint64_t a, b;
-  uint64_t status; // 0 or SYSERR_*
-};
-
-static_assert(sizeof(struct kring_hdr) == 64, "kring ABI: header size");
-static_assert(sizeof(struct ksqe) == 32, "kring ABI: sqe size");
-static_assert(sizeof(struct kcqe) == 32, "kring ABI: cqe size");
-
-#define KRING_HDR_SIZE 64
-#define KRING_NSLOTS(order) (32u << (order))
-
-// Scheme ids (the negative target space of SYS_VM_SHARE).
-#define KSCHEME_SHARES ((int64_t)-1) // one per process; where shares announce
-#define KSCHEME_GROUPS ((int64_t)-2) // wait-groups (many per process)
-#define KSCHEME_TREE   ((int64_t)-3) // one per process; child-death events
-
-// Event CQE types (top bit set to keep them disjoint from SQE ops).
-#define KEV_SHARE      (1ull << 63 | 1) // a = sharer pid, b = base | order
-#define KEV_CHILD_DEAD (1ull << 63 | 2) // a = dead child pid
-#define KEV_READY      (1ull << 63 | 3) // a = cookie (wait-groups)
-#define KEV_DEAD       (1ull << 63 | 4) // a = cookie (wait-groups)
-
-// Wait-group SQE ops (scheme -2).
-#define KGROUP_ADD 1 // a = channel base, b = cookie
-#define KGROUP_DEL 2 // a = channel base
+// The kernel ring ABI — kring_hdr/ksqe/kcqe layout, scheme ids, KEV_*
+// event types, KGROUP_* ops — lives in the shared ABI header
+// (abi/gdos/kring.h, the kernel↔userspace contract). This header adds
+// the kernel-side endpoint state and entry points.
+#include <gdos/kring.h>
 
 // A wait-group registration: a channel side's waiter slot, occupied by a
 // group instead of a parked thread (registered XOR parked). The two-bit

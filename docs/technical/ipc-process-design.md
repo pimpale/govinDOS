@@ -14,7 +14,9 @@ Implementation map: `channel.c/h` (channels, kernel ring ABI, schemes,
 waiter slots, wait-groups), `process.c/h` (tree, embryo, kill, zombies,
 reap steps), `umem.c/h` (share edges, revoke authority, VM_MOVE
 mechanics, live-pid index), `syscall.c/h` (dispatch; SYSCALL/SYSRET),
-`userspace/hello.c` (init + the ring-3 test suite for all of it).
+`userspace/bin/tests/tests.c` (the ring-3 test suite for all of it —
+formerly hello.c, which doubled as init until the boot-init design split
+the roles; see [boot-init-design.md](boot-init-design.md)).
 
 ## 0. Decisions log
 

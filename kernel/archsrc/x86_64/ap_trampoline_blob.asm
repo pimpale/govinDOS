@@ -7,5 +7,5 @@
 [GLOBAL ap_trampoline_blob_end]
 
 ap_trampoline_blob:
-        incbin "bin/archsrc/x86_64/blobs/ap_trampoline.asm.bin"
+        incbin "out/archsrc/x86_64/blobs/ap_trampoline.asm.bin"
 ap_trampoline_blob_end:

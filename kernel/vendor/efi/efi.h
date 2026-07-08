@@ -127,7 +127,9 @@ struct efi_boot_services {
   // Library Services (UEFI 1.1+)
   void *protocols_per_handle;
   void *locate_handle_buffer;
-  void *locate_protocol;
+  efi_status_t (EFIAPI *locate_protocol)(struct efi_guid *protocol,
+                                         void *registration,
+                                         void **interface);
   void *install_multiple_protocol_interfaces;
   void *uninstall_multiple_protocol_interfaces;
 

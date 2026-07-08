@@ -1,5 +1,5 @@
 compile_commands.json
-bin/
+out/
 tmp/
 obj/
 build/

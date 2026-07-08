@@ -1,14 +1,17 @@
-// init + ring-3 test suite for govindos, compiled to PE with the same
-// clang/lld-link toolchain as the kernel and loaded by the kernel's
-// boot-only loader (kernel/src/pe.c) as the root of the process tree.
+// The ring-3 test suite for govindos, shipped in the initfs and spawned
+// by init through the userland PE loader (lib/upe.c) as a real separate
+// process — which makes every boot regression-test that loader too.
+// Descended from the original hello.c, which doubled as init and the
+// suite until the boot-init design split the roles
+// (docs/technical/boot-init-design.md §0).
 //
-// Everything below init is built here, parent-driven, the way real
-// userspace will do it (ipc-process-design.md §5): PROC_CREATE an
-// embryo, VM_MOVE it a stack, VM_SHARE it this very image read-execute
-// (SASOS: the child runs the same code at the same addresses), pre-seed
-// a bootstrap channel, THREAD_SPAWN its first thread. Children exercise
-// the channel data plane from the far side; kill/reap/tree-events are
-// exercised from this side.
+// Children below are built here, parent-driven, the way real userspace
+// does it (ipc-process-design.md §5): PROC_CREATE an embryo, VM_MOVE it
+// a stack, VM_SHARE it this very image read-execute (SASOS: the child
+// runs the same code at the same addresses), pre-seed a bootstrap
+// channel, THREAD_SPAWN its first thread. Children exercise the channel
+// data plane from the far side; kill/reap/tree-events are exercised from
+// this side.
 //
 // Freestanding: no libc, no imports (the loader rejects import tables).
 // Built with -mgeneral-regs-only — the kernel preserves x87/SSE across
@@ -19,107 +22,7 @@
 
 #include <stdint.h>
 
-#define SYS_DEBUG_WRITE 0
-#define SYS_EXIT 1
-#define SYS_YIELD 2
-#define SYS_GETUID 3
-#define SYS_GETPID 4
-#define SYS_VM_MAP 5
-#define SYS_VM_UNMAP 6
-#define SYS_VM_PROTECT 7
-#define SYS_VM_SHARE 8
-#define SYS_VM_UNSHARE 9
-#define SYS_VM_MOVE 10
-#define SYS_BLOCK_DOORBELL 11
-#define SYS_BLOCK_WAIT 12
-#define SYS_PROC_CREATE 13
-#define SYS_THREAD_SPAWN 14
-#define SYS_PROC_KILL 15
-#define SYS_PROC_REAP 16
-
-#define VM_PROT_READ 1
-#define VM_PROT_WRITE 2
-#define VM_PROT_EXEC 4
-
-#define REAP_DONE 0
-#define REAP_MORE 1
-#define SYSERR_DEAD ((uint64_t)-7)
-#define SYSERR_AGAIN ((uint64_t)-8)
-
-// Kernel ring ABI (mirror of kernel/src/channel.h). Header at 0, then
-// sq[nslots], then cq[nslots]; 32-byte entries; nslots = 32 << order.
-#define KRING_HDR_SIZE 64
-#define KRING_CQ_COUNT_OFF 0
-#define KRING_CQ_HEAD_OFF 4
-#define KRING_SQ_TAIL_OFF 12
-#define KEV_SHARE_LO 1 // low bits; the type is (1<<63)|n
-#define KEV_CHILD_DEAD_LO 2
-#define KEV_READY_LO 3
-#define KEV_DEAD_LO 4
-#define KSCHEME_SHARES ((uint64_t)-1)
-#define KSCHEME_GROUPS ((uint64_t)-2)
-#define KSCHEME_TREE ((uint64_t)-3)
-#define KGROUP_ADD 1
-#define KGROUP_DEL 2
-
-struct ksqe {
-  uint64_t op;
-  uint64_t a, b, c;
-};
-
-struct kcqe {
-  uint64_t type;
-  uint64_t a, b;
-  uint64_t status;
-};
-
-// SYSCALL ABI: rax = nr, args in r10/rdx/r8/r9, result in rax. rcx and
-// r11 are clobbered by the instruction itself (return rip/rflags); the
-// kernel preserves every other register.
-static inline uint64_t sys4(uint64_t nr, uint64_t a0, uint64_t a1,
-                            uint64_t a2, uint64_t a3) {
-  uint64_t ret;
-  register uint64_t r10 __asm__("r10") = a0;
-  register uint64_t rdx __asm__("rdx") = a1;
-  register uint64_t r8 __asm__("r8") = a2;
-  register uint64_t r9 __asm__("r9") = a3;
-  __asm__ volatile("syscall"
-                   : "=a"(ret), "+r"(r10), "+r"(rdx), "+r"(r8), "+r"(r9)
-                   : "a"(nr)
-                   : "rcx", "r11", "memory");
-  return ret;
-}
-
-static inline uint64_t sys3(uint64_t nr, uint64_t a0, uint64_t a1,
-                            uint64_t a2) {
-  return sys4(nr, a0, a1, a2, 0);
-}
-static inline uint64_t sys2(uint64_t nr, uint64_t a0, uint64_t a1) {
-  return sys3(nr, a0, a1, 0);
-}
-static inline uint64_t sys1(uint64_t nr, uint64_t a0) { return sys2(nr, a0, 0); }
-static inline uint64_t sys0(uint64_t nr) { return sys2(nr, 0, 0); }
-
-static uint64_t str_len(const char *s) {
-  uint64_t len = 0;
-  while (s[len] != '\0') {
-    len++;
-  }
-  return len;
-}
-
-static void print(const char *s) { sys2(SYS_DEBUG_WRITE, (uint64_t)s, str_len(s)); }
-
-static void print_hex(uint64_t v) {
-  char buf[17];
-  for (int i = 15; i >= 0; i--) {
-    uint64_t d = v & 0xF;
-    buf[i] = (char)(d < 10 ? '0' + d : 'a' + d - 10);
-    v >>= 4;
-  }
-  buf[16] = '\n';
-  sys2(SYS_DEBUG_WRITE, (uint64_t)buf, 17);
-}
+#include "usys.h"
 
 // Absolute addresses baked into .data at link time: these force DIR64
 // base relocations that the compiler cannot fold into rip-relative
@@ -129,11 +32,6 @@ typedef void (*printer_t)(const char *);
 static volatile printer_t g_reloc_fn = print;
 static const char g_reloc_probe[] = "pe: relocated fn ptr + string work\n";
 static const char *volatile g_reloc_str = g_reloc_probe;
-
-// The image's load address == the base of the ublock the loader put it
-// in (pe.c allocates the block and copies to its base), so this is what
-// VM_SHARE wants. lld-link provides the pseudo-symbol.
-extern char __ImageBase;
 
 static void test_memory(void) {
   // Map two pages RW, print through them, unmap.
@@ -145,8 +43,8 @@ static void test_memory(void) {
   const char *msg2 = "pe: printing from a read-only page\n";
   char *pg = (char *)base;
   char *pg2 = (char *)(base + 4096);
-  uint64_t len = str_len(msg);
-  uint64_t len2 = str_len(msg2);
+  uint64_t len = strlen(msg);
+  uint64_t len2 = strlen(msg2);
   for (uint64_t i = 0; i < len; i++) {
     pg[i] = msg[i];
   }
@@ -215,7 +113,7 @@ static void test_memory(void) {
 // shares channel replays the pre-spawn seed share, the data plane works
 // both ways, and revocation wakes a parked waiter with SYSERR_DEAD.
 static void child_main(uint64_t boot_ch) {
-  print("child: hello (spawned by init)\n");
+  print("child: hello (spawned by tests)\n");
 
   // Create a shares channel; the bootstrap block was shared to us while
   // we were still an embryo, so its KEV_SHARE must replay right here.
@@ -232,7 +130,7 @@ static void child_main(uint64_t boot_ch) {
   uint64_t seen = __atomic_load_n(cq_count, __ATOMIC_ACQUIRE);
   uint64_t found = 0;
   for (uint64_t i = 0; i < seen; i++) {
-    if ((cq[i].type & 0xFF) == KEV_SHARE_LO &&
+    if ((cq[i].type & 0xFF) == KEV_LO(KEV_SHARE) &&
         (cq[i].b & ~0xFFFull) == boot_ch) {
       found = 1;
     }
@@ -291,33 +189,33 @@ static void child_burn_main(uint64_t arg) {
 // entry runs on our shared image; boot_ch (may be 0) is its argument.
 static uint64_t spawn_child(void (*entry)(uint64_t), uint64_t boot_ch) {
   uint64_t pid = sys0(SYS_PROC_CREATE);
-  print("init: proc_create pid=");
+  print("tests: proc_create pid=");
   print_hex(pid);
 
   // Stack: built here, ownership transferred into the embryo.
   uint64_t stack = sys2(SYS_VM_MAP, 4096, VM_PROT_READ | VM_PROT_WRITE);
-  print("init: vm_move(stack) rc=");
+  print("tests: vm_move(stack) rc=");
   print_hex(sys2(SYS_VM_MOVE, stack, pid));
   // The mover keeps no view: reading through it must now fail.
-  print("init: debug_write through moved stack rc=");
+  print("tests: debug_write through moved stack rc=");
   print_hex(sys2(SYS_DEBUG_WRITE, stack, 8));
 
   // Code: share our own image read-execute. SASOS means the child sees
   // it at the same address, so `entry` is valid over there too.
-  print("init: vm_share(image, RX) rc=");
+  print("tests: vm_share(image, RX) rc=");
   print_hex(sys3(SYS_VM_SHARE, (uint64_t)&__ImageBase, pid,
                  VM_PROT_READ | VM_PROT_EXEC));
 
   if (boot_ch != 0) {
     // Pre-seed the bootstrap channel while the child is an embryo — the
     // seL4/Xen answer to how strangers ever get introduced.
-    print("init: vm_share(boot_ch) rc=");
+    print("tests: vm_share(boot_ch) rc=");
     print_hex(sys3(SYS_VM_SHARE, boot_ch, pid, VM_PROT_READ | VM_PROT_WRITE));
   }
 
   uint64_t tid =
       sys4(SYS_THREAD_SPAWN, pid, (uint64_t)entry, stack + 4096, boot_ch);
-  print("init: thread_spawn tid=");
+  print("tests: thread_spawn tid=");
   print_hex(tid);
   return pid;
 }
@@ -336,13 +234,13 @@ static void reap_child(uint64_t pid) {
       continue;
     }
     if (rc != REAP_MORE) {
-      print("init: REAP FAILED rc=");
+      print("tests: REAP FAILED rc=");
       print_hex(rc);
       return;
     }
     steps++;
   }
-  print("init: reaped in bounded steps=");
+  print("tests: reaped in bounded steps=");
   print_hex(steps);
 }
 
@@ -356,8 +254,8 @@ static void await_child_death(uint64_t tch, uint32_t *seen) {
   while (__atomic_load_n(cq_count, __ATOMIC_ACQUIRE) == *seen) {
     sys0(SYS_YIELD);
   }
-  uint64_t ok = (cq[*seen & 31].type & 0xFF) == KEV_CHILD_DEAD_LO;
-  print(ok ? "init: KEV_CHILD_DEAD pid=" : "init: BAD TREE EVENT pid=");
+  uint64_t ok = (cq[*seen & 31].type & 0xFF) == KEV_LO(KEV_CHILD_DEAD);
+  print(ok ? "tests: KEV_CHILD_DEAD pid=" : "tests: BAD TREE EVENT pid=");
   print_hex(cq[*seen & 31].a);
   (*seen)++;
   __atomic_store_n(cq_head, *seen, __ATOMIC_RELEASE);
@@ -384,7 +282,10 @@ static void group_submit(uint64_t g, uint32_t *sq_tail_shadow, uint64_t op,
 
 // Wait until an event with this low type (and, unless 0, this cookie in
 // `a`) shows up in the group's CQ, consuming and printing everything on
-// the way. Consumption is acked with a doorbell so level state replays.
+// the way — but nothing past the hit: two awaited events can land in
+// one batch (scheduling-dependent), and an event consumed while hunting
+// a different one would be lost to the next await. Consumption is acked
+// with a doorbell so level state replays.
 static void group_await(uint64_t g, uint32_t *seen, uint64_t type_lo,
                         uint64_t cookie) {
   volatile uint32_t *cq_count = (volatile uint32_t *)(g + KRING_CQ_COUNT_OFF);
@@ -398,18 +299,18 @@ static void group_await(uint64_t g, uint32_t *seen, uint64_t type_lo,
     }
     uint32_t avail = __atomic_load_n(cq_count, __ATOMIC_ACQUIRE);
     uint64_t hit = 0;
-    while (*seen != avail) {
+    while (*seen != avail && !hit) {
       uint64_t t = cq[*seen & 31].type;
       uint64_t a = cq[*seen & 31].a;
       (*seen)++;
       if (t >> 63) {
-        print("init(group): event lo=");
+        print("tests(group): event lo=");
         print_hex(((t & 0xFF) << 32) | (a & 0xFFFFFFFF));
         if ((t & 0xFF) == type_lo && (cookie == 0 || a == cookie)) {
           hit = 1;
         }
       } else {
-        print("init(group): completion op=");
+        print("tests(group): completion op=");
         print_hex((t << 32) | (cq[(*seen - 1) & 31].status & 0xFFFFFFFF));
       }
     }
@@ -425,7 +326,7 @@ static void group_await(uint64_t g, uint32_t *seen, uint64_t type_lo,
 // registered kernel channel (the tree channel), and revocation.
 static void test_wait_group(uint64_t tch, uint32_t *tree_seen) {
   uint64_t g = sys2(SYS_VM_MAP, 4096, VM_PROT_READ | VM_PROT_WRITE);
-  print("init: vm_share(g, -2) rc=");
+  print("tests: vm_share(g, -2) rc=");
   print_hex(sys3(SYS_VM_SHARE, g, KSCHEME_GROUPS, 0));
   uint32_t g_seen = 0;
   uint32_t g_sq = 0;
@@ -453,30 +354,30 @@ static void test_wait_group(uint64_t tch, uint32_t *tree_seen) {
   sys1(SYS_BLOCK_DOORBELL, boot_ch);
 
   // The child's reply doorbell lands as KEV_READY{C0FFEE} in the group.
-  group_await(g, &g_seen, KEV_READY_LO, 0xC0FFEE);
+  group_await(g, &g_seen, KEV_LO(KEV_READY), 0xC0FFEE);
   print(__atomic_load_n(resp, __ATOMIC_ACQUIRE) == 1
-            ? "init: group heard the reply doorbell ok\n"
-            : "init: GROUP WOKE WITHOUT RESPONSE\n");
+            ? "tests: group heard the reply doorbell ok\n"
+            : "tests: GROUP WOKE WITHOUT RESPONSE\n");
 
   // Let the child park again, then revoke the channel: the registration
   // must turn into KEV_DEAD{C0FFEE} (POLLHUP, auto-removed)...
   for (int i = 0; i < 64; i++) {
     sys0(SYS_YIELD);
   }
-  print("init: vm_unmap(boot_ch) rc=");
+  print("tests: vm_unmap(boot_ch) rc=");
   print_hex(sys2(SYS_VM_UNMAP, boot_ch, 4096));
-  group_await(g, &g_seen, KEV_DEAD_LO, 0xC0FFEE);
+  group_await(g, &g_seen, KEV_LO(KEV_DEAD), 0xC0FFEE);
 
   // ...and the child's death reaches us through the registered tree
   // channel: KEV_READY{7EE} in the group, KEV_CHILD_DEAD underneath.
-  group_await(g, &g_seen, KEV_READY_LO, 0x7EE);
+  group_await(g, &g_seen, KEV_LO(KEV_READY), 0x7EE);
   await_child_death(tch, tree_seen);
   reap_child(c4);
 
   // DEL the tree registration and drop the group; the tree channel is
   // directly parkable again (which _start relies on).
   group_submit(g, &g_sq, KGROUP_DEL, tch, 0);
-  print("init: vm_unmap(group) rc=");
+  print("tests: vm_unmap(group) rc=");
   print_hex(sys2(SYS_VM_UNMAP, g, 4096));
 }
 
@@ -502,7 +403,7 @@ static void test_process_tree(uint64_t tch, uint32_t *tree_seen_out) {
   while (__atomic_load_n(resp, __ATOMIC_ACQUIRE) == 0) {
     sys0(SYS_YIELD);
   }
-  print("init: child served: ");
+  print("tests: child served: ");
   uint64_t mlen = 0;
   while (mlen < CH_MSG_MAX && msg[mlen] != '\0') {
     mlen++;
@@ -517,25 +418,25 @@ static void test_process_tree(uint64_t tch, uint32_t *tree_seen_out) {
   }
   // ... then free the channel block: the child wakes SYSERR_DEAD and
   // exits; its death shows up on our tree channel; then we reap it.
-  print("init: vm_unmap(boot_ch) rc=");
+  print("tests: vm_unmap(boot_ch) rc=");
   print_hex(sys2(SYS_VM_UNMAP, boot_ch, 4096));
   await_child_death(tch, &tree_seen);
   reap_child(c1);
 
   // A reaped pid is gone for good (never reused): all verbs refuse it.
-  print("init: reap of reaped pid rc=");
+  print("tests: reap of reaped pid rc=");
   print_hex(sys1(SYS_PROC_REAP, c1));
 
   // --- Child 2: kill a running process ----------------------------------
   uint64_t c2 = spawn_child(child_spin_main, 0);
   sys0(SYS_YIELD); // let the victim actually run
-  print("init: proc_kill rc=");
+  print("tests: proc_kill rc=");
   print_hex(sys1(SYS_PROC_KILL, c2));
   await_child_death(tch, &tree_seen);
   reap_child(c2);
 
   // Kill authority: only descendants (not self, not strangers).
-  print("init: kill self rc=");
+  print("tests: kill self rc=");
   print_hex(sys1(SYS_PROC_KILL, sys0(SYS_GETPID)));
 
   // --- Child 3: kill a CPU-bound process (preemption test) --------------
@@ -546,7 +447,7 @@ static void test_process_tree(uint64_t tch, uint32_t *tree_seen_out) {
   for (int i = 0; i < 64; i++) {
     sys0(SYS_YIELD); // let the burner get dispatched somewhere
   }
-  print("init: proc_kill(burner) rc=");
+  print("tests: proc_kill(burner) rc=");
   print_hex(sys1(SYS_PROC_KILL, c3));
   await_child_death(tch, &tree_seen);
   reap_child(c3);
@@ -559,34 +460,31 @@ static void test_process_tree(uint64_t tch, uint32_t *tree_seen_out) {
 
 void _start(uint64_t arg) {
   (void)arg;
-  print("init: hello from the root of the process tree!\n");
+  print("tests: hello from the ring-3 suite (a real process, not init)\n");
+  // If the userland loader (lib/upe.c) relocated us wrong, this jumps
+  // into the weeds right here.
   g_reloc_fn(g_reloc_str);
 
-  print("init: pid=");
+  print("tests: pid=");
   print_hex(sys0(SYS_GETPID));
-  print("init: uid=");
+  print("tests: uid=");
   print_hex(sys0(SYS_GETUID));
 
   sys0(SYS_YIELD);
-  print("init: back from yield\n");
+  print("tests: back from yield\n");
 
   test_memory();
 
-  // Tree channel: children's deaths arrive here, and it doubles as
-  // init's forever-park spot at the end (a kernel channel is always
-  // waitable — no peer needs to stay alive).
+  // Tree channel: our children's deaths arrive here (we are a mid-tree
+  // process now — init watches for OUR death the same way).
   uint64_t tch = sys2(SYS_VM_MAP, 4096, VM_PROT_READ | VM_PROT_WRITE);
-  print("init: vm_share(tch, -3) rc=");
+  print("tests: vm_share(tch, -3) rc=");
   print_hex(sys3(SYS_VM_SHARE, tch, KSCHEME_TREE, 0));
   uint32_t tree_seen = 0;
   test_process_tree(tch, &tree_seen);
 
-  print("init: all tests done\n");
-  // init must never exit (that's a kernel panic). Nothing left to do:
-  // park on the tree channel; no child remains, so nothing ever posts.
-  volatile uint32_t *tree_count = (volatile uint32_t *)(tch + KRING_CQ_COUNT_OFF);
-  while (1) {
-    sys2(SYS_BLOCK_WAIT, (uint64_t)tree_count, tree_seen);
-    sys0(SYS_YIELD);
-  }
+  print("tests: all tests done\n");
+  // Unlike the old hello.c-as-init, this process may exit: init reaps
+  // us, which frees our image, stack, and the tree-channel block.
+  sys0(SYS_EXIT);
 }

@@ -6,6 +6,7 @@
 #include "cpu_hwid.h"
 #include "cpu_setup.h"
 #include "debug.h"
+#include "espfile.h"
 #include "get_mmap.h"
 #include "paging.h"
 #include "pe.h"
@@ -22,7 +23,9 @@
 #include "umem.h"
 
 #include <efi/efi.h>
+#include <efi/graphics_output_protocol.h>
 #include <efi/types.h>
+#include <gdos/bootinfo.h>
 
 #define AP_TRAMPOLINE_BASE 0x8000
 
@@ -236,26 +239,60 @@ static void process_selftest(void) {
   printf("process: selftest ok\n");
 }
 
-// init: the root of the process tree, loaded from the embedded PE image
-// (userspace/hello.c) — the one image the kernel ever loads itself; all
-// further processes are built by their parents in userspace. init's
-// death is a panic (process.c).
-extern uint8_t user_pe_blob[];
-extern uint8_t user_pe_blob_end[];
+// Everything only discoverable before exit_boot_services, captured in
+// efi_main and handed to init as its bootinfo block (§3 of
+// docs/technical/boot-init-design.md).
+static struct bootinfo g_bootinfo;
 
-static void init_setup(void) {
+static void bootinfo_capture(struct efi_system_table *system) {
+  g_bootinfo.magic = BOOTINFO_MAGIC;
+  g_bootinfo.version = BOOTINFO_VERSION;
+  g_bootinfo.length = sizeof(g_bootinfo);
+  g_bootinfo.fb_format = BOOTINFO_FB_NONE;
+
+  struct efi_guid gop_guid = EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID;
+  struct efi_graphics_output_protocol *gop = nullptr;
+  efi_status_t status =
+      system->boot->locate_protocol(&gop_guid, nullptr, (void **)&gop);
+  if (status == EFI_SUCCESS && gop->mode != nullptr &&
+      gop->mode->info != nullptr) {
+    const struct efi_graphics_output_mode_information *mi = gop->mode->info;
+    g_bootinfo.fb_base = gop->mode->frame_buffer_base;
+    g_bootinfo.fb_size = gop->mode->frame_buffer_size;
+    g_bootinfo.fb_width = mi->horizontal_resolution;
+    g_bootinfo.fb_height = mi->vertical_resolution;
+    g_bootinfo.fb_pixels_per_scanline = mi->pixels_per_scan_line;
+    g_bootinfo.fb_format = mi->pixel_format;
+  }
+}
+
+// init: the root of the process tree, loaded from \boot\init.exe on the
+// ESP — the one image the kernel ever loads itself; all further
+// processes are built by their parents in userspace. init's death is a
+// panic (process.c), and so is its absence: there is no fallback init.
+static void init_setup(const uint8_t *image, size_t image_len) {
   struct process *p = process_create(nullptr, 1);
   process_set_init(p);
   uint64_t entry = 0;
-  int rc = pe_load(p, user_pe_blob, (size_t)(user_pe_blob_end - user_pe_blob),
-                   &entry);
+  int rc = pe_load(p, image, image_len, &entry);
   asserts(rc == 0, "init: PE load failed");
 
   void *stack = umem_alloc(p, 4 * PAGE_SIZE, PAGE_R | PAGE_W);
   asserts(stack != nullptr, "init: stack alloc failed");
 
-  printf("init: pid=%llu uid=%llu entry=%016llX\n", p->pid, p->uid, entry);
-  process_spawn_thread(p, entry, (uint64_t)stack + 4 * PAGE_SIZE, 0);
+  // The bootinfo block: written through the kernel's own view, then the
+  // one user view drops to read-only. Its base is init's entire entry
+  // ABI (the arg lands in rcx, a plain first parameter to _start).
+  struct bootinfo *bi = umem_alloc(p, PAGE_SIZE, PAGE_R | PAGE_W);
+  asserts(bi != nullptr, "init: bootinfo alloc failed");
+  *bi = g_bootinfo;
+  asserts(umem_protect(p, (uint64_t)bi, PAGE_SIZE, PAGE_R) == 0,
+          "init: bootinfo protect failed");
+
+  printf("init: pid=%llu uid=%llu entry=%016llX bootinfo=%016llX\n", p->pid,
+         p->uid, entry, (uint64_t)bi);
+  process_spawn_thread(p, entry, (uint64_t)stack + 4 * PAGE_SIZE,
+                       (uint64_t)bi);
 }
 
 [[noreturn]] static void ap_main() {
@@ -284,6 +321,18 @@ efi_status_t efi_main(efi_handle_t handle, struct efi_system_table *system) {
            (uint64_t)AP_TRAMPOLINE_BASE, (uint64_t)tramp_status);
   }
 
+  // Read init off the ESP and capture the GOP while boot services can
+  // still do the work. Both allocate, so they must precede the final
+  // get_memory_map — anything that changes the map invalidates mmap_key
+  // and exit_boot_services would bounce.
+  uint64_t init_image_len = 0;
+  const uint8_t *init_image = esp_read_file(
+      handle, system, (const efi_char16_t *)u"\\boot\\init.exe",
+      &init_image_len);
+  asserts(init_image != nullptr, "init: \\boot\\init.exe missing from ESP");
+  printf("init: read \\boot\\init.exe (%llu bytes)\n", init_image_len);
+  bootinfo_capture(system);
+
   // get memory map
   efi_uint_t n_mmap = 0;
   struct efi_memory_descriptor *mmap = nullptr;
@@ -291,10 +340,18 @@ efi_status_t efi_main(efi_handle_t handle, struct efi_system_table *system) {
   efi_status_t mmap_status = get_memory_map(system, &mmap, &n_mmap, &mmap_key);
   asserts(mmap_status == EFI_SUCCESS, "failed to get memory map!\n");
 
+  for (efi_uint_t i = 0; i < n_mmap; i++) {
+    g_bootinfo.mem_total_pages += mmap[i].pages;
+    if (mmap[i].type == EFI_CONVENTIONAL_MEMORY) {
+      g_bootinfo.mem_usable_pages += mmap[i].pages;
+    }
+  }
+
   // grab anything that requires boot services / the system table before we
   // throw it all away
   const struct acpi_rsdp *rsdp = acpi_init(system);
   const struct acpi_madt *madt = acpi_find_madt(rsdp);
+  g_bootinfo.acpi_rsdp = (uint64_t)rsdp;
 
   // exit boot services
   efi_status_t exit_status = system->boot->exit_boot_services(handle, mmap_key);
@@ -333,9 +390,8 @@ efi_status_t efi_main(efi_handle_t handle, struct efi_system_table *system) {
   process_selftest();
 
   // The root of the process tree. Everything else is spawned from
-  // userspace, parents building children (hello.c doubles as init and
-  // the ring-3 test suite).
-  init_setup();
+  // userspace, parents building children.
+  init_setup(init_image, init_image_len);
 
   uint64_t bsp_id = cpu_hwid();
 
