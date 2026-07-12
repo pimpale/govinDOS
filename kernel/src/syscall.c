@@ -70,7 +70,10 @@ static uint64_t sys_vm_alloc(struct thread *curr, uint64_t len,
 }
 
 static uint64_t sys_vm_free(struct thread *curr, uint64_t base) {
-  if (umem_free(curr->proc, base) != 0) {
+  int rc = umem_free(curr->proc, base);
+  if (rc == (int)SYSERR_EXIST)
+    return SYSERR_EXIST;
+  if (rc != 0) {
     return SYSERR_PERM;
   }
   return 0;
@@ -159,6 +162,10 @@ void syscall_entry(struct trap_frame *tf) {
 
   case SYS_VM_MOVE:
     tf->rax = proc_sys_vm_move(curr, a0, a1);
+    return;
+
+  case SYS_VM_MAP_DEVICE:
+    tf->rax = umem_map_device(curr->proc, a0, a1, (uint32_t)a2);
     return;
 
   case SYS_BLOCK_DOORBELL:

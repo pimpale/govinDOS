@@ -15,8 +15,14 @@
 #define KIRQ_CLAIM   1 // a = GSI, b = event cookie
 #define KIRQ_RELEASE 2 // a = GSI (or MSI pseudo-gsi)
 #define KIRQ_ACK     3 // a = GSI (or MSI pseudo-gsi), b = serviced sequence
-#define KIRQ_MSI     4 // phase 2: a = cookie -> completion a = MSI address,
-                       // b = MSI data; pseudo-gsi returned alongside
+#define KIRQ_MSI     4 // a = direct-child pid; completion a = MSI address,
+                       // b = packed route-id/data
+#define KIRQ_BIND    5 // a = granted route id, b = event cookie
+
+#define KIRQ_MSI_PACK(route, data)                                           \
+  (((uint64_t)(uint32_t)(route) << 32) | (uint32_t)(data))
+#define KIRQ_MSI_ROUTE(v) ((uint32_t)((v) >> 32))
+#define KIRQ_MSI_DATA(v)  ((uint32_t)(v))
 
 // Event CQE types.
 #define KEV_IRQ KEV(5) // a = cookie, b = raise sequence

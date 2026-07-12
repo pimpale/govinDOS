@@ -5,6 +5,8 @@
 #include "channel.h"
 #include "cpu_state.h"
 #include "debug.h"
+#include "iommu.h"
+#include "irq_scheme.h"
 #include "paging.h"
 #include "stdlib/stdio.h"
 #include "stdlib/stdlib.h"
@@ -164,6 +166,13 @@ static uint64_t reap_step_locked(struct process *target,
   while (vec_process_ptr_len(z->children) > 0) {
     vec_process_ptr_get(z->children, 0, &z);
     asserts(z->state == PROC_DEAD, "reap: live process inside dead subtree");
+  }
+
+  if (iommu_reap_one_locked(z)) {
+    return REAP_MORE;
+  }
+  if (irq_reap_one_locked(z)) {
+    return REAP_MORE;
   }
 
   if (umem_reap_one_block_locked(z, rel)) {

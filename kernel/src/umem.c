@@ -6,6 +6,7 @@
 #include "buddy_allocator/buddy_allocator.h"
 #include "channel.h"
 #include "debug.h"
+#include "platform_mem.h"
 #include "spinlock.h"
 #include "stdlib/stdlib.h"
 #include "stdlib/string.h"
@@ -67,7 +68,7 @@ static struct process *proc_lookup(uint64_t pid) {
 // ---------------------------------------------------------------------------
 
 static inline uint64_t ublock_bytes(const struct ublock *b) {
-  return (uint64_t)PAGE_SIZE << b->order;
+  return b->bytes;
 }
 
 // Index of the block with this exact base, or -1.
@@ -197,6 +198,10 @@ void *umem_alloc(struct process *p, size_t len, paging_flags_t prot) {
   asserts(b != nullptr, "umem: ublock alloc failed");
   b->base = (uint64_t)base;
   b->order = order;
+  b->bytes = bytes;
+  b->backing = UBLOCK_RAM;
+  b->kernel_flags = PAGE_KERNEL_PRISTINE;
+  b->delegatable = true;
   b->owner = p;
   vec_share_edge_new(&b->sharers);
 
@@ -211,6 +216,73 @@ void *umem_alloc(struct process *p, size_t len, paging_flags_t prot) {
   vec_ublock_ptr_push(p->blocks, &b);
   umem_proc_unlock(p);
   return base;
+}
+
+uint64_t umem_map_device(struct process *p, uint64_t base, uint64_t len,
+                         uint32_t flags) {
+  paging_flags_t kernel_flags;
+  bool delegatable;
+  if (!platform_mem_validate_device(base, len, flags, &kernel_flags,
+                                    &delegatable))
+    return SYSERR_INVAL;
+  uint64_t end = base + len;
+  paging_flags_t device_flags = PAGE_R;
+  if (flags & VM_DEVICE_WRITE)
+    device_flags |= PAGE_W;
+  if (!(flags & VM_DEVICE_FIRMWARE))
+    device_flags |= PAGE_UC;
+
+  // TODO(capability): v1 deliberately applies no caller policy here.
+  umem_lock();
+  for (uint32_t pi = 0; pi < vec_process_ptr_len(g_procs); pi++) {
+    struct process *q;
+    vec_process_ptr_get(g_procs, pi, &q);
+    umem_proc_lock(q);
+    for (uint32_t bi = 0; bi < vec_ublock_ptr_len(q->blocks); bi++) {
+      ublock *other;
+      vec_ublock_ptr_get(q->blocks, bi, &other);
+      if (other->backing == UBLOCK_DEVICE && base < other->base + other->bytes &&
+          other->base < end) {
+        umem_proc_unlock(q);
+        umem_unlock();
+        return SYSERR_EXIST;
+      }
+    }
+    umem_proc_unlock(q);
+  }
+
+  // Fix the kernel-only alias in every extant tree before making a user
+  // alias visible. Device cache types stay fixed after first registration;
+  // later clones inherit the same leaf from g_as_kernel.
+  as_flag(g_as_kernel, base, end, kernel_flags);
+  as_flush(g_as_kernel);
+  for (uint32_t pi = 0; pi < vec_process_ptr_len(g_procs); pi++) {
+    struct process *q;
+    vec_process_ptr_get(g_procs, pi, &q);
+    as_flag(q->as, base, end, kernel_flags);
+    as_flush(q->as);
+  }
+
+  ublock *b = calloc(1, sizeof(*b));
+  if (b == nullptr) {
+    umem_unlock();
+    return SYSERR_NOMEM;
+  }
+  b->base = base;
+  b->bytes = len;
+  b->backing = UBLOCK_DEVICE;
+  b->device_flags = device_flags;
+  b->kernel_flags = kernel_flags;
+  b->delegatable = delegatable;
+  b->owner = p;
+  vec_share_edge_new(&b->sharers);
+  as_flag(p->as, base, end, device_flags | PAGE_U);
+  as_flush(p->as);
+  umem_proc_lock(p);
+  vec_ublock_ptr_push(p->blocks, &b);
+  umem_proc_unlock(p);
+  umem_unlock();
+  return 0;
 }
 
 // Phase one of freeing a block: everything that needs g_umem. Caller
@@ -248,13 +320,13 @@ static void block_release_prepare(ublock *b, struct umem_release *rel) {
   rel->ases = malloc(rel->nases * sizeof(*rel->ases));
   asserts(rel->ases != nullptr, "umem: release ctx alloc failed");
 
-  as_flag(b->owner->as, b->base, end, PAGE_KERNEL_PRISTINE);
+  as_flag(b->owner->as, b->base, end, b->kernel_flags);
   as_pin(b->owner->as);
   rel->ases[0] = b->owner->as;
   for (uint32_t i = 0; i < nsharers; i++) {
     share_edge e;
     vec_share_edge_get(b->sharers, i, &e);
-    as_flag(e.to->as, b->base, end, PAGE_KERNEL_PRISTINE);
+    as_flag(e.to->as, b->base, end, b->kernel_flags);
     as_pin(e.to->as);
     rel->ases[1 + i] = e.to->as;
   }
@@ -275,10 +347,12 @@ void umem_release_finish(struct umem_release *rel) {
   }
   free(rel->ases);
 
-  spinlock_lock(&g_allocator_lock);
-  buddy_status_t s = buddy_page_free(g_allocator, b->base / PAGE_SIZE);
-  spinlock_unlock(&g_allocator_lock);
-  asserts(s == BUDDY_STATUS_SUCCESS, "umem: buddy rejected block free");
+  if (b->backing == UBLOCK_RAM) {
+    spinlock_lock(&g_allocator_lock);
+    buddy_status_t s = buddy_page_free(g_allocator, b->base / PAGE_SIZE);
+    spinlock_unlock(&g_allocator_lock);
+    asserts(s == BUDDY_STATUS_SUCCESS, "umem: buddy rejected block free");
+  }
 
   vec_share_edge_delete(&b->sharers);
   free(b);
@@ -297,6 +371,11 @@ int umem_free(struct process *p, uint64_t base) {
   }
   ublock *b;
   vec_ublock_ptr_get(p->blocks, (uint32_t)i, &b);
+  if (b->dma_pins != 0 || !channel_block_destroyable(b)) {
+    umem_proc_unlock(p);
+    umem_unlock();
+    return (int)SYSERR_EXIST;
+  }
   vec_ublock_ptr_swap_and_pop(p->blocks, (uint32_t)i);
   umem_proc_unlock(p);
   block_release_prepare(b, &rel);
@@ -327,11 +406,16 @@ int umem_protect(struct process *p, uint64_t base, size_t len,
   // context where a kernel-mode page fault is fatal. Scheme creation holds
   // this same list lock through b->ring publication, so this test cannot
   // race a protect into the creation window.
-  if (b == nullptr || b->ring != nullptr) {
+  if (b == nullptr || b->ring != nullptr ||
+      (b->backing == UBLOCK_DEVICE &&
+       ((prot & ~b->device_flags) != 0 || (prot & PAGE_X)))) {
     umem_proc_unlock(p);
     return -1;
   }
-  as_flag(p->as, base, end, prot == 0 ? 0 : (prot | PAGE_U));
+  paging_flags_t view = prot == 0 ? 0 : (prot | PAGE_U);
+  if (b->backing == UBLOCK_DEVICE)
+    view |= b->device_flags & PAGE_CACHE_MASK;
+  as_flag(p->as, base, end, view);
   as_flush(p->as);
   umem_proc_unlock(p);
   return 0;
@@ -344,7 +428,10 @@ uint64_t umem_share(struct process *p, uint64_t base, uint64_t target_pid,
   ublock *b = umem_owned_locked(p, base);
   umem_proc_unlock(p); // b stays pinned by g_umem
   struct process *target = proc_lookup(target_pid);
-  if (b == nullptr || target == nullptr || target == p || b->ring != nullptr) {
+  if (b == nullptr || target == nullptr || target == p || b->ring != nullptr ||
+      !b->delegatable ||
+      (b->backing == UBLOCK_DEVICE &&
+       ((prot & ~b->device_flags) != 0 || (prot & PAGE_X)))) {
     umem_unlock();
     return SYSERR_INVAL;
   }
@@ -358,19 +445,21 @@ uint64_t umem_share(struct process *p, uint64_t base, uint64_t target_pid,
   share_edge e = {.to = target, .notified = false};
   vec_share_edge_push(b->sharers, &e);
   umem_stripe_unlock(si);
-  // Going from one sharer to several breaks any channel identity parked
-  // waiters relied on (data-plane calls need exactly one sharer): wake
-  // them out with SYSERR_DEAD rather than strand them. Mutate first,
-  // then tear (torn's contract): with the second edge visible nothing
-  // can re-park, and whoever parked before it is woken here.
-  if (nsharers == 1) {
+  // Both 0->1 (private event block becomes a user channel) and 1->2
+  // (valid channel becomes non-channel shared memory) change the identity
+  // a parked waiter relied on. Wake it SYSERR_DEAD after publishing the
+  // new edge. With two edges visible no waiter can re-park.
+  if (nsharers <= 1) {
     channel_block_torn(b, false);
   }
 
   umem_proc_lock(target);
   vec_ublock_ptr_push(target->shared_in, &b);
   umem_proc_unlock(target);
-  as_flag(target->as, b->base, b->base + ublock_bytes(b), prot | PAGE_U);
+  paging_flags_t target_flags = prot | PAGE_U;
+  if (b->backing == UBLOCK_DEVICE)
+    target_flags |= b->device_flags & PAGE_CACHE_MASK;
+  as_flag(target->as, b->base, b->base + ublock_bytes(b), target_flags);
   as_flush(target->as);
 
   // Announce on the target's shares channel (or leave the edge's notified
@@ -402,7 +491,7 @@ int umem_unshare(struct process *p, uint64_t base) {
   // The channel (if the peers treated it as one) is gone: wake parked
   // peers with SYSERR_DEAD. The block itself lives on with its owner.
   channel_block_torn(b, false);
-  as_flag(p->as, b->base, b->base + ublock_bytes(b), PAGE_KERNEL_PRISTINE);
+  as_flag(p->as, b->base, b->base + ublock_bytes(b), b->kernel_flags);
   as_flush(p->as);
   umem_unlock();
   return 0;
@@ -449,7 +538,7 @@ bool umem_reap_one_view_locked(struct process *p) {
   // The owner's side of the channel wakes SYSERR_DEAD — it was parked
   // for a doorbell that will never come.
   channel_block_torn(b, false);
-  as_flag(p->as, b->base, b->base + ublock_bytes(b), PAGE_KERNEL_PRISTINE);
+  as_flag(p->as, b->base, b->base + ublock_bytes(b), b->kernel_flags);
   as_flush(p->as);
   return true;
 }
@@ -468,6 +557,10 @@ void umem_reap_finish_locked(struct process *p) {
 
 uint64_t umem_move_locked(ublock *b, struct process *from, struct process *to,
                           bool src_as_live) {
+  if (b->dma_pins != 0)
+    return SYSERR_EXIST;
+  if (!b->delegatable)
+    return SYSERR_INVAL;
   uint64_t bytes = ublock_bytes(b);
   // List surgery before the stripe (never the other way around). In
   // both legal moves exactly one endpoint can have live threads — down
@@ -499,9 +592,12 @@ uint64_t umem_move_locked(ublock *b, struct process *from, struct process *to,
   channel_block_torn(b, false);
 
   if (src_as_live) {
-    as_flag(from->as, b->base, b->base + bytes, PAGE_KERNEL_PRISTINE);
+    as_flag(from->as, b->base, b->base + bytes, b->kernel_flags);
   }
-  as_flag(to->as, b->base, b->base + bytes, PAGE_R | PAGE_W | PAGE_U);
+  paging_flags_t moved = PAGE_R | PAGE_W | PAGE_U;
+  if (b->backing == UBLOCK_DEVICE)
+    moved = b->device_flags | PAGE_U;
+  as_flag(to->as, b->base, b->base + bytes, moved);
   struct address_space *ases[2] = {to->as, from->as};
   as_flush_multi(ases, src_as_live ? 2 : 1);
 

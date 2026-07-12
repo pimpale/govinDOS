@@ -44,9 +44,9 @@
 #define SYS_VM_UNSHARE 9 // (base)                  -> 0
 #define SYS_VM_MOVE   10 // (base, pid)             -> 0
 
-// Shared-block channels (ipc-process-design.md §1). The block's base
-// address is the channel name; DOORBELL/WAIT roles are inferred from the
-// caller.
+// Block waits and doorbells (ipc-process-design.md §1). An owned unshared
+// block is process-private; a block with one sharer is a two-party channel.
+// The block's base is its doorbell name; WAIT takes a word within it.
 #define SYS_BLOCK_DOORBELL 11 // (base)           -> 0 (never blocks)
 #define SYS_BLOCK_WAIT     12 // (addr, expected) -> 0 (may park; SYSERR_DEAD on revoke)
 
@@ -59,7 +59,12 @@
 #define SYS_PROC_KILL    15 // (pid)                     -> 0 (own descendant; subtree dies)
 #define SYS_PROC_REAP    16 // (pid)                     -> REAP_* | SYSERR_AGAIN (own dead child)
 
-#define SYS_MAX          17
+// Map an existing, kernel-validated physical device range as a device-backed
+// ublock at its identity address. The base/length are page aligned; flags are
+// VM_DEVICE_* below. Success returns 0 (the block's name is `base`).
+#define SYS_VM_MAP_DEVICE 17 // (base, len, flags)        -> 0
+
+#define SYS_MAX          18
 
 // SYS_PROC_REAP results: one more bounded step done / the subtree is
 // fully gone. SYSERR_AGAIN means culling/drain hasn't caught up — call
@@ -71,6 +76,14 @@
 #define VM_PROT_READ  1u
 #define VM_PROT_WRITE 2u
 #define VM_PROT_EXEC  4u
+
+// SYS_VM_MAP_DEVICE flags. Ordinary device memory is UC. FIRMWARE selects
+// the read-only WB exception for ACPI backing pages; WC is reserved until a
+// platform allowlist exists.
+#define VM_DEVICE_READ     1u
+#define VM_DEVICE_WRITE    2u
+#define VM_DEVICE_WC       4u
+#define VM_DEVICE_FIRMWARE 8u
 
 // Errors are returned as small negative values in rax.
 #define SYSERR_NOSYS ((uint64_t) - 1)

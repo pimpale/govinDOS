@@ -7,6 +7,7 @@
 #include "ioapic.h"
 #include "irq.h"
 #include "irq_scheme.h"
+#include "iommu_internal.h"
 #include "lapic.h"
 #include "paging.h"
 #include "panic.h"
@@ -95,6 +96,12 @@ uint64_t interrupt_handler(struct trap_frame *tf, uint64_t vector,
   // mid-handler. iretq restores IF from the saved frame.
   irq_enter();
   switch (vector) {
+  case VECTOR_IOMMU_FAULT:
+    vtd_fault_interrupt();
+    x86_lapic_eoi();
+    cull_if_killed(tf);
+    irq_exit();
+    return 0;
   case VECTOR_TLB_SHOOTDOWN:
     paging_handle_tlb_shootdown();
     cull_if_killed(tf);

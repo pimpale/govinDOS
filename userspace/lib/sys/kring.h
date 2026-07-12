@@ -10,9 +10,9 @@
 // Shape of a session (cf. liburing):
 //
 //   struct kring g;
-//   kring_create(&g, KSCHEME_GROUPS, 4096);
+//   kring_create(&g, KSCHEME_IRQ, 4096);
 //   struct ksqe *sqe = kring_get_sqe(&g);
-//   sqe->op = KGROUP_ADD; sqe->a = ch; sqe->b = cookie;
+//   sqe->op = KIRQ_CLAIM; sqe->a = gsi; sqe->b = cookie;
 //   kring_submit(&g);                  // publish sq_tail + doorbell
 //   struct kcqe cqe;
 //   kring_wait_cqe(&g, &cqe);          // park until one lands, consume it
@@ -70,8 +70,8 @@ void kring_cqe_seen(struct kring *r);
 
 // Park until a CQE is available, copy it out, and consume it. Returns 0,
 // or SYSERR_* from the underlying SYS_BLOCK_WAIT (notably SYSERR_DEAD
-// when the block is revoked, SYSERR_EXIST when the side is already
-// parked on or registered in a group). Does not ack; do that after
+// when the block is revoked, SYSERR_EXIST when the side already has a
+// parked thread). Does not ack; do that after
 // draining what you came for.
 uint64_t kring_wait_cqe(struct kring *r, struct kcqe *cqe);
 
@@ -84,5 +84,7 @@ uint64_t kring_ack(struct kring *r);
 uint64_t kring_irq_claim(struct kring *r, uint64_t gsi, uint64_t cookie);
 uint64_t kring_irq_release(struct kring *r, uint64_t gsi);
 uint64_t kring_irq_ack(struct kring *r, uint64_t gsi, uint64_t seq);
+uint64_t kring_irq_msi(struct kring *r, uint64_t child_pid);
+uint64_t kring_irq_bind(struct kring *r, uint64_t route_id, uint64_t cookie);
 
 #endif // kring_h_INCLUDED

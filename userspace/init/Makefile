@@ -7,7 +7,7 @@ include $(U)/build.mk
 # This manifest lives here because init is the packager. Programs not
 # listed still build; they ship on the filesystem tree instead
 # (userspace/Makefile).
-INITFS_PROGS := tests
+INITFS_PROGS := nvmed pcid tests
 
 all: out/init.exe
 

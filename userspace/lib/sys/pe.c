@@ -86,8 +86,10 @@ static uint64_t fail(const char *why) {
   return 0;
 }
 
-uint64_t pe_spawn(const uint8_t *image, uint64_t len, uint64_t arg,
-                  uint64_t stack_len) {
+uint64_t pe_spawn_resources(const uint8_t *image, uint64_t len, uint64_t arg,
+                            uint64_t stack_len,
+                            const struct pe_resource *resources,
+                            uint32_t nresources) {
   if (len < sizeof(struct dos_header)) {
     return fail("image too short");
   }
@@ -186,6 +188,13 @@ uint64_t pe_spawn(const uint8_t *image, uint64_t len, uint64_t arg,
     sys_proc_kill(pid);
     return fail("vm_move failed");
   }
+  for (uint32_t i = 0; i < nresources; i++) {
+    uint64_t rc = sys_vm_share(resources[i].base, pid, resources[i].prot);
+    if (sys_iserr(rc)) {
+      sys_proc_kill(pid);
+      return fail("resource share failed");
+    }
+  }
 
   // Header page read-only, then each section per its characteristics.
   sys_vm_protect_for(base, UPAGE_SIZE, VM_PROT_READ, pid);
@@ -212,4 +221,9 @@ uint64_t pe_spawn(const uint8_t *image, uint64_t len, uint64_t arg,
     return fail("thread_spawn failed");
   }
   return pid;
+}
+
+uint64_t pe_spawn(const uint8_t *image, uint64_t len, uint64_t arg,
+                  uint64_t stack_len) {
+  return pe_spawn_resources(image, len, arg, stack_len, nullptr, 0);
 }

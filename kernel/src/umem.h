@@ -54,28 +54,37 @@ typedef struct share_edge {
 #undef VEC_DTYPE
 
 struct ring;
-struct reg;
+enum ublock_backing {
+  UBLOCK_RAM,
+  UBLOCK_DEVICE,
+};
 
 struct ublock {
   uint64_t base; // identity VA == PA; buddy-block aligned
-  uint8_t order; // bytes = PAGE_SIZE << order
+  uint8_t order; // RAM buddy order; zero for device blocks
+  uint64_t bytes;
+  enum ublock_backing backing;
+  // Device blocks retain one fixed cache type and maximum rights across all
+  // views. ECAM/firmware blocks set delegatable=false.
+  paging_flags_t device_flags;
+  paging_flags_t kernel_flags;
+  bool delegatable;
   // owner and sharers are written under g_umem + stripe(base) together,
   // so holding either makes them safe to read.
   struct process *owner;
   vec_share_edge *sharers; // processes other than owner with a view
 
-  // Channel state (channel.c, under stripe(base) — the per-block lock
-  // stripe, level 3 of the hierarchy below). Each side holds at most one
-  // of: a parked thread, or a wait-group registration — registered XOR
-  // parked, the SPSC rule (SYSERR_EXIST otherwise).
+  // Wait state (channel.c, under stripe(base) — the per-block lock stripe,
+  // level 3 of the hierarchy below). Each side holds at most one parked
+  // thread. An owned, unshared block uses owner_waiter as a process-private
+  // event; a two-party user channel uses the two slots as its endpoint waits.
   struct thread *owner_waiter;
   struct thread *sharer_waiter;
-  struct reg *owner_reg;
-  struct reg *sharer_reg;
   // Non-null iff this block is a kernel channel; owned here, freed by the
   // revoke path (channel_block_torn). Written under g_umem + stripe(base)
   // like owner/sharers; ring *internals* are control-plane state (g_umem).
   struct ring *ring;
+  uint32_t dma_pins; // g_umem: IOMMU leaves retaining this allocation
 };
 
 // One-time init (lock + registry). Call before the first user process.
@@ -91,6 +100,11 @@ void umem_process_register(struct process *p);
 // other AS the block just remains ordinary kernel memory. Returns the
 // block base or nullptr (out of memory).
 void *umem_alloc(struct process *p, size_t len, paging_flags_t prot);
+
+// Create a device-backed block over an existing physical range. Success is
+// zero; the identity base is the block name.
+uint64_t umem_map_device(struct process *p, uint64_t base, uint64_t len,
+                         uint32_t flags);
 
 // Free a block owned by `p`. base must be the exact block base — blocks
 // are the unit, so the base alone is unambiguous. Revokes every
@@ -173,32 +187,26 @@ void umem_proc_unregister_locked(struct process *p);
 //
 //   1. g_umem (umem_lock/umem_unlock) — the control-plane lock. Every
 //      ownership-graph mutation (free, share, unshare, move, reap, kill,
-//      the pid registry) and all kernel-ring/group internals run under
-//      it. Blocks are freed only under it, so holding it pins every
-//      ublock.
+//      the pid registry) and all kernel-ring internals run under it. Blocks
+//      are freed only under it, so holding it pins every ublock.
 //   2. p->ulock (umem_proc_lock/unlock) — sole guard of p->blocks and
 //      p->shared_in, reads included. Finding a block in a list you hold
 //      pins it: a freer unlinks from every list before tearing down.
-//   3. stripes (umem_stripe_*) — static lock array indexed by
-//      hash(block base). Guard the block's waiter/reg slots and
-//      serialize park vs wake vs tear; the lock's storage outlives any
-//      block, which is what makes lock-then-look safe without the
-//      global lock.
+//   3. stripes (umem_stripe_*) — static lock array indexed by hash(block
+//      base). Guard the block's waiter slots and serialize park vs wake vs
+//      tear; the lock's storage outlives any block, which is what makes
+//      lock-then-look safe without the global lock.
 //
-// The data plane (SYS_BLOCK_WAIT / SYS_BLOCK_DOORBELL on user channels,
-// including KEV_READY delivery into a wait-group) takes list lock ->
-// stripes and never touches g_umem: unrelated channels never contend.
+// The data plane (SYS_BLOCK_WAIT / SYS_BLOCK_DOORBELL on user channels and
+// private event blocks) takes list lock -> stripe and never touches g_umem:
+// unrelated blocks never contend.
 // Its soundness rules:
 //   - take the stripe BEFORE dropping the list lock that made the block
 //     reachable, and never touch the block after dropping the stripe;
 //   - never take a list lock while holding a stripe;
-//   - the only two-stripe holder is the data-plane channel->group wake
-//     pair, acquired in ASCENDING stripe-index order (release,
-//     reacquire, revalidate on descending discovery — channel.c's
-//     wake_user_side_ranked). Control-plane code never holds two
-//     stripes at once: g_umem pins regs and rings, so it posts in
-//     sequential single-stripe sections. Ascending pairs cannot cycle
-//     with each other, and single holders cannot cycle with anyone.
+//   - channel data-plane paths hold only the block's one stripe.
+// A future cross-block operation must pin both blocks and acquire their
+// stripes in ascending index order; no current channel path needs a pair.
 // ---------------------------------------------------------------------------
 
 void umem_lock(void);

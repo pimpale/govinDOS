@@ -214,12 +214,3 @@ build are gone.
 - **pe.c error paths kill but do not reap** a half-built embryo (the
   zombie waits for init's reap loop). Boot-path failures are
   print-and-continue in init, panic-grade in practice.
-- **Found and fixed while landing: a latent `group_await` race in the
-  test suite** (predates this design, exposed by the new scheduling
-  shape). The helper drained every available CQE while hunting one
-  event type; two awaited events landing in one batch meant the second
-  was consumed by the first call and its await parked forever. It now
-  stops draining at the hit and leaves the rest in the CQ. The
-  kill-order interleaving that exposed it: the revoked child's exit can
-  land before the parent's next `group_await`, batching `KEV_DEAD` and
-  the tree channel's `KEV_READY` together.

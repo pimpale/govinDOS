@@ -113,3 +113,11 @@ uint64_t kring_irq_release(struct kring *r, uint64_t gsi) {
 uint64_t kring_irq_ack(struct kring *r, uint64_t gsi, uint64_t seq) {
   return irq_submit(r, KIRQ_ACK, gsi, seq);
 }
+
+uint64_t kring_irq_msi(struct kring *r, uint64_t child_pid) {
+  return irq_submit(r, KIRQ_MSI, child_pid, 0);
+}
+
+uint64_t kring_irq_bind(struct kring *r, uint64_t route_id, uint64_t cookie) {
+  return irq_submit(r, KIRQ_BIND, route_id, cookie);
+}

@@ -63,6 +63,9 @@ static bool rsdp_valid(const struct acpi_rsdp *r) {
 }
 
 static bool sdt_valid(const struct acpi_sdt_header *h, const char *signature) {
+  if (h == nullptr || h->length < sizeof(*h)) {
+    return false;
+  }
   if (!sig_eq(h->signature, signature, 4)) {
     return false;
   }
@@ -98,7 +101,8 @@ const struct acpi_rsdp *acpi_init(struct efi_system_table *system) {
   return r;
 }
 
-const struct acpi_madt *acpi_find_madt(const struct acpi_rsdp *rsdp) {
+const struct acpi_sdt_header *acpi_find_table(const struct acpi_rsdp *rsdp,
+                                              const char signature[4]) {
   if (rsdp == nullptr) {
     return nullptr;
   }
@@ -133,10 +137,13 @@ const struct acpi_madt *acpi_find_madt(const struct acpi_rsdp *rsdp) {
 
     const struct acpi_sdt_header *h =
         (const struct acpi_sdt_header *)(uintptr_t)addr;
-    if (sig_eq(h->signature, "APIC", 4) && checksum_zero(h, h->length)) {
-      return (const struct acpi_madt *)h;
+    if (sdt_valid(h, signature)) {
+      return h;
     }
   }
   return nullptr;
 }
 
+const struct acpi_madt *acpi_find_madt(const struct acpi_rsdp *rsdp) {
+  return (const struct acpi_madt *)acpi_find_table(rsdp, "APIC");
+}

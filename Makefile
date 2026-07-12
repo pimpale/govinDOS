@@ -22,17 +22,25 @@ userspace:
 	$(MAKE) -C userspace
 
 # Add -d int to the qemu invocation to trace interrupts.
-runkernel: all
+runkernel: all out/nvme.img
 	qemu-system-x86_64 \
+	  -machine q35 \
 	  -no-reboot \
 	  -cpu max \
 	  -drive if=pflash,format=raw,file=./out/efi/OVMF.fd \
 	  -drive format=raw,file=fat:rw:out/root \
+	  -drive id=nvme0,if=none,format=raw,file=out/nvme.img \
+	  -device nvme,drive=nvme0,serial=govindos \
+	  -device intel-iommu,intremap=off \
 	  -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
 	  -serial stdio \
 	  -m 1G \
 	  -smp 4 \
 	  -net none
+
+out/nvme.img:
+	mkdir -p out
+	truncate -s 64M $@
 
 clean:
 	rm -rf out

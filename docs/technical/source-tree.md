@@ -42,8 +42,8 @@ the top level use `out/` the same way; `bin/` is a *source* directory.
 
 - **`abi/gdos/` is the single home of the kernel↔userspace contract**:
   syscall numbers, `SYSERR_*`, `VM_PROT_*`, `REAP_*`
-  (`<gdos/syscall.h>`), the kring header/SQE/CQE layout, scheme ids,
-  `KEV_*`, `KGROUP_*` (`<gdos/kring.h>`), and the bootinfo struct
+  (`<gdos/syscall.h>`), the kring header/SQE/CQE layout, scheme ids and
+  `KEV_*` vocabularies (`<gdos/kring*.h>`), and the bootinfo struct
   (`<gdos/bootinfo.h>`). Both builds add `-I../abi`; the kernel's
   `syscall.h`/`channel.h` include these rather than defining their own.
   This killed a real defect class: userspace previously *hand-mirrored*

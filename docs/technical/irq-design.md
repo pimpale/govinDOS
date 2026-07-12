@@ -19,8 +19,8 @@ dispatch branch), `lib/sys/kring.c` (driver-side wrappers).
   driver claims interrupt lines by submitting SQEs on an irq ring and
   hears about interrupts as event CQEs on the same ring. No new
   syscalls: claim/release/ack are ring ops, waiting is
-  `SYS_BLOCK_WAIT` or a wait-group registration like any other
-  channel. Redox's `irq:` scheme is the precedent for the shape;
+  `SYS_BLOCK_WAIT` like any other kernel channel. Redox's `irq:` scheme
+  is the precedent for the shape;
   govindos already has the transport.
 - **The IRQ handler posts the CQE itself — borrowed context, stripe
   plane only.** There is no kernel thread and nothing to defer to, and
@@ -51,16 +51,17 @@ dispatch branch), `lib/sys/kring.c` (driver-side wrappers).
   Managarm ack-wins/all-nack-stalls) — real machinery that modern
   hardware makes optional, because everything that matters is MSI.
   If it's ever needed the recipe is recorded in §7.
-- **MSI/MSI-X: kernel allocates the vector, userspace programs the
-  device.** `KIRQ_MSI` returns an opaque `(address, data)` pair; the
-  driver writes it into the device's MSI capability / MSI-X table
-  itself (Redox's split, not Managarm's in-kernel PCI). The kernel
-  never grows a PCI layer; whoever can already reach a device's
-  config space and BARs is already trusted with its DMA engine, so
-  self-programming adds no new authority (§5).
-- **Claim policy is deferred.** IRQ rings are temporarily unrestricted.
-  The intended end state is capability delegation through a devmgr; the
-  kernel has no uid/account policy layer.
+- **MSI/MSI-X: kernel allocates, `pcid` programs, driver receives events.**
+  `KIRQ_MSI` returns an opaque `(address, data)` pair to the trusted userspace
+  PCI manager; `pcid` writes the device's MSI capability/MSI-X table and
+  grants route binding to its driver child. The kernel still grows no PCI
+  layer. This supersedes the earlier Redox-style driver-programs-device split
+  now that [pci-design.md](pci-design.md) keeps ECAM out of drivers (§5).
+- **Claim policy is deferred behind explicit hooks.** Pin IRQ rings remain
+  temporarily unrestricted. MSI route binding uses a temporary direct-child
+  grant from `pcid`, and MSI allocation temporarily requires ownership of the
+  singleton devmem endpoint. Future `CAP_IRQ`/IRQ-control possession replaces
+  both checks; it is not a prerequisite for the MSI milestone.
 - **Affinity is deferred: everything routes to the BSP.** Also makes
   handler-side lock contention structurally nil in v1. A claim-time
   affinity argument slots in later without ABI change (the CQE and
@@ -121,7 +122,8 @@ ring — the `cookie` tells events apart). Ring creation is the ordinary
 | `KIRQ_CLAIM` | a = gsi, b = cookie | exclusive claim of a GSI for this ring. `SYSERR_EXIST` (claimed anywhere), `SYSERR_INVAL` (no such GSI), `SYSERR_PERM`, `SYSERR_NOMEM` (claim-count bound, below). On success the line is programmed (trigger/polarity from ACPI) and unmasked |
 | `KIRQ_RELEASE` | a = gsi | unclaim: masks the line, frees the route. `SYSERR_INVAL` if not this ring's claim |
 | `KIRQ_ACK` | a = gsi, b = seq | "the device is serviced through `seq`": sets `acked = seq`, unmasks a level line, re-fires the event if raises slipped past `seq` (§3) |
-| `KIRQ_MSI` | a = cookie | (phase 2) allocate an MSI vector: completion carries the opaque address/data pair in `a`/`b` (§5). Released by `KIRQ_RELEASE` on the returned pseudo-gsi |
+| `KIRQ_MSI` | a = driver child PID | (phase 2, `pcid`): allocate an MSI vector intended for that child; completion carries the opaque address and packed route-id/data result (§5) |
+| `KIRQ_BIND` | a = route id, b = cookie | (phase 2, driver): bind a route granted to this process to this ring; the future authorization hook checks `CAP_IRQ` instead |
 
 | CQE | fields | when |
 |---|---|---|
@@ -129,23 +131,23 @@ ring — the `cookie` tells events apart). Ring creation is the ordinary
 
 Event bound: at most one outstanding `KEV_IRQ` per claim, so
 `nclaims + sq-completions` can never overflow the CQ; `KIRQ_CLAIM`
-enforces `2·(nclaims+1) <= nslots`, the same accounting as wait-group
-`ADD` (headroom for one event per claim plus the 1:1 completions).
+enforces `2·(nclaims+1) <= nslots` (headroom for one event per claim plus
+the 1:1 completions).
 
 The driver loop, entirely existing vocabulary:
 
 ```
 setup:   VM_ALLOC -> ring; VM_SHARE(ring, -4)
          submit KIRQ_CLAIM{gsi, cookie}; DOORBELL; check completion
-loop:    BLOCK_WAIT(&hdr->cq_count, seen)      // or a wait-group registration
+loop:    BLOCK_WAIT(&hdr->cq_count, seen)
          consume KEV_IRQ{cookie, seq}; advance cq_head
          ... read device ISR, drain queues, quiesce ...
          submit KIRQ_ACK{gsi, seq}; DOORBELL   // doorbell = consumption ack too
 ```
 
-A driver process is otherwise ordinary: the `-4` ring composes with
-`-1`/`-2`/`-3` and user channels, so one wait-group hears device
-interrupts and client requests in the same park.
+A driver process is otherwise ordinary. It may dedicate one thread to the
+`-4` ring and forward completions into local queues, while other threads
+serve client channels; high-rate drivers normally shard rings by queue.
 
 ## 3. The count/ack protocol
 
@@ -155,8 +157,7 @@ Per claim (route entry, §4) the kernel keeps:
 - `acked` — u64, set by `KIRQ_ACK` to its `seq` argument.
 - `posted` — the outstanding-event bit, plus the CQ index of the
   outstanding `KEV_IRQ`; retired when consumption passes it
-  (`index < cq_head`, FIFO — the wait-group `pending`/`ev_index`
-  mechanism verbatim).
+  (`index < cq_head`, FIFO).
 
 Rules:
 
@@ -213,18 +214,11 @@ preempt path already does the latter). The one forbidden lock is
 `g_umem` — it is a shootdown-servicing svclock, and a handler spinning
 IRQs-off on it can be the shootdown target its holder waits on.
 
-The stripe plane suffices, because a `KEV_IRQ` post is the same act as
-a peer's data-plane doorbell:
+The stripe plane suffices:
 
 - `ring_post_locked` needs stripe(ring block) only.
 - If the ring's owner is parked, the post wakes the slot
   (`thread_unblock`: scheduler lock, legal here).
-- If the ring is registered in a wait-group, delivery is
-  `groups_notify_locked` under stripe(group block) — the g_umem-free
-  data-plane entry that already exists for exactly this, using the
-  ascending-stripe ranked acquisition of `wake_user_side_ranked`
-  (release, reacquire in index order, revalidate the slot). The
-  handler-side post reuses that shape (factored helper, not a copy).
 
 **Route table and pinning.** Static `irq_route[]`, one entry per GSI
 plus the MSI vector range: `{ leaf spinlock; struct ring *ring; u64
@@ -297,31 +291,29 @@ CPU. MSI-X is the modern variant: up to 2048 independent
 `{addr, data, mask}` entries in a table in one of the device's own
 BARs (plain MMIO), vs MSI's single pair in PCI config space.
 
-Division of labor (Redox's, deliberately not Managarm's — govindos has
-no kernel PCI layer and refuses to grow one):
+Division of labor (userspace PCI management, still no kernel PCI layer):
 
 - **Kernel (`KIRQ_MSI`):** allocate a free device vector, bind it to
-  the ring/cookie as a route with no RTE, return the `(address,
-  data)` pair in the completion CQE. The pair is **opaque to the
-  driver** — the kernel composes it (destination, delivery mode,
+  a route with no RTE, mark the route grant for `pcid`'s named direct child,
+  and return a route ID plus `(address, data)` programming pair. The pair is
+  **opaque to userspace** — the kernel composes it (destination, delivery mode,
   vector; someday the IOMMU-remapping format), which keeps affinity
   and hardening kernel-owned without ABI change. Vector choice is the
   security-critical half and stays kernel-only.
-- **Driver:** writes the pair into the device — MSI capability in
-  config space, or the mapped MSI-X table BAR — and sets the enable
-  bit. From then on: device write → LAPIC → `irq_deliver` → `KEV_IRQ`,
-  the same path as a pin interrupt, with edge/count semantics.
+- **`pcid`:** writes that pair into the MSI capability in ECAM or the MSI-X
+  table in a temporarily mapped BAR, and controls masking/enabling. It does
+  not receive interrupt events on the normal path.
+- **Driver (`KIRQ_BIND`):** binds the granted route ID to its IRQ ring and
+  cookie, then receives `KEV_IRQ` with the ordinary edge/count semantics. It
+  never sees ECAM and need not know the programming pair.
 
-Prerequisite honesty: this presupposes the driver can *reach* config
-space and BARs, which is the missing device-memory story (map the
-ECAM window / BAR ranges into driver processes — a future pcid owning
-enumeration and handing each driver its function's pages), and a trust
-decision: without an IOMMU, config-space write access is already
-full-machine trust (the device's normal DMA engine is right there), so
-MSI self-programming adds nothing new; with an IOMMU, interrupt
-remapping filters hostile pairs — future kernel work behind the same
-`KIRQ_MSI` op. Neither blocks the pin-IRQ scheme, which is why MSI is
-phase 2.
+The exact packing of route ID and MSI data into the fixed 32-byte CQE is an
+ABI detail for phase 2; both are at most 32 bits on x86 and fit in `b`. The
+kernel records `{grantor pcid endpoint, target child PID, route generation}`
+so guessing a route ID fails. Later that record is a `CAP_IRQ`; the bind and
+delivery paths are otherwise unchanged. Interrupt remapping remains future
+kernel work behind the same opaque pair. None of this blocks the implemented
+pin-IRQ scheme.
 
 ## 6. Hardware prerequisites (kernel-side, all bounded)
 

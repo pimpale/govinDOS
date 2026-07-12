@@ -8,8 +8,10 @@
 #include "debug.h"
 #include "espfile.h"
 #include "get_mmap.h"
+#include "iommu.h"
 #include "paging.h"
 #include "pe.h"
+#include "platform_mem.h"
 #include "process.h"
 #include "scheduler.h"
 #include "serial.h"
@@ -119,6 +121,60 @@ static void umem_selftest(void) {
   destroy_test_process(a);
   destroy_test_process(b);
   printf("umem: selftest ok\n");
+}
+
+static void device_block_selftest(const struct acpi_rsdp *rsdp,
+                                  uint64_t framebuffer_base) {
+  struct process *a = process_create(nullptr);
+  struct process *b = process_create(nullptr);
+
+  // Usable RAM is never accepted as device memory.
+  uint8_t *ram = umem_alloc(a, PAGE_SIZE, PAGE_R | PAGE_W);
+  asserts(ram != nullptr, "devmem selftest: RAM alloc failed");
+  asserts(umem_map_device(a, (uint64_t)ram, PAGE_SIZE,
+                          VM_DEVICE_READ | VM_DEVICE_WRITE) == SYSERR_INVAL,
+          "devmem selftest: conventional RAM accepted");
+  asserts(umem_free(a, (uint64_t)ram) == 0,
+          "devmem selftest: RAM cleanup failed");
+
+  // Firmware backing is readable but never delegatable.
+  uint64_t fw = (uint64_t)rsdp & ~(uint64_t)(PAGE_SIZE - 1);
+  asserts(umem_map_device(a, fw, PAGE_SIZE,
+                          VM_DEVICE_READ | VM_DEVICE_FIRMWARE) == 0,
+          "devmem selftest: ACPI map failed");
+  asserts(user_range_ok(a, fw, PAGE_SIZE, false),
+          "devmem selftest: ACPI owner cannot read");
+  asserts(umem_share(a, fw, b->pid, PAGE_R) == SYSERR_INVAL,
+          "devmem selftest: ACPI block delegated");
+  asserts(umem_free(a, fw) == 0, "devmem selftest: ACPI free failed");
+
+  // A Q35 framebuffer page exercises the ordinary UC, delegatable case.
+  if (framebuffer_base >= 0xC0000000ull &&
+      framebuffer_base + PAGE_SIZE <= 0xFEC00000ull) {
+    uint64_t mmio = framebuffer_base & ~(uint64_t)(PAGE_SIZE - 1);
+    asserts(umem_map_device(a, mmio, PAGE_SIZE,
+                            VM_DEVICE_READ | VM_DEVICE_WRITE) == 0,
+            "devmem selftest: MMIO map failed");
+    asserts(umem_map_device(b, mmio, PAGE_SIZE, VM_DEVICE_READ) ==
+                SYSERR_EXIST,
+            "devmem selftest: overlapping device block allowed");
+    asserts(umem_share(a, mmio, b->pid, PAGE_R) == 0,
+            "devmem selftest: BAR-style share failed");
+    paging_flags_t f;
+    bool present;
+    asserts(as_getinfo(b->as, mmio, &f, &present) == 0 && present &&
+                (f & (PAGE_U | PAGE_UC)) == (PAGE_U | PAGE_UC) &&
+                !(f & PAGE_W),
+            "devmem selftest: shared cache/rights not inherited");
+    asserts(umem_unshare(b, mmio) == 0,
+            "devmem selftest: BAR-style unshare failed");
+    asserts(umem_free(a, mmio) == 0,
+            "devmem selftest: device free failed");
+  }
+
+  destroy_test_process(a);
+  destroy_test_process(b);
+  printf("devmem: device-backed ublock selftest ok\n");
 }
 
 // Boot-time test of the channel plumbing that doesn't need running
@@ -381,6 +437,11 @@ efi_status_t efi_main(efi_handle_t handle, struct efi_system_table *system) {
   // paging, interrupts, etc still not yet set up
   cpu_setup_bsp(rsdp);
 
+  // Snapshot the firmware classification before its loader-data map can be
+  // recycled, then establish VT-d default-deny before any user AS exists.
+  platform_mem_init(n_mmap, mmap, rsdp);
+  iommu_init_required(rsdp);
+
   // Initialize per-CPU runqueues before bringing up APs — APs will call
   // scheduler_loop() as soon as they finish cpu_setup, which needs
   // cs->scheduler.lock + queue to be live.
@@ -396,6 +457,7 @@ efi_status_t efi_main(efi_handle_t handle, struct efi_system_table *system) {
   // exist by now, so g_as_kernel is in its final boot-static shape and
   // user ASes can clone it directly.
   umem_selftest();
+  device_block_selftest(rsdp, g_bootinfo.fb_base);
   channel_selftest();
   process_selftest();
 

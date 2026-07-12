@@ -119,6 +119,7 @@ struct process {
   // path when those blocks die.
   struct ring *share_ch;
   struct ring *tree_ch;
+  struct ring *iommu_ch;
 };
 
 // Spawn a user thread that starts at `entry` in ring 3 on `user_stack_top`

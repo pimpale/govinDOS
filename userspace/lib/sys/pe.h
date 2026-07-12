@@ -20,4 +20,16 @@
 uint64_t pe_spawn(const uint8_t *image, uint64_t len, uint64_t arg,
                   uint64_t stack_len);
 
+struct pe_resource {
+  uint64_t base;
+  uint64_t prot;
+};
+
+// As pe_spawn, but establishes read/write views of parent-owned blocks in the
+// embryo before its first thread can run.
+uint64_t pe_spawn_resources(const uint8_t *image, uint64_t len, uint64_t arg,
+                            uint64_t stack_len,
+                            const struct pe_resource *resources,
+                            uint32_t nresources);
+
 #endif // pe_h_INCLUDED

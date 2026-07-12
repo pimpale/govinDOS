@@ -26,7 +26,6 @@
 
 #include <stdint.h>
 
-#include <gdos/kring_groups.h>
 #include <gdos/kring_shares.h>
 #include <gdos/kring_tree.h>
 
@@ -97,6 +96,11 @@ static void test_memory(void) {
   print_hex(sys_vm_unshare(blk));
   print("pe: cleanup vm_free rc=");
   print_hex(sys_vm_free(blk));
+
+  // The removed wait-group id stays vacant; later schemes retain their ids.
+  struct kring removed;
+  print("pe: removed scheme -2 rc=");
+  print_hex(kring_create(&removed, (int64_t)-2, 4096));
 
   // The kernel must refuse to touch non-PAGE_U memory on our behalf
   // (expect SYSERR_FAULT, ...fffe).
@@ -263,100 +267,33 @@ static void await_child_death(struct kring *tch) {
   kring_ack(tch); // consumption ack
 }
 
-// ---------------------------------------------------------------------------
-// Wait-group (scheme -2) helpers on <kring.h>
-// ---------------------------------------------------------------------------
-
-static void group_submit(struct kring *g, uint64_t op, uint64_t a,
-                         uint64_t b) {
-  struct ksqe *sqe = kring_get_sqe(g);
-  // The suite never has more than a couple in flight; a full SQ here is
-  // a bug worth crashing on.
-  sqe->op = op;
-  sqe->a = a;
-  sqe->b = b;
-  sqe->c = 0;
-  kring_submit(g);
-}
-
-// Consume CQEs (printing everything on the way) until an event of this
-// type (and, unless 0, this cookie in `a`) shows up — but nothing past
-// the hit: two awaited events can land in one batch, and one consumed
-// while hunting a different one would be lost to the next await. Each
-// consumption is acked so level state replays.
-static void group_await(struct kring *g, uint64_t type, uint64_t cookie) {
-  while (1) {
-    struct kcqe cqe;
-    kring_wait_cqe(g, &cqe);
-    kring_ack(g);
-    if (cqe.type & KEV_EVENT_BIT) {
-      print("tests(group): event lo=");
-      print_hex(((cqe.type & 0xFF) << 32) | (cqe.a & 0xFFFFFFFF));
-      if (cqe.type == type && (cookie == 0 || cqe.a == cookie)) {
-        return;
-      }
-    } else {
-      print("tests(group): completion op=");
-      print_hex((cqe.type << 32) | (cqe.status & 0xFFFFFFFF));
-    }
-  }
-}
-
-// Multiplexing server: one park spot (the group) hears a user channel, a
-// registered kernel channel (the tree channel), and revocation.
-static void test_wait_group(struct kring *tch) {
-  struct kring g;
-  print("tests: kring_create(g, -2) rc=");
-  print_hex(kring_create(&g, KSCHEME_GROUPS, 4096));
-
-  // Register the tree channel (a kernel channel we own): child deaths
-  // will now show up as KEV_READY{0x7EE} here.
-  group_submit(&g, KGROUP_ADD, tch->base, 0x7EE);
-  // Group-in-group must be refused (completion carries the error).
-  group_submit(&g, KGROUP_ADD, g.base, 0xBAD);
-
-  // Bootstrap channel + child, as before — but init multiplexes on the
-  // group instead of parking on the block.
-  uint64_t boot_ch = sys_vm_alloc(4096, VM_PROT_READ | VM_PROT_WRITE);
-  volatile uint32_t *req = (volatile uint32_t *)(boot_ch + CH_REQ_OFF);
-  volatile uint32_t *resp = (volatile uint32_t *)(boot_ch + CH_RESP_OFF);
-  volatile char *msg = (volatile char *)(boot_ch + CH_MSG_OFF);
-  static const char hello2[] = "hello through the wait-group";
-  for (uint64_t i = 0; i <= sizeof(hello2) - 1; i++) {
-    msg[i] = hello2[i];
-  }
-  uint64_t c4 = spawn_child(child_main, boot_ch);
-  group_submit(&g, KGROUP_ADD, boot_ch, 0xC0FFEE);
-
-  __atomic_store_n(req, 1, __ATOMIC_RELEASE);
-  sys_block_doorbell(boot_ch);
-
-  // The child's reply doorbell lands as KEV_READY{C0FFEE} in the group.
-  group_await(&g, KEV_READY, 0xC0FFEE);
-  print(__atomic_load_n(resp, __ATOMIC_ACQUIRE) == 1
-            ? "tests: group heard the reply doorbell ok\n"
-            : "tests: GROUP WOKE WITHOUT RESPONSE\n");
-
-  // Let the child park again, then revoke the channel: the registration
-  // must turn into KEV_DEAD{C0FFEE} (POLLHUP, auto-removed)...
+// A second thread proves that an owned, unshared block is a local event:
+// the durable sequence closes an early-wake race, while the doorbell wakes
+// the owner-side waiter when the first thread is already parked.
+static void local_event_waker(uint64_t event_base) {
   for (int i = 0; i < 64; i++) {
     sys_yield();
   }
-  print("tests: vm_free(boot_ch) rc=");
-  print_hex(sys_vm_free(boot_ch));
-  group_await(&g, KEV_DEAD, 0xC0FFEE);
+  volatile uint32_t *seq = (volatile uint32_t *)event_base;
+  __atomic_store_n(seq, 1, __ATOMIC_RELEASE);
+  sys_block_doorbell(event_base);
+  sys_exit();
+}
 
-  // ...and the child's death reaches us through the registered tree
-  // channel: KEV_READY{7EE} in the group, KEV_CHILD_DEAD underneath.
-  group_await(&g, KEV_READY, 0x7EE);
-  await_child_death(tch);
-  reap_child(c4);
-
-  // DEL the tree registration and drop the group; the tree channel is
-  // directly parkable again (which _start relies on).
-  group_submit(&g, KGROUP_DEL, tch->base, 0);
-  print("tests: vm_free(group) rc=");
-  print_hex(kring_destroy(&g));
+static void test_local_event(void) {
+  uint64_t event = sys_vm_alloc(4096, VM_PROT_READ | VM_PROT_WRITE);
+  uint64_t stack = sys_vm_alloc(4096, VM_PROT_READ | VM_PROT_WRITE);
+  volatile uint32_t *seq = (volatile uint32_t *)event;
+  uint64_t tid = sys_thread_spawn(sys_getpid(), (uint64_t)local_event_waker,
+                                  stack + 4096, event);
+  print("tests: local event waker tid=");
+  print_hex(tid);
+  uint64_t rc = sys_block_wait(seq, 0);
+  print(rc == 0 && __atomic_load_n(seq, __ATOMIC_ACQUIRE) == 1
+            ? "tests: local wait/doorbell ok\n"
+            : "tests: LOCAL WAIT/DOORBELL FAILED\n");
+  // The waker may still be exiting on its stack; both allocations are
+  // reclaimed with the process rather than racing its TCB teardown here.
 }
 
 static void test_process_tree(struct kring *tch) {
@@ -428,8 +365,6 @@ static void test_process_tree(struct kring *tch) {
   await_child_death(tch);
   reap_child(c3);
 
-  // --- Child 4: multiplex through a wait-group --------------------------
-  test_wait_group(tch);
 }
 
 void _start(uint64_t arg) {
@@ -446,6 +381,7 @@ void _start(uint64_t arg) {
   print("tests: back from yield\n");
 
   test_memory();
+  test_local_event();
 
   // Tree channel: our children's deaths arrive here (we are a mid-tree
   // process now — init watches for OUR death the same way).

@@ -70,4 +70,10 @@ const struct acpi_rsdp *acpi_init(struct efi_system_table *system);
 // for the MADT. Returns nullptr if not present or invalid.
 const struct acpi_madt *acpi_find_madt(const struct acpi_rsdp *rsdp);
 
+// Checked four-character SDT lookup shared by the architecture backends and
+// the early platform registry. The returned table has a valid header length
+// and checksum. `signature` need not be NUL terminated.
+const struct acpi_sdt_header *acpi_find_table(const struct acpi_rsdp *rsdp,
+                                              const char signature[4]);
+
 #endif // acpi_h_INCLUDED

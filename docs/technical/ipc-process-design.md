@@ -1,7 +1,7 @@
 # IPC & process design: channels, kernel schemes, fault reflection, threads, process trees
 
 Status: **implemented 2026-07-07** — §§1, 2, 4, 5 all landed (channels +
-schemes -1/-2/-3, process trees, zombies + reap, kernel-thread deletion,
+schemes -1/-3, process trees, zombies + reap, kernel-thread deletion,
 `g_as_template` collapse); **§3 fault reflection remains unimplemented**
 (its own session, as planned). §7 records where the implementation
 deliberately diverges. Companion to [memory-design.md](memory-design.md);
@@ -10,8 +10,8 @@ document contradicts details of that one (notably the reaper kthread in
 its §7 and the eager teardown walks in its §6), this one is what's
 implemented — the reaper kthread is gone.
 
-Implementation map: `channel.c/h` (channels, kernel ring ABI, schemes,
-waiter slots, wait-groups), `process.c/h` (tree, embryo, kill, zombies,
+Implementation map: `channel.c/h` (channels, private events, kernel ring ABI,
+schemes, waiter slots), `process.c/h` (tree, embryo, kill, zombies,
 reap steps), `umem.c/h` (share edges, revoke authority, VM_MOVE
 mechanics, live-pid index), `syscall.c/h` (dispatch; SYSCALL/SYSRET),
 `userspace/bin/tests/tests.c` (the ring-3 test suite for all of it —
@@ -30,13 +30,13 @@ the roles; see [boot-init-design.md](boot-init-design.md)).
   the kernel (§2).
 - **Kernel services are channels, not syscalls.** Redox-scheme-shaped:
   sharing a block to a *negative* id creates a channel whose far end is
-  a kernel scheme (§2: share notifications, wait-groups; later: name
+  a kernel scheme (§2: share notifications; later: name
   registry, timers, devices). No kernel thread consumes them — commands
   run in the doorbeller's syscall context (the io_uring-enter model) and
   events post in the syscall/IRQ context of whoever caused them. Design
   law replacing "short syscalls must not block": **kernel-channel
   commands are bounded and non-blocking**; long-lived interest is a
-  registration, and results are events.
+  registration in the owning scheme, and results are events.
 - **Channel blocks are client-owned.** A client can
   impose costs on a server anyway (request spam, expensive requests);
   servers defend themselves with their own quota/accounting policy, in
@@ -50,9 +50,8 @@ the roles; see [boot-init-design.md](boot-init-design.md)).
   budgets are deferred to the capability design.
 - **Teardown has one authority: the revoke path.** Free, unshare,
   decline, and death all land in the same umem code, which wakes parked
-  peers with an error or posts the death event to their registration.
-  There is no parallel IPC bookkeeping to keep in sync with block
-  lifetime.
+  peers with an error. There is no parallel IPC bookkeeping to keep in
+  sync with block lifetime.
 - **Death is O(1); the dead are zombies until their parent reaps them.**
   Pids are u64, allocated monotonically, never reused. Cross-process
   references are `(pid, base)` pairs checked against a live-pid index,
@@ -130,6 +129,9 @@ these verbs create and destroy blocks, they don't position anything.)
     channel per process).
 
 - `SYS_BLOCK_DOORBELL(base) -> 0` — role-inferred, never blocks.
+  - Owned block with no sharers or scheme: wakes the owner's waiter slot.
+    This is a process-private event block; userspace supplies the durable
+    sequence/queue state and may use it to wake another thread locally.
   - User peer on the far side: wakes the thread parked on the *other*
     side of the block, if any (its `SYS_BLOCK_WAIT` returns 0); success
     and no-op otherwise. Never reads the block.
@@ -151,8 +153,8 @@ these verbs create and destroy blocks, they don't position anything.)
   (`SYSERR_INVAL` otherwise). Under the block's stripe lock: load the
   32-bit word at `addr`; if it differs from `expected`, return 0
   immediately; else park in the caller's side slot until a wake: the
-  peer's doorbell or, on a kernel channel, the kernel posting a CQE
-  (returns 0); or revocation (`SYSERR_DEAD`). Parking on a user channel
+  local or peer doorbell or, on a kernel channel, the kernel posting a CQE
+  (returns 0); or revocation/identity change (`SYSERR_DEAD`). Parking on a user channel
   whose peer process is no longer live fails `SYSERR_DEAD` up front (a
   live-pid index check, §4) — only threads already parked at the death
   wait for reap-time revocation. Doorbell, post, and park all take that
@@ -161,13 +163,15 @@ these verbs create and destroy blocks, they don't position anything.)
   `ring_wait_user`, generalized to a caller-chosen word. The loaded word is untrusted:
   the kernel only compares it, and a lying peer can only misdirect
   waiters who chose to rendezvous with it. `SYSERR_EXIST` if the side
-  already has a waiter — SPSC is a rule, one thread per side per
-  channel; multi-threaded endpoints shard across blocks.
+  already has a waiter — one thread per side, or per private block;
+  multi-threaded endpoints shard across blocks.
 
-For user↔user channels a block must have exactly one sharer; both
-data-plane calls return `SYSERR_INVAL` on a block with zero or several
-sharers, or when the caller is neither participant. A kernel channel's
-far side is the scheme; it has no sharer entry.
+An owned block with zero sharers is the process-private case. A user↔user
+channel has exactly one sharer. Both data-plane calls return `SYSERR_INVAL`
+on a block with several sharers or when the caller is neither participant.
+A kernel channel's far side is the scheme; it has no sharer entry. The
+first share changes private-event identity into channel identity and wakes
+any prior private waiter with `SYSERR_DEAD`.
 
 ### Establishment flow
 
@@ -189,9 +193,8 @@ client with `SYSERR_DEAD` like any other revocation.
 
 ### Ownership and failure modes
 
-Every teardown edge funnels through the revoke path; waking a parked
-peer with `SYSERR_DEAD` (or posting the death event to its group
-registration, §2) happens exactly where the view is torn out, so
+Every teardown edge funnels through the revoke path; waking a parked peer
+with `SYSERR_DEAD` happens exactly where the view is torn out, so
 error-on-park and fault-on-touch cannot disagree.
 
 - **Server unshares:** immediate — the client keeps its own block, and
@@ -273,8 +276,8 @@ cannot overflow by construction: completions are 1:1 with consumed SQEs
 ### Scheme `-1`: shares
 
 One per process (`SYSERR_EXIST` on a second). Where incoming shares
-announce themselves. No commands — like `-3`, a pure event channel
-(only `-2` has SQEs at all); rejection is `SYS_VM_UNSHARE`, an
+announce themselves. No commands — like `-3`, a pure event channel;
+rejection is `SYS_VM_UNSHARE`, an
 ordinary syscall, not a scheme op.
 
 | CQE | fields | when |
@@ -289,49 +292,30 @@ size and peer identity from the event, never from block contents;
 everything *inside* the block is hostile until validated.
 
 A single-purpose server's whole event loop is `BLOCK_WAIT` on this one
-channel — no dedicated acceptor thread needed; a multiplexing server
-registers it in a group (below).
+channel. A multiplexing runtime uses dedicated structural waiters and
+process-private event blocks, or arranges for its servers to publish
+already-multiplexed completion queues.
 
-### Scheme `-2`: wait-groups
+### Process-private events and userspace multiplexing
 
-Many per process. The epoll fixed point — *any lossless readiness
-design is either a bitmap or a queue with dedup* — landed on the queue
-arm, with the dedup that makes it lossless.
+There is deliberately no scheme `-2`. Kernel wait-groups made a channel
+wake forward into another ublock, requiring registration lifetime state,
+two-stripe ordering, CQ deduplication, and kernel-side fanout policy. An
+arbitrary listener count also makes the borrowed kernel path unbounded.
 
-| SQE | fields | effect |
-|---|---|---|
-| `ADD` | base, cookie | registers the caller's side of the channel at `base` — a user channel or a kernel channel the caller owns (group-in-group: `SYSERR_INVAL`). The side's waiter slot becomes the registration (registered XOR parked — `SYSERR_EXIST`, the SPSC rule again). `SYSERR_NOMEM` if `2·registrations` would exceed the group's CQ slots |
-| `DEL` | base | removes the registration and its bits; the side is parkable again. Already-posted events stay — tolerating stale cookies is userspace's problem, exactly as with epoll |
+Instead, an owned unshared ublock is a local event object. One thread parks
+on a userspace sequence word with `BLOCK_WAIT`; another updates the durable
+queue/sequence and calls `BLOCK_DOORBELL` on the same block. There remains
+one parked thread per block, so runtimes shard local event blocks or use a
+small number of structural waiter threads.
 
-| CQE | fields | when |
-|---|---|---|
-| `EV_READY` | cookie | a wake lands on a registered side: peer doorbell on a user channel, CQE post on a registered kernel channel |
-| `EV_DEAD` | cookie | the registered view is revoked; the registration is auto-removed with it (POLLHUP; no `DEL` needed for a dead channel) |
-
-`cookie` is an opaque u64, epoll-style; there is no kernel id
-namespace — blocks are already global names. The group's own wait is
-`SYS_BLOCK_WAIT` on its CQ count word, like any kernel channel.
-
-**Lossless dedup needs two bits per registration.** A wake on a
-registered side with pending *clear* posts `EV_READY` and sets pending;
-with pending *set* it just sets absorbed — the unconsumed event already
-covers it, but the arrival is remembered. When the owner's doorbell
-acknowledges consumption (SQ processing advances the kernel's view of
-what the user has seen), registrations whose event was consumed either
-re-post immediately (absorbed set — pending stays) or clear pending. A
-wake that lands between the server draining a channel and acknowledging
-its event therefore re-fires instead of vanishing: at most one
-`EV_READY` outstanding per registration, and no lost wakeups. With
-`EV_DEAD` at most once per registration ever, `2·registrations <= CQ
-slots` makes overflow impossible by construction, enforced at `ADD`.
-
-**Registration ordering discipline:** register a new channel *before*
-acking its client in-band, and the channel is provably cold at ADD time
-(the client sends nothing until acked) — no backfill scan needed.
-Registering an already-hot channel (migration between groups) is the
-one case that needs a drain-once-then-wait after ADD. Registered kernel
-channels get backfill for free: if their CQ is non-empty at ADD, the
-kernel posts `EV_READY` immediately (it can see its own queue).
+High-fan-in services multiplex before crossing protection domains: for
+example, a network stack posts `{connection-id, buffer}` completions for
+many connections into a per-worker channel and rings it once per batch.
+Userspace runtimes build epoll-shaped subscription graphs, ready queues,
+and coroutine scheduling above these sharded channels. A dedicated waiter
+per unrelated service channel can forward into process-private queues when
+the producers cannot share one completion stream.
 
 ### Scheme `-3`: tree
 
@@ -592,12 +576,8 @@ capability design rather than inferred from a user identity.
    parent-driven after step 2, delete the kthread machinery + legacy
    kernel rings, dummydev becomes a device scheme, collapse
    `g_as_template` into `g_as_kernel`.
-5. **The wait-group scheme** (§2 `-2`).
-
 Steps 1–3 are order-independent among themselves; step 4 needs 2 (the
-reap model replaces the reaper kthread) and unlocks the template
-collapse; step 5 is pure addition on hooks steps 1 and 2 leave in
-place.
+reap model replaces the reaper kthread) and unlocks the template collapse.
 
 In practice steps 2 and 4 were one changeset: the reaper is itself a
 kthread, and kill must enumerate every park site, so the legacy
@@ -659,20 +639,16 @@ rings/dummydev (and their kthreads) had to go with it.
   (a scheme endpoint is owner-bound identity); sharer edges survive the
   move; a receiver's pre-existing shared-in view is subsumed. Any move
   wakes parked waiters SYSERR_DEAD — ownership is channel identity.
-- **Sharing a single-sharer block to a second pid** also wakes parked
-  waiters SYSERR_DEAD (the channel identity those waiters relied on is
-  gone; data-plane calls need exactly one sharer).
+- **Sharing changes wait identity at both boundaries.** The first share
+  turns a private event block into a channel; the second makes it ordinary
+  multi-sharer memory. Either transition wakes existing waiters SYSERR_DEAD.
 - **Resource budgets are not wired**: there are no kernel uid accounts or
   per-process limits. A later capability design may add explicit budgets.
-- **Wait-groups**: the two dedup bits are implemented as
-  `pending`/`armed` plus the CQ index of the outstanding KEV_READY
-  (consumption is FIFO, so `index < cq_head` retires it on the next
-  ack). KEV_DEAD is level state too — a dead registration lingers on the
-  group until its event posts. Destroying a *group* silently detaches
-  its registrations (the listener itself is gone; the sides become
-  parkable again). `ADD` enforces `2·(nregs+1) <= nslots`; command
-  completions share the CQ with events, so a submitter who keeps the SQ
-  saturated can still delay (never lose) event delivery.
+- **Wait-groups were removed (2026-07-12).** Scheme `-2`, its ABI, channel
+  registration slots, cross-block forwarding, and two-stripe ranked wake
+  path are gone. Process-private ublock events plus sharded server queues are
+  the userspace building blocks for multiplexing. Existing scheme ids were
+  intentionally not renumbered.
 - **SYS_THREAD_SPAWN carries an `arg`** (4th syscall argument) delivered
   in the child thread's first argument register — how init hands a
   child its bootstrap-channel address without any other channel yet.
@@ -680,8 +656,8 @@ rings/dummydev (and their kthreads) had to go with it.
   remaining caller); its death is a kernel panic. hello.c is init and
   the whole ring-3 test suite: it builds children per §5 (embryo, move,
   share-image-RX — SASOS makes the entry pointer valid cross-AS —
-  pre-seeded bootstrap channel, spawn) and exercises channels, revoke
-  wakes, kill, tree events, reap, and wait-group multiplexing.
+  pre-seeded bootstrap channel, spawn) and exercises channels, local event
+  wakes, revoke wakes, kill, tree events, and reap.
 - **Live-pid index** is the linear registry vec from umem.c (processes
   are few; binary search when it hurts). Sharer entries and shared_in
   still hold `struct process *` / `ublock *` pointers rather than
@@ -700,41 +676,27 @@ specifically — the authoritative comments live in `umem.h`,
 `channel.c`, and `channel_internal.h`:
 
 - **Two planes.** `SYS_BLOCK_WAIT` and `SYS_BLOCK_DOORBELL` on user
-  channels — *including* `KEV_READY` delivery into a wait-group when
-  the far side is registered — run on list lock + stripes only;
-  unrelated channels never contend. Ring drains, replays, registration
-  surgery (`KGROUP_ADD`/`DEL`), and teardown stay under `g_umem`: they
-  execute commands against cross-block control state (regs vec, share
-  edges' notified bits, `p->children`) whose invariants pair with
-  `g_umem` structures, and the drain's `sq_head` cursor wants a
-  serializer anyway.
+  channels and private event blocks run on list lock + one stripe only;
+  unrelated blocks never contend. Ring drains, replays, and teardown stay
+  under `g_umem`; the drain's `sq_head` cursor wants a serializer anyway.
 - **CQ publication is stripe-scoped, uniformly.** The full-check, CQE
   write, `cq_count` bump, and owner-side wake happen under
   stripe(ring block) for every scheme. The asymmetry to remember:
   holding the stripe does NOT by itself license posting for shares/
   tree — their posts must stay atomic with level-state flips
-  (`notified`/`death_notified`) that live under `g_umem`. Groups'
-  wake-state (`pending`/`armed`/`ev_index`/`dead`) lives under
-  stripe(group block) instead, which is exactly what makes data-plane
-  delivery legal there.
-- **The one two-stripe holder** is the data-plane channel→group wake
-  pair, acquired in ascending stripe-index order with
-  release-reacquire-revalidate on descending discovery
-  (`wake_user_side_ranked`). A reg observed in a side slot is pinned
-  while that slot's stripe is held (every detach clears the slot under
-  it before anything frees); a dying group marks its regs `dead` under
-  the group stripe before detaching, so a racing waker refuses a ring
-  mid-teardown and drops the wake — correct, since the only possible
-  listener is the group being destroyed. Control-plane code never
-  holds two stripes (g_umem pins regs, so it posts in sequential
-  single-stripe sections); ascending pairs can't cycle with each other
-  or with single holders.
+  (`notified`/`death_notified`) that live under `g_umem`.
+- **No current channel path holds two stripes.** A future cross-block
+  operation must pin both blocks and acquire stripe indices in ascending
+  order; the old registration-specific release/reacquire/revalidate path
+  was removed with scheme `-2`.
 - **`channel_block_torn` contract**: callers mutate channel identity
   first (edge pushed/removed, owner swapped, lists unlinked), then
-  call torn *without* the stripe — torn takes it itself, wakes/
-  detaches, and posts the owed KEV_DEADs afterward. Post-mutation
-  parkers fail classification; pre-mutation parkers are woken by torn.
+  call torn *without* the stripe — torn takes it itself and wakes parked
+  threads. Post-mutation parkers fail classification; pre-mutation parkers
+  are woken by torn. Scheme creation is the controlled exception: it holds
+  the owner's list lock while tearing a private waiter and publishing the
+  ring, so nobody can re-park in between.
 - **Layout**: per-scheme logic moved to `kernel/src/schemes/{shares,
-  tree,groups}.c` over the shared internals in `channel_internal.h`;
+  tree,irq}.c` over the shared internals in `channel_internal.h`;
   `channel.c` keeps the plumbing, data-plane syscalls, drains, and
   teardown.

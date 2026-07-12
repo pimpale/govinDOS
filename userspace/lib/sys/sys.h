@@ -96,6 +96,10 @@ static inline uint64_t sys_vm_unshare(uint64_t base) {
 static inline uint64_t sys_vm_move(uint64_t base, uint64_t pid) {
   return sys2(SYS_VM_MOVE, base, pid);
 }
+static inline uint64_t sys_vm_map_device(uint64_t base, uint64_t len,
+                                         uint64_t flags) {
+  return sys3(SYS_VM_MAP_DEVICE, base, len, flags);
+}
 
 static inline uint64_t sys_block_doorbell(uint64_t base) {
   return sys1(SYS_BLOCK_DOORBELL, base);

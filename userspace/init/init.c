@@ -14,6 +14,7 @@
 
 #include <gdos/bootinfo.h>
 #include <gdos/kring_tree.h>
+#include <gdos/pci.h>
 
 #include <cpio.h>
 #include <kring.h>
@@ -73,13 +74,14 @@ static void reap_child(uint64_t pid) {
 }
 
 // Wait for the next KEV_CHILD_DEAD on the tree channel and consume it.
-static void await_child_death(struct kring *tch) {
+static uint64_t await_child_death(struct kring *tch) {
   struct kcqe cqe;
   kring_wait_cqe(tch, &cqe);
   print(cqe.type == KEV_CHILD_DEAD ? "init: KEV_CHILD_DEAD pid="
                                    : "init: BAD TREE EVENT pid=");
   print_hex(cqe.a);
   kring_ack(tch);
+  return cqe.a;
 }
 
 void _start(uint64_t arg) {
@@ -97,6 +99,41 @@ void _start(uint64_t arg) {
   print("init: kring_create(tch, -3) rc=");
   print_hex(kring_create(&tch, KSCHEME_TREE, 4096));
 
+  // PCI configuration manager starts before ordinary children and remains
+  // the parent of future hardware drivers. Its sole entry argument is the
+  // RSDP physical address extracted from bootinfo.
+  const uint8_t *pcid = nullptr;
+  uint64_t pcid_len = 0;
+  const uint8_t *nvmed = nullptr;
+  uint64_t nvmed_len = 0;
+  uint64_t bootstrap_base = 0;
+  uint64_t pcid_pid = 0;
+  struct pe_resource resources[2] = {0};
+  if (cpio_find(bootfs_start, (uint64_t)(bootfs_end - bootfs_start),
+                "pcid.exe", &pcid, &pcid_len) != 0 ||
+      cpio_find(bootfs_start, (uint64_t)(bootfs_end - bootfs_start),
+                "nvmed.exe", &nvmed, &nvmed_len) != 0) {
+    print("init: INITFS MISSING pcid.exe\n");
+  } else {
+    bootstrap_base = sys_vm_alloc(4096, VM_PROT_READ | VM_PROT_WRITE);
+    struct pcid_bootstrap *bootstrap = (void *)bootstrap_base;
+    *bootstrap = (struct pcid_bootstrap){
+        .acpi_rsdp = ((const struct bootinfo *)arg)->acpi_rsdp,
+        .driver_image = (uint64_t)nvmed,
+        .driver_image_length = nvmed_len,
+    };
+    resources[0] =
+        (struct pe_resource){.base = (uint64_t)&__ImageBase,
+                             .prot = VM_PROT_READ};
+    resources[1] = (struct pe_resource){.base = bootstrap_base,
+                                        .prot = VM_PROT_READ};
+    pcid_pid = pe_spawn_resources(
+        pcid, pcid_len, bootstrap_base, 8 * 4096, resources,
+        sizeof(resources) / sizeof(resources[0]));
+    print("init: spawned pcid.exe pid=");
+    print_hex(pcid_pid);
+  }
+
   // The ring-3 test suite, shipped in the initfs and built as a real
   // separate process by the userland loader — the first consumer of the
   // whole boot design.
@@ -112,7 +149,18 @@ void _start(uint64_t arg) {
     print("init: spawned tests.exe pid=");
     print_hex(pid);
     if (pid != 0) {
-      await_child_death(&tch);
+      uint64_t dead;
+      do {
+        dead = await_child_death(&tch);
+        if (pcid_pid != 0 && dead == pcid_pid) {
+          reap_child(pcid_pid);
+          pcid_pid = pe_spawn_resources(
+              pcid, pcid_len, bootstrap_base, 8 * 4096, resources,
+              sizeof(resources) / sizeof(resources[0]));
+          print("init: restarted pcid.exe pid=");
+          print_hex(pcid_pid);
+        }
+      } while (dead != pid);
       reap_child(pid);
       print("init: tests.exe reaped\n");
     }
@@ -121,8 +169,16 @@ void _start(uint64_t arg) {
   print("init: up (parking on the tree channel)\n");
   while (1) {
     struct kcqe cqe;
-    kring_wait_cqe(&tch, &cqe); // parks; a stray event just loops us
+    kring_wait_cqe(&tch, &cqe);
     kring_ack(&tch);
+    if (pcid_pid != 0 && cqe.type == KEV_CHILD_DEAD && cqe.a == pcid_pid) {
+      reap_child(pcid_pid);
+      pcid_pid = pe_spawn_resources(
+          pcid, pcid_len, bootstrap_base, 8 * 4096, resources,
+          sizeof(resources) / sizeof(resources[0]));
+      print("init: restarted pcid.exe pid=");
+      print_hex(pcid_pid);
+    }
     sys_yield();
   }
 }

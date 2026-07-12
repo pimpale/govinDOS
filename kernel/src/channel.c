@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include "debug.h"
+#include "iommu.h"
 #include "process.h"
 #include "stdlib/stdlib.h"
 #include "stdlib/string.h"
@@ -12,38 +13,27 @@
 #include "uaccess.h"
 
 // Core channel plumbing: rings, wakes, the data-plane syscalls, and
-// teardown. Per-scheme logic lives in schemes/{shares,tree,groups}.c;
-// shared internals in channel_internal.h.
+// teardown. Per-scheme logic lives in schemes/{shares,tree,irq}.c; shared
+// internals in channel_internal.h.
 //
 // Locking (hierarchy in umem.h). Two planes:
 //
 //   Data plane — channel_block_wait and channel_block_doorbell on user
-//   channels, INCLUDING delivery into a wait-group when the far side is
-//   registered. Takes the caller's list lock to resolve the block, then
-//   stripes, never g_umem. The stripe serializes park vs wake vs tear
-//   (lossless wake protocol); the list lock pins the block; a reg read
-//   from a slot is pinned while that slot's stripe is held.
+//   channels and private event blocks. Takes the caller's list lock to
+//   resolve the block, then one stripe, never g_umem. The stripe serializes
+//   park vs wake vs tear (the lossless compare-and-park protocol); the list
+//   lock pins the block.
 //
-//   Control plane — ring drains, scheme replays, registration surgery,
-//   teardown: all under g_umem, exactly as before the split.
-//
-// Stripe pairing discipline: a KEV_READY delivery touches two blocks —
-// the registered channel (its slot, under stripe(b)) and the group ring
-// (its CQ + reg wake-state, under stripe(G)). The data plane holds both
-// simultaneously, acquired in ASCENDING stripe-index order; when the
-// discovered order is descending it releases, reacquires ascending, and
-// revalidates the slot (wake_user_side_ranked). All data-plane pair
-// holders acquiring in index order cannot cycle. Control-plane code
-// never holds two stripes at once: g_umem pins regs and rings, so it
-// posts in sequential single-stripe sections (channel_post, then
-// groups_forward). A control-plane single-stripe holder never waits on
-// a second stripe, so it cannot join a cycle either.
+//   Control plane — ring drains, scheme replays, and teardown: all under
+//   g_umem. CQ publication itself takes the ring block's stripe.
 
 // ---------------------------------------------------------------------------
 // Side classification + wakes
 // ---------------------------------------------------------------------------
 
-bool classify_side(struct process *p, ublock *b, bool *owner_out) {
+static bool classify_side(struct process *p, ublock *b, bool *owner_out,
+                          bool *local_out) {
+  *local_out = false;
   if (b->ring != nullptr) {
     if (b->owner != p) {
       return false; // ring blocks have no sharers: only the owner side
@@ -51,7 +41,16 @@ bool classify_side(struct process *p, ublock *b, bool *owner_out) {
     *owner_out = true;
     return true;
   }
-  if (vec_share_edge_len(b->sharers) != 1) {
+  uint32_t nsharers = vec_share_edge_len(b->sharers);
+  if (nsharers == 0) {
+    if (b->owner != p) {
+      return false;
+    }
+    *owner_out = true;
+    *local_out = true;
+    return true;
+  }
+  if (nsharers != 1) {
     return false;
   }
   bool is_owner = b->owner == p;
@@ -83,12 +82,11 @@ static void wake_slot(struct thread **slot, uint64_t result) {
 // once and never trusted: a cq_head run ahead of cq_count makes the
 // in-flight count wrap huge and the channel look permanently full,
 // starving only the liar. Callers treat a false return as "leave the
-// event pending in its level state" (notified bits, dead children,
-// armed/dead registrations); completions for consumed SQEs are dropped
-// instead, which can only hit a user violating the sizing rules.
+// event pending in its level state" (notified bits, dead children, IRQ
+// route state); completions for consumed SQEs are dropped instead, which
+// can only hit a user violating the sizing rules.
 bool ring_post_locked(struct ring *ring, uint64_t type, uint64_t a,
-                      uint64_t b, uint64_t status, struct reg **fwd_out) {
-  *fwd_out = nullptr;
+                      uint64_t b, uint64_t status) {
   struct kring_hdr *h = hdr_of(ring);
   uint32_t consumed = atomic_load_explicit(&h->cq_head, memory_order_acquire);
   if (ring->cq_count - consumed >= ring->nslots) {
@@ -98,126 +96,32 @@ bool ring_post_locked(struct ring *ring, uint64_t type, uint64_t a,
       (struct kcqe){.type = type, .a = a, .b = b, .status = status};
   ring->cq_count++;
   atomic_store_explicit(&h->cq_count, ring->cq_count, memory_order_release);
-  // The post is itself a wake on the ring's owner side. The slot lives
-  // under the stripe we hold; a registration is handed out instead of
-  // delivered (a second stripe must not nest here).
-  struct reg *r = *side_reg(ring->block, true);
-  if (r != nullptr) {
-    *fwd_out = r;
-  } else {
-    wake_slot(side_waiter(ring->block, true), 0);
-  }
+  // The post is itself a wake on the ring's owner side. The waiter slot
+  // and the CQ publication are serialized by the stripe we hold.
+  wake_slot(side_waiter(ring->block, true), 0);
   return true;
 }
 
 bool channel_post(struct ring *ring, uint64_t type, uint64_t a, uint64_t b,
                   uint64_t status) {
   uint32_t si = umem_stripe(ring->block->base);
-  struct reg *fwd;
   umem_stripe_lock(si);
-  bool posted = ring_post_locked(ring, type, a, b, status, &fwd);
+  bool posted = ring_post_locked(ring, type, a, b, status);
   umem_stripe_unlock(si);
-  if (fwd != nullptr) {
-    groups_forward(fwd); // pinned by g_umem; bounded: groups never forward
-  }
   return posted;
-}
-
-// Lock the stripe set for a wake on `side` of b: entered with stripe(si
-// == stripe(b)) held, returns with si still held plus, when the side is
-// registered, the registration's group stripe (== si when they collide),
-// and *r_out the slot occupant revalidated under that set (or nullptr).
-// The caller releases both.
-//
-// Pinning chain: the caller holds a lock that pins b itself (its list
-// lock, g_umem, or an IRQ route lock). While stripe(b) is held and r
-// sits in the slot, r and r->group's ring cannot be freed (every detach
-// path clears the slot under stripe(b) first, and frees happen strictly
-// after detach), so r->group may be dereferenced to find the second
-// stripe. Ascending acquisition; on descending discovery: release,
-// reacquire in order, revalidate the slot — it may have changed or even
-// been ABA-reused, in which case only the freshly-read value is trusted
-// and the loop redispatches on it.
-static void ranked_lock_side(ublock *b, bool side, uint32_t si,
-                             uint32_t *sg_out, struct reg **r_out) {
-  for (;;) {
-    struct reg *r = *side_reg(b, side);
-    if (r == nullptr) {
-      *r_out = nullptr;
-      *sg_out = si;
-      return;
-    }
-    uint32_t sg = umem_stripe(r->group->block->base);
-    if (sg >= si) {
-      if (sg != si) {
-        umem_stripe_lock(sg);
-      }
-      *r_out = r;
-      *sg_out = sg;
-      return;
-    }
-    // sg < si: reacquire ascending and revalidate.
-    umem_stripe_unlock(si);
-    umem_stripe_lock(sg);
-    umem_stripe_lock(si);
-    struct reg *r2 = *side_reg(b, side);
-    if (r2 == r && umem_stripe(r2->group->block->base) == sg) {
-      *r_out = r2;
-      *sg_out = sg;
-      return;
-    }
-    // The slot changed while nothing was held: drop the stale stripe
-    // and redispatch on the fresh value (still holding si).
-    umem_stripe_unlock(sg);
-  }
 }
 
 bool channel_post_data(struct ring *ring, uint64_t type, uint64_t a,
                        uint64_t b, uint64_t status, uint32_t *index_out) {
   ublock *blk = ring->block;
-  uint32_t sr = umem_stripe(blk->base);
-  umem_stripe_lock(sr);
-  uint32_t sg;
-  struct reg *r;
-  ranked_lock_side(blk, true, sr, &sg, &r);
-  // The slot cannot change while sr stays held, so the forward slot
-  // ring_post_locked hands back is exactly `r` and its group stripe is
-  // in the held set; a dead reg's listener is gone, so that wake drops.
-  struct reg *fwd;
-  bool posted = ring_post_locked(ring, type, a, b, status, &fwd);
+  uint32_t si = umem_stripe(blk->base);
+  umem_stripe_lock(si);
+  bool posted = ring_post_locked(ring, type, a, b, status);
   if (posted) {
     *index_out = ring->cq_count - 1;
-    if (fwd != nullptr && !fwd->dead) {
-      groups_notify_locked(fwd);
-    }
-  }
-  if (r != nullptr && sg != sr) {
-    umem_stripe_unlock(sg);
-  }
-  umem_stripe_unlock(sr);
-  return posted;
-}
-
-// Data-plane wake of one side of a user channel, following a
-// registration into its group without g_umem (pinning per
-// ranked_lock_side). Entered with stripe(b) (== `si`) held; returns
-// with all stripes released. r->dead (set under stripe(G) before a
-// dying group detaches) guards the delivery: a dead reg's listener is
-// gone, so the wake is dropped, not delivered into a ring that may be
-// mid-teardown.
-static void wake_user_side_ranked(ublock *b, bool side, uint32_t si) {
-  uint32_t sg;
-  struct reg *r;
-  ranked_lock_side(b, side, si, &sg, &r);
-  if (r == nullptr) {
-    wake_slot(side_waiter(b, side), 0);
-  } else if (!r->dead) {
-    groups_notify_locked(r);
-  }
-  if (r != nullptr && sg != si) {
-    umem_stripe_unlock(sg);
   }
   umem_stripe_unlock(si);
+  return posted;
 }
 
 // ---------------------------------------------------------------------------
@@ -228,20 +132,23 @@ static struct ring **shares_anchor(struct process *p) { return &p->share_ch; }
 
 static struct ring **tree_anchor(struct process *p) { return &p->tree_ch; }
 
+static struct ring **iommu_anchor(struct process *p) { return &p->iommu_ch; }
+
 static const struct scheme_ops g_schemes[] = {
     {.id = KSCHEME_SHARES,
      .replay = shares_replay,
      .anchor = shares_anchor},
-    {.id = KSCHEME_GROUPS,
-     .exec = groups_exec,
-     .init = groups_ring_init,
-     .replay = groups_replay,
-     .destroy = groups_endpoint_destroy},
     {.id = KSCHEME_TREE, .replay = tree_replay, .anchor = tree_anchor},
     {.id = KSCHEME_IRQ,
      .exec = irq_exec,
      .replay = irq_replay,
      .destroy = irq_endpoint_destroy},
+    {.id = KSCHEME_IOMMU,
+     .exec = iommu_exec,
+     .replay = iommu_replay,
+     .destroy = iommu_endpoint_destroy,
+     .anchor = iommu_anchor,
+     .destroyable = iommu_endpoint_destroyable},
 };
 
 static const struct scheme_ops *scheme_lookup(int64_t id) {
@@ -254,7 +161,7 @@ static const struct scheme_ops *scheme_lookup(int64_t id) {
 }
 
 static uint64_t scheme_exec(struct thread *curr, struct ring *ring,
-                            const struct ksqe *sqe) {
+                            struct ksqe *sqe) {
   if (ring->ops->exec == nullptr) {
     // Pure event schemes take no commands; a submitted SQE still consumes
     // its slot and completes, carrying the error.
@@ -343,7 +250,7 @@ uint64_t channel_scheme_create(struct process *p, uint64_t base,
   umem_lock();
   umem_proc_lock(p);
   ublock *b = umem_owned_locked(p, base);
-  if (b == nullptr || b->ring != nullptr ||
+  if (b == nullptr || b->backing != UBLOCK_RAM || b->ring != nullptr ||
       vec_share_edge_len(b->sharers) != 0) {
     umem_proc_unlock(p);
     umem_unlock();
@@ -367,13 +274,10 @@ uint64_t channel_scheme_create(struct process *p, uint64_t base,
   ring->ops = ops;
   ring->block = b;
   ring->nslots = KRING_NSLOTS(b->order);
-  if (ops->init != nullptr) {
-    ops->init(ring);
-  }
-
   // The kernel is the trusted producer: it owns the header from here on.
-  // Initialized before b->ring is published — until then the block has
-  // zero sharers, so no data-plane call can classify a side of it.
+  // First tear a possible private-block waiter. p's list lock prevents a
+  // new local waiter until b->ring is published below.
+  channel_block_torn(b, false);
   struct kring_hdr *h = (struct kring_hdr *)b->base;
   memset(h, 0, sizeof(*h));
   h->nslots = ring->nslots;
@@ -398,9 +302,8 @@ uint64_t channel_scheme_create(struct process *p, uint64_t base,
 
 uint64_t channel_block_doorbell(struct thread *curr, uint64_t base) {
   struct process *p = curr->proc;
-  // Data plane: any user-channel wake — including delivery into a
-  // wait-group — runs on list lock + stripes alone. Only kernel-ring
-  // doorbells (drains) go to the control plane.
+  // User-channel and private-block wakes run on list lock + one stripe.
+  // Only kernel-ring doorbells (drains) go to the control plane.
   umem_proc_lock(p);
   ublock *b = umem_view_locked(p, base, 1);
   if (b == nullptr) {
@@ -409,8 +312,8 @@ uint64_t channel_block_doorbell(struct thread *curr, uint64_t base) {
   }
   uint32_t si = umem_stripe(b->base);
   umem_stripe_lock(si);
-  bool owner;
-  if (!classify_side(p, b, &owner)) {
+  bool owner, local;
+  if (!classify_side(p, b, &owner, &local)) {
     umem_stripe_unlock(si);
     umem_proc_unlock(p);
     return SYSERR_INVAL;
@@ -420,9 +323,10 @@ uint64_t channel_block_doorbell(struct thread *curr, uint64_t base) {
     umem_proc_unlock(p);
     return doorbell_ring(curr, base);
   }
-  // Never reads the block. The list lock stays held across the ranked
-  // wake: it is what pins b through the reacquire-and-revalidate path.
-  wake_user_side_ranked(b, !owner, si);
+  // A private event block self-wakes its owner slot; a channel wakes its
+  // peer. The persistent notification state remains the userspace word.
+  wake_slot(side_waiter(b, local ? true : !owner), 0);
+  umem_stripe_unlock(si);
   umem_proc_unlock(p);
   return 0;
 }
@@ -452,13 +356,13 @@ uint64_t channel_block_wait(struct thread *curr, uint64_t addr,
   }
   uint32_t si = umem_stripe(b->base);
   umem_stripe_lock(si);
-  bool owner;
-  if (!classify_side(p, b, &owner)) {
+  bool owner, local;
+  if (!classify_side(p, b, &owner, &local)) {
     umem_stripe_unlock(si);
     umem_proc_unlock(p);
     return SYSERR_INVAL;
   }
-  if (b->ring == nullptr) {
+  if (b->ring == nullptr && !local) {
     // Fail fast if the peer process is no longer live: only threads
     // already parked at its death wait for reap-time revocation. (The
     // read is racy against a concurrent kill; losing that race just
@@ -471,10 +375,10 @@ uint64_t channel_block_wait(struct thread *curr, uint64_t addr,
       return SYSERR_DEAD;
     }
   }
-  if (*side_waiter(b, owner) != nullptr || *side_reg(b, owner) != nullptr) {
+  if (*side_waiter(b, owner) != nullptr) {
     umem_stripe_unlock(si);
     umem_proc_unlock(p);
-    return SYSERR_EXIST; // registered XOR parked; one thread per side
+    return SYSERR_EXIST; // one parked thread per side / private block
   }
 
   // The word is untrusted: only compared, never interpreted. A lying peer
@@ -500,33 +404,20 @@ uint64_t channel_block_wait(struct thread *curr, uint64_t addr,
 // ---------------------------------------------------------------------------
 
 void channel_block_torn(ublock *b, bool destroy_endpoint) {
-  // Caller holds g_umem, NOT the stripe, and has already made the
-  // identity-breaking mutation visible (edge pushed/removed, owner
-  // swapped, lists unlinked): a thread parking after that mutation
-  // fails classification, and everyone who parked before it is woken
-  // right here. Detach under the stripe, then post the owed KEV_DEADs
-  // in single-stripe sections (the regs are pinned by g_umem).
+  // Caller holds g_umem, not the stripe. Normally the identity-breaking
+  // mutation is already visible, so new parkers fail classification.
+  // Scheme creation instead holds the owner's list lock until it publishes
+  // b->ring. Either exclusion makes clearing the old slots final.
   uint32_t si = umem_stripe(b->base);
-  struct reg *own, *shr;
   struct ring *ring = nullptr;
   umem_stripe_lock(si);
   wake_slot(&b->owner_waiter, SYSERR_DEAD);
   wake_slot(&b->sharer_waiter, SYSERR_DEAD);
-  own = b->owner_reg;
-  b->owner_reg = nullptr;
-  shr = b->sharer_reg;
-  b->sharer_reg = nullptr;
   if (destroy_endpoint && b->ring != nullptr) {
     ring = b->ring;
     b->ring = nullptr;
   }
   umem_stripe_unlock(si);
-  if (own != nullptr) {
-    groups_reg_died(own);
-  }
-  if (shr != nullptr) {
-    groups_reg_died(shr);
-  }
   if (ring != nullptr) {
     struct ring **anchor = ring->ops->anchor != nullptr
                                ? ring->ops->anchor(b->owner)
@@ -538,12 +429,15 @@ void channel_block_torn(ublock *b, bool destroy_endpoint) {
     if (ring->ops->destroy != nullptr) {
       ring->ops->destroy(ring);
     }
-    // b->ring was cleared under the stripe and every registration is
-    // detached: nothing can newly reach this ring. Data-plane holders
-    // that reached it earlier finished before the detach acquired
-    // their pinning stripes.
+    // b->ring was cleared under the stripe, so no new data-plane holder
+    // can reach it; earlier holders finished before the clear acquired it.
     free(ring);
   }
+}
+
+bool channel_block_destroyable(ublock *b) {
+  return b->ring == nullptr || b->ring->ops->destroyable == nullptr ||
+         b->ring->ops->destroyable(b->ring);
 }
 
 void channel_unhook_process_locked(struct process *p) {
