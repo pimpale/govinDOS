@@ -101,9 +101,4 @@ void channel_block_torn(ublock *b, bool destroy_endpoint);
 // resources are gone. Reap performs the scheme cleanup first.
 bool channel_block_destroyable(ublock *b);
 
-// Kill-time unhook (process.c): remove every thread of `p` from the
-// waiter slots it could be parked in and requeue it for the scheduler's
-// dispatch cull.
-void channel_unhook_process_locked(struct process *p);
-
 #endif // channel_h_INCLUDED

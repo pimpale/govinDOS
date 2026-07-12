@@ -7,6 +7,7 @@
 #include "channel.h"
 #include "debug.h"
 #include "platform_mem.h"
+#include "process.h"
 #include "spinlock.h"
 #include "stdlib/stdlib.h"
 #include "stdlib/string.h"
@@ -50,17 +51,13 @@ void umem_stripe_unlock(uint32_t idx) { svclock_unlock(&g_stripes[idx]); }
 // Registry (under g_umem)
 // ---------------------------------------------------------------------------
 
-static vec_process_ptr *g_procs;
+static llrb_pid_process *g_procs;
 
 static struct process *proc_lookup(uint64_t pid) {
-  for (uint32_t i = 0; i < vec_process_ptr_len(g_procs); i++) {
-    struct process *p;
-    vec_process_ptr_get(g_procs, i, &p);
-    if (p->pid == pid) {
-      return p;
-    }
-  }
-  return nullptr;
+  struct process *p;
+  if (!llrb_pid_process_get(g_procs, &pid, &p))
+    return nullptr;
+  return p == nullptr || process_is_dead(p) ? nullptr : p;
 }
 
 // ---------------------------------------------------------------------------
@@ -99,18 +96,6 @@ static void remove_block(vec_ublock_ptr *v, const ublock *b) {
   int32_t i = find_block(v, b->base);
   asserts(i >= 0, "umem: block missing from list");
   vec_ublock_ptr_swap_and_pop(v, (uint32_t)i);
-}
-
-static void remove_proc(vec_process_ptr *v, const struct process *p) {
-  for (uint32_t i = 0; i < vec_process_ptr_len(v); i++) {
-    struct process *q;
-    vec_process_ptr_get(v, i, &q);
-    if (q == p) {
-      vec_process_ptr_swap_and_pop(v, i);
-      return;
-    }
-  }
-  asserts(false, "umem: process missing from list");
 }
 
 // Index of the edge sharing to `p`, or -1.
@@ -155,7 +140,7 @@ ublock *umem_view_locked(struct process *p, uint64_t addr, uint64_t len) {
 
 void umem_init(void) {
   asserts(g_procs == nullptr, "umem_init: called twice");
-  vec_process_ptr_new(&g_procs);
+  asserts(llrb_pid_process_new(&g_procs), "umem: pid tree alloc failed");
 }
 
 void umem_process_register(struct process *p) {
@@ -163,7 +148,8 @@ void umem_process_register(struct process *p) {
   vec_ublock_ptr_new(&p->blocks);
   vec_ublock_ptr_new(&p->shared_in);
   umem_lock();
-  vec_process_ptr_push(g_procs, &p);
+  asserts(llrb_pid_process_insert(g_procs, &p->pid, &p),
+          "umem: duplicate pid or pid node alloc failed");
   umem_unlock();
 }
 
@@ -234,9 +220,10 @@ uint64_t umem_map_device(struct process *p, uint64_t base, uint64_t len,
 
   // TODO(capability): v1 deliberately applies no caller policy here.
   umem_lock();
-  for (uint32_t pi = 0; pi < vec_process_ptr_len(g_procs); pi++) {
-    struct process *q;
-    vec_process_ptr_get(g_procs, pi, &q);
+  llrb_pid_process_iter iter;
+  llrb_pid_process_iter_begin(g_procs, &iter);
+  struct process *q;
+  while (llrb_pid_process_iter_next(&iter, nullptr, &q)) {
     umem_proc_lock(q);
     for (uint32_t bi = 0; bi < vec_ublock_ptr_len(q->blocks); bi++) {
       ublock *other;
@@ -256,9 +243,8 @@ uint64_t umem_map_device(struct process *p, uint64_t base, uint64_t len,
   // later clones inherit the same leaf from g_as_kernel.
   as_flag(g_as_kernel, base, end, kernel_flags);
   as_flush(g_as_kernel);
-  for (uint32_t pi = 0; pi < vec_process_ptr_len(g_procs); pi++) {
-    struct process *q;
-    vec_process_ptr_get(g_procs, pi, &q);
+  llrb_pid_process_iter_begin(g_procs, &iter);
+  while (llrb_pid_process_iter_next(&iter, nullptr, &q)) {
     as_flag(q->as, base, end, kernel_flags);
     as_flush(q->as);
   }
@@ -616,5 +602,7 @@ struct process *umem_proc_lookup_locked(uint64_t pid) {
 }
 
 void umem_proc_unregister_locked(struct process *p) {
-  remove_proc(g_procs, p);
+  struct process *removed;
+  asserts(llrb_pid_process_remove(g_procs, &p->pid, &removed) && removed == p,
+          "umem: process missing from pid tree");
 }

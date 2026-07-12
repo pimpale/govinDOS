@@ -25,6 +25,8 @@ static struct thread *process_spawn_thread_locked(struct process *p,
                                                   uint64_t stack_top,
                                                   uint64_t arg);
 
+#define REAP_TCB_BATCH 256
+
 void process_set_init(struct process *p) {
   asserts(g_init == nullptr, "process: init set twice");
   g_init = p;
@@ -68,7 +70,7 @@ static struct thread *process_spawn_thread_locked(struct process *p,
                                                   uint64_t entry,
                                                   uint64_t stack_top,
                                                   uint64_t arg) {
-  asserts(p->state != PROC_DEAD, "process: spawning into the dead");
+  asserts(!process_is_dead(p), "process: spawning into the dead");
   // First spawn seals the embryo: parent authority (VM_MOVE in,
   // parent-set protections) drops to normal peer.
   p->state = PROC_LIVE;
@@ -76,24 +78,36 @@ static struct thread *process_spawn_thread_locked(struct process *p,
   // Bookkeeping before the enqueue inside uthread_spawn: the thread can
   // run (and exit) on another CPU the moment it is enqueued.
   struct thread *t = uthread_spawn(p, entry, stack_top, arg);
+  t->proc_slot = vec_thread_ptr_len(p->threads);
   vec_thread_ptr_push(p->threads, &t);
   return t;
 }
 
 // ---------------------------------------------------------------------------
-// Death: O(subtree) mark + park-wake; everything else is lazy
+// Death: one direct mark; descendants observe it through their ancestry
 // ---------------------------------------------------------------------------
 
-static void remove_thread_ref(vec_thread_ptr *v, const struct thread *t) {
-  for (uint32_t i = 0; i < vec_thread_ptr_len(v); i++) {
-    struct thread *q;
-    vec_thread_ptr_get(v, i, &q);
-    if (q == t) {
-      vec_thread_ptr_swap_and_pop(v, i);
-      return;
+bool process_is_dead(const struct process *p) {
+  for (; p != nullptr; p = p->parent) {
+    if (atomic_load_explicit(&p->state, memory_order_acquire) == PROC_DEAD) {
+      return true;
     }
   }
-  asserts(false, "process: thread missing from list");
+  return false;
+}
+
+static void remove_thread_ref(struct process *p, const struct thread *t) {
+  uint32_t i = t->proc_slot;
+  uint32_t n = vec_thread_ptr_len(p->threads);
+  asserts(i < n, "process: bad thread slot");
+  struct thread *at, *last;
+  vec_thread_ptr_get(p->threads, i, &at);
+  vec_thread_ptr_get(p->threads, n - 1, &last);
+  asserts(at == t, "process: thread slot mismatch");
+  vec_thread_ptr_swap_and_pop(p->threads, i);
+  if (i != n - 1) {
+    last->proc_slot = i;
+  }
 }
 
 // Post KEV_CHILD_DEAD for `child` to its parent's tree channel, or leave
@@ -102,7 +116,7 @@ static void remove_thread_ref(vec_thread_ptr *v, const struct thread *t) {
 // itself dying — the grandparent hears about the parent instead.
 static void notify_parent_locked(struct process *child) {
   struct process *parent = child->parent;
-  if (parent == nullptr || parent->state == PROC_DEAD) {
+  if (parent == nullptr || process_is_dead(parent)) {
     child->death_notified = true; // nobody to tell, ever
     return;
   }
@@ -110,22 +124,23 @@ static void notify_parent_locked(struct process *child) {
 }
 
 static void mark_dead_locked(struct process *p) {
-  if (p->state == PROC_DEAD) {
+  if (process_is_dead(p)) {
     return;
   }
   asserts(p != g_init, "init died");
   p->state = PROC_DEAD;
   umem_proc_unregister_locked(p);
-  channel_unhook_process_locked(p);
-  // Death follows tree edges down: descendants die with their ancestor
-  // (this is also what reaps orphaned embryos — they have no threads, so
-  // nothing else could). Interior parents are dying here, so only the
-  // subtree root's parent gets a KEV_CHILD_DEAD (the caller posts it).
-  for (uint32_t i = 0; i < vec_process_ptr_len(p->children); i++) {
-    struct process *c;
-    vec_process_ptr_get(p->children, i, &c);
-    mark_dead_locked(c);
+}
+
+// Reap materializes effective death one process at a time. Interior
+// descendants do not notify their also-dead parents.
+static void materialize_dead_locked(struct process *p) {
+  if (p->state == PROC_DEAD) {
+    return;
   }
+  asserts(process_is_dead(p), "process: materializing the live");
+  p->state = PROC_DEAD;
+  umem_proc_unregister_locked(p);
 }
 
 void process_kill_subtree(struct process *p) {
@@ -138,10 +153,10 @@ void process_kill_subtree(struct process *p) {
 void process_thread_exited(struct thread *t) {
   struct process *p = t->proc;
   umem_lock();
-  remove_thread_ref(p->threads, t);
+  remove_thread_ref(p, t);
   free(t);
   uint64_t left = atomic_fetch_sub(&p->nthreads, 1) - 1;
-  if (left == 0 && p->state == PROC_LIVE) {
+  if (left == 0 && !process_is_dead(p)) {
     // Natural death: the last thread exited. Cascades exactly like a
     // kill — children never outlive their parent (daemonize via init).
     mark_dead_locked(p);
@@ -165,8 +180,9 @@ static uint64_t reap_step_locked(struct process *target,
   struct process *z = target;
   while (vec_process_ptr_len(z->children) > 0) {
     vec_process_ptr_get(z->children, 0, &z);
-    asserts(z->state == PROC_DEAD, "reap: live process inside dead subtree");
+    asserts(process_is_dead(z), "reap: live process inside dead subtree");
   }
+  materialize_dead_locked(z);
 
   if (iommu_reap_one_locked(z)) {
     return REAP_MORE;
@@ -179,6 +195,27 @@ static uint64_t reap_step_locked(struct process *target,
     return REAP_MORE; // caller runs umem_release_finish after unlocking
   }
   if (umem_reap_one_view_locked(z)) {
+    return REAP_MORE;
+  }
+  // Expensive resources are gone, so every blocked TCB has been detached
+  // from its waiter slot. Free a fixed batch from the vector tail. A
+  // RUNNABLE/RUNNING/DEAD tail remains scheduler-owned and is left alone.
+  uint32_t ntcbs = 0;
+  while (ntcbs < REAP_TCB_BATCH && vec_thread_ptr_len(z->threads) > 0) {
+    uint32_t i = vec_thread_ptr_len(z->threads) - 1;
+    struct thread *t;
+    vec_thread_ptr_get(z->threads, i, &t);
+    if (atomic_load_explicit(&t->on_cpu, memory_order_acquire) ||
+        atomic_load_explicit(&t->status, memory_order_acquire) !=
+            THREAD_BLOCKED) {
+      break;
+    }
+    remove_thread_ref(z, t);
+    free(t);
+    atomic_fetch_sub(&z->nthreads, 1);
+    ntcbs++;
+  }
+  if (ntcbs != 0) {
     return REAP_MORE;
   }
   if (atomic_load(&z->nthreads) != 0) {

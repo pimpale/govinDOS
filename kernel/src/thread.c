@@ -56,12 +56,13 @@ void thread_unblock(struct thread *t) {
   while (atomic_load_explicit(&t->on_cpu, memory_order_acquire)) {
     __asm__ volatile("pause");
   }
-  // status read is unsynchronized — fine while there's only one possible
-  // unblocker per blocked thread (the SPSC waiter-slot rule; a killer
-  // unhooks the slot under the umem lock first, so it cannot race the
-  // slot's normal waker).
-  asserts(t->status == THREAD_BLOCKED, "thread_unblock: not blocked");
-  t->status = THREAD_RUNNABLE;
+  // There is only one possible unblocker per blocked thread (the SPSC
+  // waiter-slot rule). Death does not enqueue blocked victims; resource
+  // reap later detaches their slots.
+  asserts(atomic_load_explicit(&t->status, memory_order_acquire) ==
+              THREAD_BLOCKED,
+          "thread_unblock: not blocked");
+  atomic_store_explicit(&t->status, THREAD_RUNNABLE, memory_order_release);
   scheduler_enqueue(t);
 }
 

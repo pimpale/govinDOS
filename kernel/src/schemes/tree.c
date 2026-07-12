@@ -7,6 +7,7 @@
 
 #include "channel_internal.h"
 
+#include "process.h"
 #include "syscall.h"
 #include "thread.h"
 
@@ -17,6 +18,8 @@ void tree_replay(struct ring *ring) {
   for (uint32_t i = 0; i < vec_process_ptr_len(p->children); i++) {
     struct process *c;
     vec_process_ptr_get(p->children, i, &c);
+    // Only directly dead children notify a live parent. Effective-dead
+    // interior descendants belong to the already-announced subtree root.
     if (c->state == PROC_DEAD && !c->death_notified) {
       if (!channel_post(ring, KEV_CHILD_DEAD, c->pid, 0, 0)) {
         return;

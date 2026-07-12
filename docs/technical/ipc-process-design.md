@@ -69,7 +69,8 @@ the roles; see [boot-init-design.md](boot-init-design.md)).
 - **Process trees, parent-driven creation, no reparenting ever.**
   Parents build children from their own resources (embryo state, block
   ownership transfer, explicit first-thread spawn). **Killing a process
-  kills its descendants recursively.** Orphaned embryos die with their
+  logically kills every descendant through immutable parent links.** No
+  eager subtree walk is needed. Orphaned embryos die with their
   parent by the same rule; a dead parent's zombies are reaped by the
   grandparent as part of its subtree. Daemonization means asking init
   (over a channel) to spawn the image as *its* child — Unix's
@@ -425,9 +426,12 @@ the child out of bounded syscalls, and it takes it apart the same way.
 
 **Identity: u64 pids, never reused.** Monotonic allocation; 2^63 pids
 outlast the hardware, so there is no reuse and therefore no ABA — a
-`(pid, base)` pair is forever unambiguous. A live-pid index (hash map,
-or sorted-by-pid vec with binary search — pids insert in order, so
-append is O(1) and lookup O(log n)) maps pid → `struct process *`.
+`(pid, base)` pair is forever unambiguous. The sole live-process registry is
+an owning left-leaning red-black tree keyed by pid. Lookup, insertion, and
+removal are O(log n); allocation-free in-order traversal supports the rare
+operations that intentionally visit every extant live address space. Tree
+allocation is selected through per-instantiation hooks, ready for a future
+slab-backed allocator without coupling that policy to the container.
 Lookups happen under the registry lock, which pins the pointer for the
 critical section: a process leaves the index before its struct is
 freed (the discipline umem's registry already follows).
@@ -442,15 +446,16 @@ Consequently a process's ublock metadata lives **by value in one
 per-process vec**: nothing external points into it, so the final reap
 step frees it wholesale.
 
-**Death is O(1).** Mark dying, remove from the live-pid index, post
-`EV_CHILD_DEAD` to the parent's tree channel (§2 — one bounded post;
-skipped if the parent is itself dying). Threads die at their next
-kernel entry or are woken from parks with a dead result, each TCB
-freed inline, O(1) apiece. When the last CPU switches away from the
-dying AS, `as_switch` flips a drained flag (idle already switches to
-`g_as_kernel`, so this terminates). Killing a subtree marks and
-park-wakes each victim thread — O(own subtree), the one deliberately
-super-constant kill cost.
+**Logical death is O(tree depth), independent of subtree breadth.** Mark
+the subtree root directly dead, remove it from the live-pid index, and post
+`EV_CHILD_DEAD` to its live parent. A process is effectively dead when it
+or any immutable ancestor is directly dead; syscall/interrupt checkpoints,
+scheduler dispatch, peer-liveness checks, and live-pid lookup all use that
+predicate. Reap materializes descendants' direct death one leaf at a time,
+removing their hidden registry entries as it reaches them. Runnable/running
+threads die at dispatch or their next kernel entry. Blocked victims are not
+woken merely to be culled: resource teardown detaches their waiter slots and
+reap frees up to 256 detached TCBs per call.
 
 **Zombies hold everything.** Pristinity needs no revocation at death:
 revocation guards *recycled* memory, and a zombie's blocks are still
@@ -464,14 +469,16 @@ dead subtree (post-order cursor; nothing ever reparents, so the
 subtree is closed). One bounded step per call, whichever applies:
 
 1. revoke + free one owned block of the deepest unreaped zombie,
-   waking parked sharer-side threads `SYSERR_DEAD` / posting `EV_DEAD`
-   to their registrations — exactly the §1 revoke path; or
+   waking live parked sharer-side threads `SYSERR_DEAD` — exactly the §1
+   revoke path; dead waiters are detached without enqueueing; or
 2. drop one shared-in view, waking the owner-side waiter parked for a
    doorbell that will never come (the zombie's own *views* need no
    unmapping — they die with its AS); or
-3. free K page-table nodes of the AS — `SYSERR_AGAIN` until the drain
+3. free up to 256 detached blocked TCBs; scheduler-owned runnable/running
+   TCBs yield `SYSERR_AGAIN` until dispatch/preemption culls them; or
+4. free K page-table nodes of the AS — `SYSERR_AGAIN` until the drain
    flag is up; or
-4. all resources gone: free the metadata vec in one
+5. all resources gone: free the metadata vec in one
    shot, free the process struct — `REAP_DONE`.
 
 A block can instead be **claimed** with the upward `VM_MOVE` (§5)
@@ -483,9 +490,10 @@ liveness check. That latency rides on prompt parents — a libc default
 (park on the tree channel, reap on `EV_CHILD_DEAD`), not a kernel
 guarantee — accepted.
 
-What stays lazy forever: a dead sharer's entry in a live owner's
-sharer vec (dropped when the owner next walks it), share edges naming
-the dead (revalidated on touch), and the live-pid index hole itself.
+What stays lazy until touched or reaped: a dead sharer's entry in a live
+owner's sharer vec, share edges naming the dead, and an effective-dead
+descendant's hidden live-index entry. Materializing that descendant during
+post-order reap removes the registry entry in O(log n).
 
 ## 5. Process trees and parent-driven creation
 
@@ -505,7 +513,7 @@ SYS_PROC_CREATE()                        -> pid   // embryo: AS clone, no thread
 SYS_VM_MOVE(base, pid)                            // ownership transfer along tree edges only (below)
 SYS_VM_PROTECT(base, len, prot [, pid])           // parent may set an embryo's views (W^X after writing)
 SYS_THREAD_SPAWN(pid, entry, stack_top)  -> tid   // parent+embryo only; first spawn seals the child
-SYS_PROC_KILL(pid)                                // own descendant; the subtree dies (O(subtree) mark+wake)
+SYS_PROC_KILL(pid)                                // own descendant; logical subtree death (O(depth))
 SYS_PROC_REAP(pid)     -> more | done | again     // own dead child; one bounded step (§4)
 ```
 
@@ -532,13 +540,13 @@ SYS_PROC_REAP(pid)     -> more | done | again     // own dead child; one bounded
 
 ### The tree
 
-Every process records its parent and children. **Kill is recursive**:
-killing a process kills its descendants, embryos included (which also
-answers the orphaned-embryo problem — an embryo has no threads, so
-nthreads-driven death can never fire for it; tree death is what reaps
-it). Kill delivery: mark dying; parked threads get an error/dead result;
-running threads die at next kernel entry (for CPU-bound hostile children
-the quantum timer bounds that entry to one quantum — see §7).
+Every process records its immutable parent and children. Killing a process
+marks only the subtree root directly dead; descendants, embryos included,
+are immediately dead by ancestry. This answers the orphaned-embryo problem
+without walking a broad tree. Running threads die at their next kernel
+entry (the quantum timer bounds hostile CPU-bound code to one quantum);
+runnable threads are culled at dispatch; blocked threads stay off the
+runqueue and are reclaimed by bounded reap.
 
 **Nothing ever reparents.** Death follows tree edges down; reaping
 follows them up; the tree is never restructured. A dead parent's
@@ -568,7 +576,7 @@ capability design rather than inferred from a user identity.
    `BLOCK_DOORBELL`/`BLOCK_WAIT`, `SYSERR_DEAD` wakes in the revoke
    path. Legacy `SYS_RING_*` kept temporarily.
 2. **Process trees + lifecycle** (§5, §4): u64 pids + live-pid index,
-   embryo, `VM_MOVE` both directions, parent protect/spawn, recursive
+   embryo, `VM_MOVE` both directions, parent protect/spawn, lazy descendant
    kill, zombies + `SYS_PROC_REAP`, the `-3` tree scheme; pe.c →
    boot-only init loader. This replaces the reaper kthread's job.
 3. **Fault reflection** (§3) — its own session, already agreed.
@@ -625,15 +633,13 @@ rings/dummydev (and their kthreads) had to go with it.
   per call — as_free isn't incremental yet. Bounded by the AS's table
   count, which sharer/owner teardown in earlier steps has already pruned.
   Revisit if page trees ever get big enough to matter.
-- **Reap also gates on culled TCBs** (`nthreads == 0`, SYSERR_AGAIN
-  otherwise): killed threads die at their next kernel entry or at
-  dispatch (the scheduler culls dead-process threads before installing
-  them), and the process struct must outlive every TCB.
-- **All death cascades.** The doc said kill is recursive; the
-  implementation treats natural death (last thread exits) identically —
-  descendants never outlive their ancestor, embryos included. Unifying
-  the two keeps "the dead subtree is closed" unconditional, which the
-  post-order reap cursor relies on.
+- **Reap batches cheap TCB work.** Scheduler-owned threads die at their next
+  kernel entry or dispatch; detached `THREAD_BLOCKED` TCBs are freed in
+  batches of at most 256 after the leaf process's blocks/views are gone.
+  Thread-vector slots make scheduler removal O(1), avoiding quadratic cull.
+- **All death cascades logically.** Natural death and explicit kill mark
+  only the subtree root; immutable ancestor traversal makes every descendant
+  immediately dead while post-order reap materializes them incrementally.
 - **VM_MOVE**: the receiver's view arrives R|W (parent applies W^X via
   VM_PROTECT-with-pid afterwards); kernel-channel blocks refuse to move
   (a scheme endpoint is owner-bound identity); sharer edges survive the

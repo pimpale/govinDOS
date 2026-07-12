@@ -184,6 +184,18 @@ static void child_spin_main(uint64_t arg) {
   }
 }
 
+// Announce that we reached the channel, then remain parked. Killing this
+// process exercises lazy dead-waiter detachment and reap-owned TCB freeing:
+// the victim must never be enqueued merely to be culled.
+static void child_park_main(uint64_t boot_ch) {
+  volatile uint32_t *ready = (volatile uint32_t *)boot_ch;
+  __atomic_store_n(ready, 1, __ATOMIC_RELEASE);
+  sys_block_doorbell(boot_ch);
+  sys_block_wait(ready, 1);
+  print("parked victim: RETURNED AFTER KILL\n");
+  sys_exit();
+}
+
 // First thread of the preemption-test child: burns CPU in ring 3 and
 // never enters the kernel again. Only the quantum timer can pull it in,
 // so killing AND reaping it proves preemption end to end — the reap
@@ -364,6 +376,23 @@ static void test_process_tree(struct kring *tch) {
   print_hex(sys_proc_kill(c3));
   await_child_death(tch);
   reap_child(c3);
+
+  // --- Child 4: kill a thread parked in a channel ----------------------
+  uint64_t park_ch = sys_vm_alloc(4096, VM_PROT_READ | VM_PROT_WRITE);
+  volatile uint32_t *ready = (volatile uint32_t *)park_ch;
+  uint64_t c4 = spawn_child(child_park_main, park_ch);
+  sys_block_wait(ready, 0);
+  for (int i = 0; i < 64; i++) {
+    sys_yield();
+  }
+  print("tests: proc_kill(parked) rc=");
+  print_hex(sys_proc_kill(c4));
+  await_child_death(tch);
+  // Revocation clears the dead child's waiter slot without enqueueing it;
+  // bounded reap subsequently owns the detached blocked TCB.
+  print("tests: vm_free(park_ch) rc=");
+  print_hex(sys_vm_free(park_ch));
+  reap_child(c4);
 
 }
 

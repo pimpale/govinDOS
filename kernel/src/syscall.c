@@ -121,10 +121,9 @@ void syscall_entry(struct trap_frame *tf) {
   struct thread *curr = thread_current();
   asserts(curr != nullptr, "syscall: no current thread");
 
-  // Death checkpoint: a killed thread dies at its next kernel entry.
-  // (Racy read; the authoritative re-check for parking paths is under
-  // the umem lock in channel_block_wait.)
-  if (curr->proc->state == PROC_DEAD) {
+  // Death checkpoint: direct or inherited death takes effect at the next
+  // kernel entry. channel_block_wait repeats it before installing a slot.
+  if (process_is_dead(curr->proc)) {
     uthread_park_exit();
   }
 

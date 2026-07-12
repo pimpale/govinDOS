@@ -78,9 +78,10 @@ void scheduler_enqueue(struct thread *t) {
 
     // Dispatch cull: a thread whose process died (kill, or the cascade
     // from an ancestor) is reaped here instead of being run — this is
-    // where queued-runnable and unhooked-parked victims all land. Done
+    // where queued-runnable victims land. Blocked victims never enter a
+    // runqueue merely to die; bounded reap detaches and frees them. Done
     // before install so the dying AS is never re-entered.
-    if (next != nullptr && next->proc->state == PROC_DEAD) {
+    if (next != nullptr && process_is_dead(next->proc)) {
       next->status = THREAD_DEAD;
       spinlock_unlock(&scheduler->lock);
       process_thread_exited(next); // takes the umem lock; none held here

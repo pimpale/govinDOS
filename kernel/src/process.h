@@ -18,7 +18,9 @@
 // takes them apart one bounded step at a time. Nothing ever reparents.
 //
 // There is no kernel work queue and no reaper thread: the chunking
-// mechanism for teardown is the syscall boundary itself.
+// mechanism for teardown is the syscall boundary itself. Descendant death
+// is logically immediate through process_is_dead(), then materialized one
+// process at a time during post-order reap.
 //
 // All tree/state mutations run under g_umem, the umem control-plane
 // lock (hierarchy in umem.h) — the same lock that guards share edges
@@ -34,19 +36,23 @@ struct process *process_create(struct process *parent);
 struct thread *process_spawn_thread(struct process *p, uint64_t entry,
                                     uint64_t stack_top, uint64_t arg);
 
-// Mark `p` and every descendant dead: remove them from the live-pid
-// index, post KEV_CHILD_DEAD for the subtree root (interior parents are
-// themselves dying), unhook and wake each victim thread parked in a
-// channel waiter slot. Running threads die at their next kernel entry;
-// runnable ones are culled at dispatch. O(subtree). Takes the umem lock.
+// Effective liveness: true when p or any immutable ancestor is directly
+// PROC_DEAD. Safe for lock-free checkpoint reads because process structs are
+// reaped descendants-first, so an extant process's ancestor chain is live.
+bool process_is_dead(const struct process *p);
+
+// Mark `p` directly dead. Every descendant becomes effectively dead through
+// process_is_dead without an eager subtree walk. Post KEV_CHILD_DEAD for the
+// subtree root; running/runnable threads are culled at checkpoints/dispatch,
+// and blocked TCBs are detached and batch-freed by bounded reap.
 void process_kill_subtree(struct process *p);
 
 // One bounded reap step on the dead subtree rooted at `target` (which
 // must already be dead): frees one owned block of the deepest unreaped
-// zombie, or drops one of its shared-in views, or (once its threads are
-// culled and its AS has drained off every CPU) frees the AS, or frees
-// the process struct itself. Returns REAP_MORE / REAP_DONE /
-// SYSERR_AGAIN (still draining). Takes the umem lock.
+// zombie, drops one shared-in view, frees up to 256 detached blocked TCBs,
+// or (once scheduler-owned threads are culled and its AS has drained off
+// every CPU) frees the AS/process. Returns REAP_MORE / REAP_DONE /
+// SYSERR_AGAIN (still draining). Takes g_umem.
 uint64_t process_reap_step(struct process *target);
 
 // Called by the scheduler loop (IRQs off, no scheduler lock held) for a

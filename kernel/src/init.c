@@ -246,6 +246,7 @@ static void channel_selftest(void) {
 static void process_selftest(void) {
   struct process *parent = process_create(nullptr);
   struct process *child = process_create(parent);
+  struct process *grandchild = process_create(child);
   asserts(child->state == PROC_EMBRYO, "process selftest: not an embryo");
 
   // Move a block down into the embryo: parent view gone, child view RW.
@@ -271,6 +272,15 @@ static void process_selftest(void) {
   asserts(channel_scheme_create(parent, (uint64_t)tch, KSCHEME_TREE) == 0,
           "process selftest: tree channel create failed");
   process_kill_subtree(child);
+  // Only the subtree root is materialized synchronously. Its descendant
+  // is immediately dead by ancestry, hidden from live-pid lookup, and is
+  // materialized later by bounded post-order reap.
+  asserts(grandchild->state == PROC_EMBRYO && process_is_dead(grandchild),
+          "process selftest: descendant death was not lazy");
+  umem_lock();
+  asserts(umem_proc_lookup_locked(grandchild->pid) == nullptr,
+          "process selftest: effective-dead pid remained reachable");
+  umem_unlock();
   volatile struct kring_hdr *h = (volatile struct kring_hdr *)tch;
   const struct kcqe *cq =
       (const struct kcqe *)(tch + KRING_HDR_SIZE +

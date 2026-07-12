@@ -12,6 +12,7 @@
 #include "paging.h"
 #include "panic.h"
 #include "scheduler.h"
+#include "process.h"
 #include "stdlib/stdio.h"
 #include "thread.h"
 #include "trap_frame.h"
@@ -83,7 +84,7 @@ static void cull_if_killed(struct trap_frame *tf) {
     return;
   }
   struct thread *curr = thread_current();
-  if (curr != nullptr && curr->proc->state == PROC_DEAD) {
+  if (curr != nullptr && process_is_dead(curr->proc)) {
     uthread_park_exit(); // never returns
   }
 }

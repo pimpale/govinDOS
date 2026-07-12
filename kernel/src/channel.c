@@ -74,6 +74,11 @@ static void wake_slot(struct thread **slot, uint64_t result) {
     return;
   }
   *slot = nullptr;
+  // Dead threads never return to userspace. Leaving the detached TCB
+  // blocked lets bounded process reap free it without a runqueue burst.
+  if (process_is_dead(t->proc)) {
+    return;
+  }
   thread_deliver_wait_result(t, result);
   thread_unblock(t);
 }
@@ -338,12 +343,10 @@ uint64_t channel_block_wait(struct thread *curr, uint64_t addr,
     return SYSERR_INVAL;
   }
   umem_proc_lock(p);
-  // A kill can land between the dispatcher's death check and here; a
-  // dead process must not park (nobody would cull it until reap). The
-  // kill's unhook sweep takes this list lock, so this cannot race past
-  // it: either PROC_DEAD is visible here, or the sweep sees our thread
-  // in the slot and requeues it.
-  if (p->state == PROC_DEAD) {
+  // A kill can land between the dispatcher's checkpoint and here. An
+  // effectively dead process must not install a new waiter; existing
+  // blocked waiters are detached as their resources are reaped.
+  if (process_is_dead(p)) {
     umem_proc_unlock(p);
     uthread_park_exit();
   }
@@ -369,7 +372,7 @@ uint64_t channel_block_wait(struct thread *curr, uint64_t addr,
     // means parking and being woken SYSERR_DEAD by the reap-time tear.)
     struct process *peer =
         owner ? vec_share_edge_at(b->sharers, 0)->to : b->owner;
-    if (peer->state == PROC_DEAD) {
+    if (process_is_dead(peer)) {
       umem_stripe_unlock(si);
       umem_proc_unlock(p);
       return SYSERR_DEAD;
@@ -438,37 +441,4 @@ void channel_block_torn(ublock *b, bool destroy_endpoint) {
 bool channel_block_destroyable(ublock *b) {
   return b->ring == nullptr || b->ring->ops->destroyable == nullptr ||
          b->ring->ops->destroyable(b->ring);
-}
-
-void channel_unhook_process_locked(struct process *p) {
-  // A thread can only be parked in a waiter slot of a block its process
-  // has a view of, so p's blocks + shared_in cover every park site of
-  // p's threads. Unhook and requeue them; the scheduler culls them at
-  // dispatch (their process is dead by the time this runs).
-  umem_proc_lock(p);
-  for (uint32_t i = 0; i < vec_ublock_ptr_len(p->blocks); i++) {
-    ublock *b;
-    vec_ublock_ptr_get(p->blocks, i, &b);
-    uint32_t si = umem_stripe(b->base);
-    umem_stripe_lock(si);
-    if (b->owner_waiter != nullptr && b->owner_waiter->proc == p) {
-      struct thread *t = b->owner_waiter;
-      b->owner_waiter = nullptr;
-      thread_unblock(t);
-    }
-    umem_stripe_unlock(si);
-  }
-  for (uint32_t i = 0; i < vec_ublock_ptr_len(p->shared_in); i++) {
-    ublock *b;
-    vec_ublock_ptr_get(p->shared_in, i, &b);
-    uint32_t si = umem_stripe(b->base);
-    umem_stripe_lock(si);
-    if (b->sharer_waiter != nullptr && b->sharer_waiter->proc == p) {
-      struct thread *t = b->sharer_waiter;
-      b->sharer_waiter = nullptr;
-      thread_unblock(t);
-    }
-    umem_stripe_unlock(si);
-  }
-  umem_proc_unlock(p);
 }

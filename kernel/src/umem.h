@@ -53,6 +53,14 @@ typedef struct share_edge {
 #include <vec/vec.h>
 #undef VEC_DTYPE
 
+#define LLRB_NAME pid_process
+#define LLRB_KEY uint64_t
+#define LLRB_VALUE process_ptr
+#include <llrb/llrb.h>
+#undef LLRB_VALUE
+#undef LLRB_KEY
+#undef LLRB_NAME
+
 struct ring;
 enum ublock_backing {
   UBLOCK_RAM,
@@ -175,8 +183,9 @@ void umem_reap_finish_locked(struct process *p);
 uint64_t umem_move_locked(ublock *b, struct process *from, struct process *to,
                           bool src_as_live);
 
-// Live-pid index: lookup (nullptr if dead/unknown — zombies leave the
-// index at death) and removal.
+// Live-pid index: lookup returns nullptr for unknown or effectively dead
+// processes. Effective-dead descendants remain stored but hidden until
+// bounded reap materializes them and removes their entry.
 struct process *umem_proc_lookup_locked(uint64_t pid);
 void umem_proc_unregister_locked(struct process *p);
 

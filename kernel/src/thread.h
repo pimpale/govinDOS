@@ -34,7 +34,10 @@ enum thread_status {
 typedef struct thread {
   uint64_t tid;
   struct process *proc; // never null
-  enum thread_status status;
+  // Index in proc->threads. Both insertion and removal hold g_umem;
+  // swap-and-pop updates the moved TCB, making scheduler culls O(1).
+  uint32_t proc_slot;
+  _Atomic enum thread_status status;
 
   // User TLS base. FSBASE on x86_64, TPIDR_EL0 on aarch64. Saved/restored
   // by arch code on the user<->kernel boundary (not yet wired).
@@ -79,9 +82,10 @@ struct process {
   // identity layout (SASOS) — isolation is which tree carries PAGE_U
   // leaves for a block.
   struct address_space *as;
-  // Guarded by the umem lock (with racy reads by kernel-entry death
-  // checks, which is fine: the transition to PROC_DEAD is one-way).
-  enum proc_state state;
+  // Direct lifecycle state, guarded for writes by g_umem. Descendants of
+  // a PROC_DEAD ancestor may remain structurally EMBRYO/LIVE until bounded
+  // reap reaches them; process_is_dead() is the effective-liveness test.
+  _Atomic enum proc_state state;
 
   // The creation edge. Death follows children downward, reaping follows
   // them upward, and the tree is never restructured: a dead parent's
@@ -95,9 +99,9 @@ struct process {
   // exists and has room.
   bool death_notified;
 
-  // Threads with un-reaped TCBs. Incremented at spawn; decremented by
-  // process_thread_exited when the scheduler culls the TCB. The struct
-  // itself outlives every TCB (final reap step waits for zero).
+  // Threads with un-reaped TCBs. Incremented at spawn; decremented by the
+  // scheduler's exit/cull path or by bounded reap for detached blocked TCBs.
+  // The process struct outlives every TCB.
   _Atomic uint64_t nthreads;
   struct vec_thread_ptr *threads;
 
