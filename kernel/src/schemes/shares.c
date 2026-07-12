@@ -22,11 +22,8 @@ static share_edge *find_edge_to(ublock *b, const struct process *p) {
 // Post KEV_SHARE for every un-notified edge pointing at `p`, until the CQ
 // fills. This runs at channel creation (backfill) and after every
 // doorbell (the consumption ack).
-void shares_replay(struct process *p) {
-  struct ring *ring = p->share_ch;
-  if (ring == nullptr) {
-    return;
-  }
+void shares_replay(struct ring *ring) {
+  struct process *p = ring->block->owner;
   umem_proc_lock(p);
   for (uint32_t i = 0; i < vec_ublock_ptr_len(p->shared_in); i++) {
     ublock *b;

@@ -22,7 +22,7 @@
 #define SYS_DEBUG_WRITE 0 // (ptr, len)             -> bytes written
 #define SYS_EXIT        1 // ()                     -> never returns
 #define SYS_YIELD       2 // ()                     -> 0
-#define SYS_GETUID      3 // ()                     -> uid
+#define SYS_RESERVED_3  3 // retired GETUID slot; kept reserved for ABI stability
 #define SYS_GETPID      4 // ()                     -> pid
 
 // Memory blocks are the vm_alloc unit (power-of-two pages). alloc/free,

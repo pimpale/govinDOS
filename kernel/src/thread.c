@@ -31,8 +31,7 @@ static _Atomic uint64_t g_next_tid = 1;
 
 struct thread *uthread_spawn(struct process *proc, uint64_t entry,
                              uint64_t user_stack_top, uint64_t arg) {
-  asserts(proc != nullptr && proc->uid != 0,
-          "uthread_spawn: needs a user process");
+  asserts(proc != nullptr, "uthread_spawn: needs a user process");
   struct thread *t = calloc(1, sizeof(*t));
   asserts(t != nullptr, "thread: alloc failed");
   t->tid = atomic_fetch_add(&g_next_tid, 1);
@@ -92,8 +91,7 @@ void thread_deliver_wait_result(struct thread *t, uint64_t v) {
 
   spinlock_lock(&cs->scheduler.lock);
   struct thread *curr = cs->scheduler.current_thread;
-  asserts(curr != nullptr && curr->proc->uid != 0,
-          "uthread_park: no current user thread");
+  asserts(curr != nullptr, "uthread_park: no current user thread");
   curr->status = status;
   if (requeue) {
     // Local requeue only: pushing to another CPU's queue would let it

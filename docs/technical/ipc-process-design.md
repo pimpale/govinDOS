@@ -37,7 +37,7 @@ the roles; see [boot-init-design.md](boot-init-design.md)).
   law replacing "short syscalls must not block": **kernel-channel
   commands are bounded and non-blocking**; long-lived interest is a
   registration, and results are events.
-- **Channel blocks are client-owned and client-charged.** A client can
+- **Channel blocks are client-owned.** A client can
   impose costs on a server anyway (request spam, expensive requests);
   servers defend themselves with their own quota/accounting policy, in
   which time-per-request can participate. The kernel does not arbitrate.
@@ -45,12 +45,9 @@ the roles; see [boot-init-design.md](boot-init-design.md)).
   user pid maps the block into the target on the spot and posts a
   notification (§2, scheme `-1`); rejection is one `SYS_VM_UNSHARE` —
   the same bounded work an accept handshake would cost, with no pending
-  state to track. Every cost lands on the sharer's uid: the edge
-  bookkeeping, the target's shared-in entry, and any hugepage-split
-  page-table nodes — so spam self-limits against the spammer's own
-  quota and a target is never billed for what it didn't ask for. The
-  accepted price is the planting caveat (§1): the mapping exists until
-  the target unshares it.
+  state to track. The accepted price is the planting caveat (§1): the
+  mapping and its bookkeeping exist until the target unshares it. Resource
+  budgets are deferred to the capability design.
 - **Teardown has one authority: the revoke path.** Free, unshare,
   decline, and death all land in the same umem code, which wakes parked
   peers with an error or posts the death event to their registration.
@@ -79,10 +76,8 @@ the roles; see [boot-init-design.md](boot-init-design.md)).
   (over a channel) to spawn the image as *its* child — Unix's
   orphan-adoption by pid 1 is deliberately rejected; Fuchsia's job
   trees are the precedent.
-- **Quotas:** no strong opinion recorded. Default: the charge follows the
-  owner (a `VM_MOVE` re-charges the child's uid); Genode-style
-  charge-stays-with-creator noted as the alternative if cross-uid
-  spawning ever wants it. Same-uid spawning makes them equivalent.
+- **Resource budgets:** deferred to the capability design. The kernel has no
+  uid/account layer today.
 
 ## 1. Shared-block channels
 
@@ -116,8 +111,7 @@ these verbs create and destroy blocks, they don't position anything.)
     `base` appears in the target's AS as `prot|PAGE_U` on return, and
     a notification is queued for the target's share channel (§2,
     scheme `-1`). Errors: `SYSERR_INVAL` (not the owner, unknown pid,
-    self-share), `SYSERR_EXIST` (already shared to that pid),
-    `SYSERR_NOMEM` (sharer's uid out of quota for the bookkeeping).
+    self-share), or `SYSERR_EXIST` (already shared to that pid).
     The share edges themselves are the notification queue — each
     carries a notified bit — so there is no separate queue to size or
     overflow. The target rejects by unsharing; until it does, the
@@ -287,8 +281,8 @@ ordinary syscall, not a scheme op.
 |---|---|---|
 | `EV_SHARE` | sharer pid, `base\|order` | a block was shared in — it is already mapped; also replayed for edges whose notified bit is still clear when the channel is created |
 
-Event bound: one `EV_SHARE` per share edge, and edges are bounded by
-sharer quotas; a CQ smaller than the worst case simply delays replay
+Event bound: one `EV_SHARE` per share edge; a CQ smaller than the number of
+edges simply delays replay
 until slots free (shares are level-state in the edges — the queue is a
 view of it, and nothing is lost if the ring lags). The receiver learns
 size and peer identity from the event, never from block contents;
@@ -429,8 +423,7 @@ Nothing else in the kernel owns a stack, so the "suspend iff you own
 your stack" asymmetry disappears — **every thread is a user thread**;
 the only suspension is the parked trap frame. `kthread_spawn`,
 `thread_block`, kernel-side `yield`, `wait_result`, `t->stack_top`, and
-`STACK_TYPE_KERNEL_TASK` are all deleted; `thread_deliver_wait_result`
-loses its uid branch.
+`STACK_TYPE_KERNEL_TASK` are all deleted.
 
 **Cascade:** kthread-stack guard punches were the *only* post-seal
 mutation of `g_as_kernel`. Without them, `g_as_kernel` is boot-static —
@@ -477,10 +470,9 @@ super-constant kill cost.
 
 **Zombies hold everything.** Pristinity needs no revocation at death:
 revocation guards *recycled* memory, and a zombie's blocks are still
-allocated and still charged. Sharers' views survive — a server may
-drain a dead client's last requests — and the quota charge is what
-makes zombie-hoarding self-defeating: an unreaped subtree starves its
-own uid, nobody else.
+allocated. Sharers' views survive — a server may drain a dead client's last
+requests. Parents are responsible for promptly reaping their dead subtrees;
+resource containment is deferred to capability budgets.
 
 **`SYS_PROC_REAP(pid) -> REAP_MORE | REAP_DONE | SYSERR_AGAIN`** —
 callable by the parent on a dead child, covering the child's whole
@@ -495,7 +487,7 @@ subtree is closed). One bounded step per call, whichever applies:
    unmapping — they die with its AS); or
 3. free K page-table nodes of the AS — `SYSERR_AGAIN` until the drain
    flag is up; or
-4. all resources gone: uncharge the uid, free the metadata vec in one
+4. all resources gone: free the metadata vec in one
    shot, free the process struct — `REAP_DONE`.
 
 A block can instead be **claimed** with the upward `VM_MOVE` (§5)
@@ -546,8 +538,8 @@ SYS_PROC_REAP(pid)     -> more | done | again     // own dead child; one bounded
   are userspace libraries built on this). General gifting between
   established processes stays banned — a griefing vector and unneeded;
   established processes *share* (channels; an unwanted share costs its
-  target one unshare, an unwanted *move* would cost it real quota,
-  which is why only moves are tree-restricted). A parent can
+  target one unshare, while a move changes ownership, which is why only
+  moves are tree-restricted). A parent can
   pre-seed a bootstrap channel (to itself or a registry server) before
   first spawn — the seL4/Xen answer to how strangers ever get
   introduced.
@@ -577,14 +569,11 @@ flaky-parent risk a non-issue for anything linking a sane runtime).
 init is the root, loaded by a boot-only kernel loader from the ramdisk
 (pe.c demoted to exactly one image); init's death is a panic.
 
-### Billing
+### Resource attribution
 
-Cleanup attribution is structural: the child's blocks were built from
-identifiable transfers. Default: charge follows the owner (`VM_MOVE`
-uncharges parent uid, charges child uid, failing over-quota).
-Alternative (Genode-style, if cross-uid spawn wants it): charge stays
-with the creating uid until the blocks die. Same-uid spawning makes the
-choice invisible; decide when cross-uid arrives.
+Cleanup attribution is structural: blocks have an explicit owner and
+`VM_MOVE` transfers that ownership. Quantitative budgets are deferred to the
+capability design rather than inferred from a user identity.
 
 ## 6. Suggested implementation order
 
@@ -673,10 +662,8 @@ rings/dummydev (and their kthreads) had to go with it.
 - **Sharing a single-sharer block to a second pid** also wakes parked
   waiters SYSERR_DEAD (the channel identity those waiters relied on is
   gone; data-plane calls need exactly one sharer).
-- **Sharer-charged bookkeeping is not wired**: uid accounts still charge
-  block bytes to the owner only (limits default to unlimited), so §1's
-  SYSERR_NOMEM-on-share is currently unreachable. The quota section (§0)
-  remains open anyway.
+- **Resource budgets are not wired**: there are no kernel uid accounts or
+  per-process limits. A later capability design may add explicit budgets.
 - **Wait-groups**: the two dedup bits are implemented as
   `pending`/`armed` plus the CQ index of the outstanding KEV_READY
   (consumption is FIFO, so `index < cq_head` retires it on the next

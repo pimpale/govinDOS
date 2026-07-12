@@ -72,8 +72,8 @@ static void paging_merge_selftest(void) {
 // revoke-on-free. Runs before the scheduler ever dispatches anything, so
 // the reap loop in destroy_test_process finishes without retries.
 static void umem_selftest(void) {
-  struct process *a = process_create(nullptr, 9001);
-  struct process *b = process_create(nullptr, 9002);
+  struct process *a = process_create(nullptr);
+  struct process *b = process_create(nullptr);
 
   uint8_t *blk = umem_alloc(a, 2 * PAGE_SIZE, PAGE_R | PAGE_W);
   asserts(blk != nullptr, "umem selftest: alloc failed");
@@ -126,8 +126,8 @@ static void umem_selftest(void) {
 // immediate path and the replay of edges that predate the channel), and
 // endpoint teardown through process death.
 static void channel_selftest(void) {
-  struct process *a = process_create(nullptr, 9003); // sharer
-  struct process *b = process_create(nullptr, 9004); // shares-channel owner
+  struct process *a = process_create(nullptr); // sharer
+  struct process *b = process_create(nullptr); // shares-channel owner
 
   // Share BEFORE b has a shares channel: the edge holds the pending
   // notification (level state), to be replayed at channel creation.
@@ -169,6 +169,12 @@ static void channel_selftest(void) {
   asserts(channel_scheme_create(a, (uint64_t)early, KSCHEME_SHARES) ==
               SYSERR_INVAL,
           "channel selftest: scheme on a shared block allowed");
+  // IRQ rings stay mapped because the hardware handler can publish from a
+  // borrowed context. Creation policy moves to capabilities later.
+  asserts(channel_scheme_create(b, (uint64_t)spare, KSCHEME_IRQ) == 0,
+          "channel selftest: IRQ ring create failed");
+  asserts(umem_protect(b, (uint64_t)spare, PAGE_SIZE, PAGE_R) != 0,
+          "channel selftest: IRQ ring protect allowed");
 
   // Teardown through the ordinary death paths: a's blocks revoke out of
   // b's AS, b's channel block dies with its ring endpoint.
@@ -182,8 +188,8 @@ static void channel_selftest(void) {
 // (reap-time claim), the tree channel's KEV_CHILD_DEAD (replay path),
 // and the subtree reap cursor.
 static void process_selftest(void) {
-  struct process *parent = process_create(nullptr, 9005);
-  struct process *child = process_create(parent, 9005);
+  struct process *parent = process_create(nullptr);
+  struct process *child = process_create(parent);
   asserts(child->state == PROC_EMBRYO, "process selftest: not an embryo");
 
   // Move a block down into the embryo: parent view gone, child view RW.
@@ -275,7 +281,7 @@ static void bootinfo_capture(struct efi_system_table *system) {
 // processes are built by their parents in userspace. init's death is a
 // panic (process.c), and so is its absence: there is no fallback init.
 static void init_setup(const uint8_t *image, size_t image_len) {
-  struct process *p = process_create(nullptr, 1);
+  struct process *p = process_create(nullptr);
   process_set_init(p);
   uint64_t entry = 0;
   int rc = pe_load(p, image, image_len, &entry);
@@ -293,8 +299,8 @@ static void init_setup(const uint8_t *image, size_t image_len) {
   asserts(umem_protect(p, (uint64_t)bi, PAGE_SIZE, PAGE_R) == 0,
           "init: bootinfo protect failed");
 
-  printf("init: pid=%llu uid=%llu entry=%016llX bootinfo=%016llX\n", p->pid,
-         p->uid, entry, (uint64_t)bi);
+  printf("init: pid=%llu entry=%016llX bootinfo=%016llX\n", p->pid, entry,
+         (uint64_t)bi);
   process_spawn_thread(p, entry, (uint64_t)stack + 4 * PAGE_SIZE,
                        (uint64_t)bi);
 }
@@ -380,7 +386,7 @@ efi_status_t efi_main(efi_handle_t handle, struct efi_system_table *system) {
   // cs->scheduler.lock + queue to be live.
   scheduler_init();
 
-  // User-memory bookkeeping (ublock registry + uid accounts).
+  // User-memory bookkeeping (ublock registry).
   umem_init();
 
   // Guard punch + revert must return the kernel tree to its exact shape.

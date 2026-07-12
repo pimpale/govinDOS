@@ -18,6 +18,11 @@ static _Atomic uint64_t g_next_pid = 1;
 
 static struct process *g_init;
 
+static struct thread *process_spawn_thread_locked(struct process *p,
+                                                  uint64_t entry,
+                                                  uint64_t stack_top,
+                                                  uint64_t arg);
+
 void process_set_init(struct process *p) {
   asserts(g_init == nullptr, "process: init set twice");
   g_init = p;
@@ -27,8 +32,7 @@ void process_set_init(struct process *p) {
 // Creation
 // ---------------------------------------------------------------------------
 
-struct process *process_create(struct process *parent, uint64_t uid) {
-  asserts(uid != 0, "process: uid 0 is reserved for the kernel");
+struct process *process_create(struct process *parent) {
   struct process *p = calloc(1, sizeof(*p));
   asserts(p != nullptr, "process: alloc failed");
   p->pid = atomic_fetch_add(&g_next_pid, 1);
@@ -37,7 +41,6 @@ struct process *process_create(struct process *parent, uint64_t uid) {
   // punches kthread-stack guards into it. Isolation is which tree
   // carries PAGE_U leaves, enforced by the per-process CR3.
   p->as = as_clone(g_as_kernel);
-  p->uid = uid;
   p->state = PROC_EMBRYO;
   p->parent = parent;
   vec_process_ptr_new(&p->children);
@@ -54,6 +57,15 @@ struct process *process_create(struct process *parent, uint64_t uid) {
 struct thread *process_spawn_thread(struct process *p, uint64_t entry,
                                     uint64_t stack_top, uint64_t arg) {
   umem_lock();
+  struct thread *t = process_spawn_thread_locked(p, entry, stack_top, arg);
+  umem_unlock();
+  return t;
+}
+
+static struct thread *process_spawn_thread_locked(struct process *p,
+                                                  uint64_t entry,
+                                                  uint64_t stack_top,
+                                                  uint64_t arg) {
   asserts(p->state != PROC_DEAD, "process: spawning into the dead");
   // First spawn seals the embryo: parent authority (VM_MOVE in,
   // parent-set protections) drops to normal peer.
@@ -63,7 +75,6 @@ struct thread *process_spawn_thread(struct process *p, uint64_t entry,
   // run (and exit) on another CPU the moment it is enqueued.
   struct thread *t = uthread_spawn(p, entry, stack_top, arg);
   vec_thread_ptr_push(p->threads, &t);
-  umem_unlock();
   return t;
 }
 
@@ -227,7 +238,7 @@ uint64_t process_reap_step(struct process *target) {
 // ---------------------------------------------------------------------------
 
 uint64_t proc_sys_create(struct thread *curr) {
-  struct process *child = process_create(curr->proc, curr->proc->uid);
+  struct process *child = process_create(curr->proc);
   return child->pid;
 }
 
@@ -246,10 +257,7 @@ uint64_t proc_sys_thread_spawn(struct thread *curr, uint64_t pid,
     umem_unlock();
     return SYSERR_INVAL;
   }
-  target->state = PROC_LIVE;
-  atomic_fetch_add(&target->nthreads, 1);
-  struct thread *t = uthread_spawn(target, entry, stack_top, arg);
-  vec_thread_ptr_push(target->threads, &t);
+  struct thread *t = process_spawn_thread_locked(target, entry, stack_top, arg);
   uint64_t tid = t->tid;
   umem_unlock();
   return tid;

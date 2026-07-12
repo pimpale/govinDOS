@@ -133,10 +133,6 @@ void syscall_entry(struct trap_frame *tf) {
     tf->rax = sys_debug_write(curr, a0, a1);
     return;
 
-  case SYS_GETUID:
-    tf->rax = curr->proc->uid;
-    return;
-
   case SYS_GETPID:
     tf->rax = curr->proc->pid;
     return;

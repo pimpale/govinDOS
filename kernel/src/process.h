@@ -26,9 +26,8 @@
 // disagree.
 
 // Create an embryo. `parent` may be nullptr only for kernel-driven
-// creations (init, boot selftests). The child inherits `uid` from the
-// caller at the syscall layer; kernel callers pass it explicitly.
-struct process *process_create(struct process *parent, uint64_t uid);
+// creations (init, boot selftests).
+struct process *process_create(struct process *parent);
 
 // Spawn a thread into `p` (kernel-driven: init's first thread, boot
 // tests), sealing an embryo. Takes the umem lock.

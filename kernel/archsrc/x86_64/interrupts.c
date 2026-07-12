@@ -4,7 +4,9 @@
 #include <stdint.h>
 
 #include "cpu_state.h"
+#include "ioapic.h"
 #include "irq.h"
+#include "irq_scheme.h"
 #include "lapic.h"
 #include "paging.h"
 #include "panic.h"
@@ -122,6 +124,20 @@ uint64_t interrupt_handler(struct trap_frame *tf, uint64_t vector,
     irq_exit();
     return 0;
   default:
+    if (irq_is_device_vector(vector)) {
+      irq_deliver((uint8_t)vector);
+      cull_if_killed(tf);
+      irq_exit();
+      return 0;
+    }
+    if (vector >= PIC_VECTOR_BASE && vector <= PIC_VECTOR_END) {
+      // A spurious legacy-PIC vector (the parked remap range). The 8259s
+      // are masked; a ghost IR7/IR15 needs no PIC EOI, and ExtINT
+      // delivery never sets a LAPIC in-service bit, so no EOI at all.
+      cull_if_killed(tf);
+      irq_exit();
+      return 0;
+    }
     break;
   }
 

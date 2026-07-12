@@ -92,3 +92,24 @@ uint64_t kring_ack(struct kring *r) {
   atomic_store_explicit(&r->hdr->cq_head, r->cq_head, memory_order_release);
   return sys_block_doorbell(r->base);
 }
+
+static uint64_t irq_submit(struct kring *r, uint64_t op, uint64_t a,
+                           uint64_t b) {
+  struct ksqe *sqe = kring_get_sqe(r);
+  if (sqe == nullptr)
+    return SYSERR_AGAIN;
+  *sqe = (struct ksqe){.op = op, .a = a, .b = b};
+  return kring_submit(r);
+}
+
+uint64_t kring_irq_claim(struct kring *r, uint64_t gsi, uint64_t cookie) {
+  return irq_submit(r, KIRQ_CLAIM, gsi, cookie);
+}
+
+uint64_t kring_irq_release(struct kring *r, uint64_t gsi) {
+  return irq_submit(r, KIRQ_RELEASE, gsi, 0);
+}
+
+uint64_t kring_irq_ack(struct kring *r, uint64_t gsi, uint64_t seq) {
+  return irq_submit(r, KIRQ_ACK, gsi, seq);
+}

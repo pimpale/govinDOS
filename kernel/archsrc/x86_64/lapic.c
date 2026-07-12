@@ -14,6 +14,7 @@
 #define LAPIC_REG_ID 0x020 // bits 24..31 = APIC ID
 #define LAPIC_REG_EOI 0x0B0
 #define LAPIC_REG_SVR 0x0F0 // spurious interrupt vector
+#define LAPIC_REG_LVT_LINT0 0x350
 #define LAPIC_REG_ICR_LOW 0x300
 #define LAPIC_REG_ICR_HIGH 0x310
 #define LAPIC_REG_LVT_TIMER 0x320
@@ -101,6 +102,11 @@ uint8_t x86_lapic_id(void) { return (uint8_t)(lapic_read(LAPIC_REG_ID) >> 24); }
 
 void x86_lapic_enable(void) {
   lapic_write(LAPIC_REG_SVR, LAPIC_SVR_ENABLE | LAPIC_SPURIOUS_VECTOR);
+  // Firmware may hand off in virtual-wire mode (LINT0 = ExtINT), which
+  // would let the legacy PIC's INTR line inject vectors behind the
+  // IOAPIC's back. Symmetric-I/O only: mask LINT0 on every CPU. LINT1
+  // stays firmware-configured — it is conventionally the NMI wire.
+  lapic_write(LAPIC_REG_LVT_LINT0, LAPIC_LVT_MASKED);
 }
 
 // Spin until the previous IPI has left the LAPIC.

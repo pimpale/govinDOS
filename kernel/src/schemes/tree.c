@@ -12,11 +12,8 @@
 
 // Post KEV_CHILD_DEAD for every un-notified dead child, until the CQ
 // fills.
-void tree_replay(struct process *p) {
-  struct ring *ring = p->tree_ch;
-  if (ring == nullptr) {
-    return;
-  }
+void tree_replay(struct ring *ring) {
+  struct process *p = ring->block->owner;
   for (uint32_t i = 0; i < vec_process_ptr_len(p->children); i++) {
     struct process *c;
     vec_process_ptr_get(p->children, i, &c);

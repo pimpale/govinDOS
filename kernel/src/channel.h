@@ -27,6 +27,7 @@
 // the kernel-side endpoint state and entry points.
 #include <gdos/kring.h>
 #include <gdos/kring_groups.h>
+#include <gdos/kring_irq.h>
 #include <gdos/kring_shares.h>
 #include <gdos/kring_tree.h>
 
@@ -68,8 +69,10 @@ typedef reg *reg_ptr;
 // atomic with level-state flips (notified/death_notified) that live
 // under g_umem. The stripe guards the bytes; for those schemes g_umem
 // still licenses the act.
+struct scheme_ops;
+
 struct ring {
-  int64_t scheme;
+  const struct scheme_ops *ops;
   struct ublock *block;
   uint32_t nslots;
   uint32_t sq_head;  // authoritative; header copy is a mirror
@@ -79,6 +82,10 @@ struct ring {
   // registration: one outstanding KEV_READY + the final KEV_DEAD).
   vec_reg_ptr *regs;
   uint32_t nregs;
+  // Scheme -4 only: intrusive list of static route entries. The list and
+  // count are g_umem-only; each route's delivery state has its own lock.
+  struct irq_route *irq_claims;
+  uint32_t nclaims;
 };
 
 // ---------------------------------------------------------------------------

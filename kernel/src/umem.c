@@ -46,83 +46,10 @@ void umem_stripe_lock(uint32_t idx) { svclock_lock(&g_stripes[idx]); }
 void umem_stripe_unlock(uint32_t idx) { svclock_unlock(&g_stripes[idx]); }
 
 // ---------------------------------------------------------------------------
-// Registry (under g_umem) + per-uid accounts (lock-free)
+// Registry (under g_umem)
 // ---------------------------------------------------------------------------
 
 static vec_process_ptr *g_procs;
-
-// Accounts are append-only and never freed, so the list is a lock-free
-// CAS-push stack and charging is a CAS loop on `bytes` — quota checks
-// must not funnel every allocator on the machine through one lock.
-struct user_account {
-  uint64_t uid;
-  _Atomic uint64_t bytes;
-  uint64_t limit;
-  struct user_account *_Atomic next;
-};
-
-static struct user_account *_Atomic g_accounts;
-
-static struct user_account *account_lookup(uint64_t uid) {
-  for (struct user_account *a =
-           atomic_load_explicit(&g_accounts, memory_order_acquire);
-       a != nullptr; a = atomic_load_explicit(&a->next, memory_order_acquire)) {
-    if (a->uid == uid) {
-      return a;
-    }
-  }
-  return nullptr;
-}
-
-static struct user_account *account_for(uint64_t uid) {
-  struct user_account *a = account_lookup(uid);
-  if (a != nullptr) {
-    return a;
-  }
-  struct user_account *fresh = malloc(sizeof(*fresh));
-  asserts(fresh != nullptr, "umem: account alloc failed");
-  fresh->uid = uid;
-  atomic_store_explicit(&fresh->bytes, 0, memory_order_relaxed);
-  fresh->limit = UINT64_MAX; // no quota until someone sets one
-  for (;;) {
-    struct user_account *head =
-        atomic_load_explicit(&g_accounts, memory_order_acquire);
-    atomic_store_explicit(&fresh->next, head, memory_order_relaxed);
-    if (atomic_compare_exchange_weak_explicit(&g_accounts, &head, fresh,
-                                              memory_order_release,
-                                              memory_order_acquire)) {
-      return fresh;
-    }
-    // Lost the race; a concurrent push may have been our uid.
-    a = account_lookup(uid);
-    if (a != nullptr) {
-      free(fresh);
-      return a;
-    }
-  }
-}
-
-static bool account_charge(uint64_t uid, uint64_t bytes) {
-  struct user_account *a = account_for(uid);
-  uint64_t cur = atomic_load_explicit(&a->bytes, memory_order_relaxed);
-  for (;;) {
-    if (bytes > a->limit - cur) {
-      return false;
-    }
-    if (atomic_compare_exchange_weak_explicit(&a->bytes, &cur, cur + bytes,
-                                              memory_order_relaxed,
-                                              memory_order_relaxed)) {
-      return true;
-    }
-  }
-}
-
-static void account_uncharge(uint64_t uid, uint64_t bytes) {
-  struct user_account *a = account_for(uid);
-  uint64_t prev =
-      atomic_fetch_sub_explicit(&a->bytes, bytes, memory_order_relaxed);
-  asserts(prev >= bytes, "umem: account underflow");
-}
 
 static struct process *proc_lookup(uint64_t pid) {
   for (uint32_t i = 0; i < vec_process_ptr_len(g_procs); i++) {
@@ -254,17 +181,11 @@ void *umem_alloc(struct process *p, size_t len, paging_flags_t prot) {
   }
   uint64_t bytes = (uint64_t)PAGE_SIZE << order;
 
-  // Reserve the charge first; roll back if the buddy can't deliver.
-  if (!account_charge(p->uid, bytes)) {
-    return nullptr;
-  }
-
   uint64_t page_id = 0;
   spinlock_lock(&g_allocator_lock);
   buddy_status_t s = buddy_page_alloc(g_allocator, 1ull << order, &page_id);
   spinlock_unlock(&g_allocator_lock);
   if (s != BUDDY_STATUS_SUCCESS) {
-    account_uncharge(p->uid, bytes);
     return nullptr;
   }
   uint8_t *base = (uint8_t *)(page_id * PAGE_SIZE);
@@ -323,7 +244,6 @@ static void block_release_prepare(ublock *b, struct umem_release *rel) {
   channel_block_torn(b, true);
 
   rel->b = b;
-  rel->uid = b->owner->uid;
   rel->nases = 1 + nsharers;
   rel->ases = malloc(rel->nases * sizeof(*rel->ases));
   asserts(rel->ases != nullptr, "umem: release ctx alloc failed");
@@ -360,7 +280,6 @@ void umem_release_finish(struct umem_release *rel) {
   spinlock_unlock(&g_allocator_lock);
   asserts(s == BUDDY_STATUS_SUCCESS, "umem: buddy rejected block free");
 
-  account_uncharge(rel->uid, ublock_bytes(b));
   vec_share_edge_delete(&b->sharers);
   free(b);
   rel->b = nullptr;
@@ -404,7 +323,11 @@ int umem_protect(struct process *p, uint64_t base, size_t len,
   // between wait's user_range_ok and its load.
   umem_proc_lock(p);
   ublock *b = umem_view_locked(p, base, len);
-  if (b == nullptr) {
+  // A kernel channel's CQ is written from borrowed contexts, including IRQ
+  // context where a kernel-mode page fault is fatal. Scheme creation holds
+  // this same list lock through b->ring publication, so this test cannot
+  // race a protect into the creation window.
+  if (b == nullptr || b->ring != nullptr) {
     umem_proc_unlock(p);
     return -1;
   }
@@ -546,15 +469,6 @@ void umem_reap_finish_locked(struct process *p) {
 uint64_t umem_move_locked(ublock *b, struct process *from, struct process *to,
                           bool src_as_live) {
   uint64_t bytes = ublock_bytes(b);
-  if (from->uid != to->uid) {
-    // Charge follows the owner: reserve the new charge before releasing
-    // the old so a failure leaves everything untouched.
-    if (!account_charge(to->uid, bytes)) {
-      return SYSERR_NOMEM;
-    }
-    account_uncharge(from->uid, bytes);
-  }
-
   // List surgery before the stripe (never the other way around). In
   // both legal moves exactly one endpoint can have live threads — down
   // is into an own embryo, up is out of an own zombie — and that live

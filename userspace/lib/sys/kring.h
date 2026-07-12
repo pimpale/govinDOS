@@ -26,6 +26,7 @@
 #include <stdint.h>
 
 #include <gdos/kring.h>
+#include <gdos/kring_irq.h>
 
 struct kring {
   uint64_t base; // block base — the channel's name to the syscalls
@@ -77,5 +78,11 @@ uint64_t kring_wait_cqe(struct kring *r, struct kcqe *cqe);
 // Consumption ack: publish cq_head and ring the doorbell so the kernel
 // replays pending level-state events into the freed slots.
 uint64_t kring_ack(struct kring *r);
+
+// IRQ command submission helpers. These return the doorbell result; the
+// command's result is the ordinary completion CQE (events may precede it).
+uint64_t kring_irq_claim(struct kring *r, uint64_t gsi, uint64_t cookie);
+uint64_t kring_irq_release(struct kring *r, uint64_t gsi);
+uint64_t kring_irq_ack(struct kring *r, uint64_t gsi, uint64_t seq);
 
 #endif // kring_h_INCLUDED

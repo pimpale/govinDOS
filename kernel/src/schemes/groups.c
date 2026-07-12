@@ -105,13 +105,11 @@ void groups_reg_died(struct reg *r) {
 void groups_replay(struct ring *group) {
   uint32_t sg = umem_stripe(group->block->base);
   umem_stripe_lock(sg);
-  uint32_t consumed =
-      atomic_load_explicit(&hdr_of(group)->cq_head, memory_order_acquire);
   // Backwards: posting a dead reg's event removes it from the vec.
   for (uint32_t i = vec_reg_ptr_len(group->regs); i > 0; i--) {
     struct reg *r;
     vec_reg_ptr_get(group->regs, i - 1, &r);
-    if (r->pending && (int32_t)(consumed - r->ev_index) > 0) {
+    if (r->pending && cqe_consumed(group, r->ev_index)) {
       r->pending = false;
     }
     struct reg *fwd;
@@ -140,7 +138,7 @@ static uint64_t groups_add(struct thread *curr, struct ring *group,
   if (b == nullptr || !classify_side(p, b, &owner)) {
     return SYSERR_INVAL;
   }
-  if (b->ring != nullptr && b->ring->scheme == KSCHEME_GROUPS) {
+  if (b->ring != nullptr && b->ring->ops->id == KSCHEME_GROUPS) {
     return SYSERR_INVAL; // group-in-group
   }
   if (b->ring == nullptr) {

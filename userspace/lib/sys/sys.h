@@ -63,7 +63,6 @@ static inline uint64_t sys_debug_write(const void *buf, uint64_t len) {
 }
 
 static inline void sys_yield(void) { sys0(SYS_YIELD); }
-static inline uint64_t sys_getuid(void) { return sys0(SYS_GETUID); }
 static inline uint64_t sys_getpid(void) { return sys0(SYS_GETPID); }
 
 // Blocks are the allocation unit (power-of-two pages); returns the base.

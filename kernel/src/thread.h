@@ -79,10 +79,6 @@ struct process {
   // identity layout (SASOS) — isolation is which tree carries PAGE_U
   // leaves for a block.
   struct address_space *as;
-  // Owner of this process, for the multi-user model. uid 0 is reserved
-  // for the kernel itself. User memory is charged to this uid.
-  uint64_t uid;
-
   // Guarded by the umem lock (with racy reads by kernel-entry death
   // checks, which is fine: the transition to PROC_DEAD is one-way).
   enum proc_state state;

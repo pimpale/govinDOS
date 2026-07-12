@@ -7,6 +7,7 @@
 #include "interrupts.h"
 #include "lapic.h"
 #include "madt_x86.h"
+#include "irq_scheme.h"
 #include "paging.h"
 #include "stacks.h"
 #include "stdlib/stdlib.h"
@@ -96,19 +97,12 @@ static void map_acpi_mmio(struct address_space *as,
                           const struct acpi_madt *madt) {
   map_mmio_page(as, x86_lapic_address(madt));
 
-  const uint8_t *p = (const uint8_t *)madt + sizeof(*madt);
-  const uint8_t *end = (const uint8_t *)madt + madt->header.length;
-  while (p + sizeof(struct acpi_madt_entry_header) <= end) {
-    const struct acpi_madt_entry_header *eh =
-        (const struct acpi_madt_entry_header *)p;
-    if (eh->length < sizeof(*eh) || p + eh->length > end)
-      break;
+  madt_for_each(madt, eh) {
     if (eh->type == ACPI_MADT_IO_APIC) {
       const struct acpi_madt_io_apic *ioapic =
-          (const struct acpi_madt_io_apic *)p;
+          (const struct acpi_madt_io_apic *)eh;
       map_mmio_page(as, ioapic->io_apic_address);
     }
-    p += eh->length;
   }
 }
 
@@ -154,6 +148,10 @@ void cpu_setup_bsp(const struct acpi_rsdp *rsdp) {
   // every other CPU's, which is idempotent.
   x86_lapic_enable();
   x86_lapic_timer_calibrate();
+
+  // Discover and silence every IOAPIC input before userspace can claim one.
+  // Device routes target this BSP in v1.
+  irq_scheme_init(madt);
 }
 
 void cpu_setup() {

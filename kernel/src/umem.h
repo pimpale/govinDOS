@@ -25,10 +25,8 @@
 //     (PAGE_KERNEL_PRISTINE) and flushed. Whatever sub-range flags the
 //     process applied are erased structurally by that whole-block
 //     overwrite — the kernel never tracks or replays them.
-//   - Blocks are zeroed at allocation: they recycle across processes and
-//     users, so handing out old contents would be an info leak.
-//   - Every allocation is charged to the owner's uid; revocation-on-death
-//     means the charge never migrates.
+//   - Blocks are zeroed at allocation: they recycle across protection
+//     domains, so handing out old contents would be an info leak.
 
 typedef struct ublock ublock;
 typedef ublock *ublock_ptr;
@@ -91,7 +89,7 @@ void umem_process_register(struct process *p);
 // Allocate >= len bytes (rounded up to a power-of-two page count) of
 // zeroed memory owned by `p`, mapped prot|PAGE_U in p's AS only. In every
 // other AS the block just remains ordinary kernel memory. Returns the
-// block base or nullptr (out of memory / over the uid's limit).
+// block base or nullptr (out of memory).
 void *umem_alloc(struct process *p, size_t len, paging_flags_t prot);
 
 // Free a block owned by `p`. base must be the exact block base — blocks
@@ -140,11 +138,10 @@ struct umem_release {
   ublock *b;
   struct address_space **ases; // owner + sharers, pinned; malloc'd
   uint32_t nases;
-  uint64_t uid; // uncharge target (owner may be unreachable by then)
 };
 
 // Flush all views in ONE shootdown round, unpin, return the block to
-// the buddy, uncharge, free the metadata. No locks held. Idempotent on
+// the buddy, and free the metadata. No locks held. Idempotent on
 // a zeroed struct.
 void umem_release_finish(struct umem_release *rel);
 
@@ -158,10 +155,9 @@ bool umem_reap_one_view_locked(struct process *p);
 // Final reap step: free p's (now empty) block lists.
 void umem_reap_finish_locked(struct process *p);
 
-// Transfer ownership of `b` from `from` to `to`: re-charge, tear the
-// old owner's view (skipped when src_as_live is false — a reaped-away
-// AS), map R|W into the new owner, keep sharer edges. 0 or SYSERR_NOMEM
-// (receiver uid over quota).
+// Transfer ownership of `b` from `from` to `to`: tear the old owner's view
+// (skipped when src_as_live is false — a reaped-away AS), map R|W into the
+// new owner, and keep sharer edges.
 uint64_t umem_move_locked(ublock *b, struct process *from, struct process *to,
                           bool src_as_live);
 

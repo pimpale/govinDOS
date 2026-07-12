@@ -17,7 +17,8 @@ manipulation, per-frame metadata in `g_frames`.
 - **Sharing** between user processes, with a defined owner-death policy.
 - **Continuous merging**: when flag fragmentation is reverted, the page tree
   collapses back to hugepages.
-- **Multiuser**: per-uid accounting and no cross-process information leaks.
+- **Isolation**: per-process views and zero-on-allocation prevent
+  cross-process information leaks; account policy stays in userspace.
 
 ## 2. The core invariant: the buddy only holds pristine memory
 
@@ -203,8 +204,8 @@ because each can be held across `as_flush` by some path:
    ipc-process-design.md §7).
 
 Consequences: the IPC data plane never touches `g_umem`; `umem_alloc`
-takes no global lock at all (per-uid accounts are lock-free CAS, the
-buddy has its own lock, the list push is `p->ulock`); and revocation's
+takes no global lock at all (the buddy has its own lock and the list push
+uses `p->ulock`); and revocation's
 flush round runs with *no* locks held (free path below).
 
 The `ublock` list is the **sole authority** on ownership and lifetime; the
@@ -258,7 +259,7 @@ longest thing the old global lock ever covered, so it moved outside):
 2. **With no locks held** (`umem_release_finish`): flush every view in
    **one combined shootdown round** (`as_flush_multi` — union dirty
    range, one IPI per target CPU regardless of sharer count), unpin,
-   `buddy_page_free`, uncharge.
+   `buddy_page_free`.
 
 Flush-before-buddy-free is the pristinity/TLB rule from §2. The pins
 are what let the flush leave the lock: a concurrently-reaped sharer's
@@ -274,13 +275,9 @@ access is revoked** (their views are re-flagged pristine, so a subsequent
 ring-3 touch takes a page fault → kill or error delivery). Rationale:
 
 - **Deterministic reclamation.** Block lifetime == owner lifetime. A leaked or
-  hostile share can never pin memory; when a user's last process dies, all
-  memory charged to that user is provably back in the buddy.
-- **Crisp multiuser accounting.** The charge stays on the creator's uid for
-  the block's whole life (§8). Survivorship (option 2) forces a re-charge to
-  the inheriting process's uid at owner death, including a "bequest would
-  exceed the heir's quota" failure path — policy sludge with no payoff at this
-  stage.
+  hostile share can never keep a block alive after its owner is reaped.
+- **No implicit inheritance policy.** Survivorship (option 2) would need rules
+  for choosing a new owner. Revocation has no such policy decision.
 - **Mechanically free.** Owner exit walks `blocks` and runs the §5 free path;
   revocation of sharers *is* step 1. Option 2 needs extra transfer logic.
 - Sharing is cooperative — a sharer must already handle the owner
@@ -289,7 +286,7 @@ ring-3 touch takes a page fault → kill or error delivery). Rationale:
 
 The `ublock` structure (explicit owner + sharer list) keeps option 2 available
 as a later per-share flag (`SHARE_BEQUEATH`: on owner death, promote the first
-sharer to owner and transfer the uid charge) without reshaping anything.
+sharer to owner) without reshaping anything.
 
 ## 7. Teardown paths
 
@@ -330,17 +327,16 @@ On reap of a dead kthread:
 
 User threads are stackless in the kernel; their death costs nothing here.
 
-## 8. Multiuser
+## 8. Resource policy
 
-- `struct user_account { uint64_t uid; _Atomic uint64_t bytes; uint64_t limit; }`,
-  looked up/created at `process_create_user`. `SYS_MEM_ALLOC` charges the
-  owner's uid and fails with `-ENOMEM`-equivalent past the limit;
-  free/owner-exit uncharges. Under the revoke policy the charge never
-  migrates.
+- The kernel has no uid or account table. Login identities and POSIX
+  credentials belong to userspace services.
+- `SYS_VM_ALLOC` currently fails only when the global buddy allocator is out
+  of memory. A later capability design may add explicit resource-budget
+  objects without coupling allocation to user identities.
 - Permission checks are ublock checks: only the owner may free or share; a
   sharer may only flag/unshare its own view.
-- Zero-on-alloc (§5) is the isolation half of multiuser; the page trees are
-  the enforcement half.
+- Zero-on-alloc (§5) and per-process page trees enforce isolation.
 
 ## 9. Locking
 
@@ -361,8 +357,8 @@ User threads are stackless in the kernel; their death costs nothing here.
 
 **Status: all of §§1–9 are implemented and QEMU-verified (2026-07-06),**
 minus `kas_flag` (omitted per above). Key files: paging.c (merge pass,
-per-AS lock, `as_table_count`), umem.c/h (ublocks, registry, uid
-accounts), reaper.c/h (thread/process teardown, AS drain), ring.c
+per-AS lock, `as_table_count`), umem.c/h (ublocks and the process registry),
+reaper.c/h (thread/process teardown, AS drain), ring.c
 (`ring_destroy`), stacks.c (`stacks_free_kernel`), interrupts.c (ring-3
 faults kill the process). Boot self-tests in init.c cover split→merge
 shape restoration and two-process share/protect/revoke; userspace/hello.c
@@ -384,7 +380,7 @@ The order the work landed in, each step keeping the userspace test green:
 6. **ublock layer + syscalls** (alloc/flag/free), rings allocated from
    ublocks; `g_frames` retired.
 7. **Share/unshare + revoke-on-exit.**
-8. **uid accounting + zero-on-alloc** (zeroing can land with 6).
+8. **zero-on-alloc** (can land with 6).
 
 ## Appendix A: refcounted shared subtrees (persistent page trees)
 

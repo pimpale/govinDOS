@@ -128,7 +128,7 @@ billed to it like any ublock. Contents, initial set:
 - ACPI RSDP physical address
 - framebuffer: base, pitch, width, height, pixel format (GOP capture)
 - memory: total/usable page counts at handoff (informational; authority
-  over memory stays with the kernel's allocator + quota model)
+  over memory stays with the kernel allocator)
 
 Deliberately *not* in bootinfo: the initfs (linked symbols instead,
 §0), a command line (no use case yet; add a field when one exists).

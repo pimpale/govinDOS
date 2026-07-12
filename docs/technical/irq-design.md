@@ -1,6 +1,6 @@
 # IRQ design: userspace drivers, the irq scheme
 
-Status: **design 2026-07-11, not implemented.** Companion to
+Status: **pin IRQs implemented 2026-07-11; MSI remains phase 2.** Companion to
 [ipc-process-design.md](ipc-process-design.md); this is the first of the
 "device schemes, where the IRQ handler posts the completion CQE" its §2
 promised, and it must obey that document's design law: bounded
@@ -58,9 +58,9 @@ dispatch branch), `lib/sys/kring.c` (driver-side wrappers).
   never grows a PCI layer; whoever can already reach a device's
   config space and BARs is already trusted with its DMA engine, so
   self-programming adds no new authority (§5).
-- **Policy is a stub: uid 0 claims.** MINIX's per-driver allow-list
-  (RS/system.conf) is the right end state once a devmgr exists to own
-  it; until then irq rings are creatable by uid 0 only.
+- **Claim policy is deferred.** IRQ rings are temporarily unrestricted.
+  The intended end state is capability delegation through a devmgr; the
+  kernel has no uid/account policy layer.
 - **Affinity is deferred: everything routes to the BSP.** Also makes
   handler-side lock contention structurally nil in v1. A claim-time
   affinity argument slots in later without ABI change (the CQE and
@@ -99,7 +99,7 @@ redoxos}`); the scheme below is a synthesis, not an invention.
   programs MSI address/data into the device itself; root-only.
   Contributions taken: nearly everything — the count-as-sequence, the
   ack-mismatch-refires semantics, the exclusive-vector stance, the
-  MSI division of labor, uid-0 policy. Redox's shape is close to
+  MSI division of labor, excluding its uid-based policy. Redox's shape is close to
   isomorphic to a govindos scheme already.
 
 The three agree on the core: **mask level lines until the driver says
@@ -112,7 +112,7 @@ handle vs fd), which govindos already standardized as krings.
 Many rings per process allowed, many claims per ring (a driver with
 several devices, or one device's several MSI-X vectors, multiplexes one
 ring — the `cookie` tells events apart). Ring creation is the ordinary
-`SYS_VM_SHARE(base, -4, prot)`, gated on uid 0 for now (§0).
+`SYS_VM_SHARE(base, -4, prot)`; capability gating is deferred (§0).
 
 `abi/gdos/kring_irq.h`:
 
@@ -350,8 +350,8 @@ ACPI (`_PRT` for PCI INTx) or platform knowledge — userspace's problem
   `maskedForNack`, exponent capped). The ABI holds: `KIRQ_CLAIM`
   grows a SHARED flag, `KIRQ_NACK` joins `KIRQ_ACK`. Not before a
   real device forces it — PCIe devices are MSI-capable by spec.
-- **Claim policy.** uid-0 today; the end state is a devmgr that owns
-  the allow-list (MINIX's RS + system.conf as the model), likely as
+- **Claim policy.** A future devmgr owns the allow-list (MINIX's RS +
+  system.conf as the model), likely as
   the same process that owns ECAM and hands out device memory — claims
   then become something it brokers, not something the kernel
   policy-checks per-GSI.

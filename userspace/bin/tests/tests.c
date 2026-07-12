@@ -441,8 +441,6 @@ void _start(uint64_t arg) {
 
   print("tests: pid=");
   print_hex(sys_getpid());
-  print("tests: uid=");
-  print_hex(sys_getuid());
 
   sys_yield();
   print("tests: back from yield\n");

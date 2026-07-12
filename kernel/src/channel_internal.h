@@ -1,6 +1,8 @@
 #ifndef channel_internal_h_INCLUDED
 #define channel_internal_h_INCLUDED
 
+#include <stdatomic.h>
+
 #include "channel.h"
 
 // Internals shared between channel.c (core plumbing, syscall backends,
@@ -17,6 +19,19 @@
 //     under it before the reg or its ring can be freed), or while
 //     holding g_umem (all frees take it).
 
+// One description of a kernel-channel scheme's complete lifecycle. A null
+// callback means the scheme has no work for that operation. `anchor` is
+// non-null for the one-per-process schemes and returns their owner slot.
+struct scheme_ops {
+  int64_t id;
+  uint64_t (*exec)(struct thread *curr, struct ring *ring,
+                   const struct ksqe *sqe);
+  void (*init)(struct ring *ring);
+  void (*replay)(struct ring *ring);
+  void (*destroy)(struct ring *ring);
+  struct ring **(*anchor)(struct process *p);
+};
+
 // Ring geometry. The block is hostile user memory: only the kernel-side
 // struct ring fields are trusted; header fields are mirrors.
 static inline struct kring_hdr *hdr_of(const struct ring *ring) {
@@ -30,6 +45,17 @@ static inline struct ksqe *sq_of(const struct ring *ring) {
 static inline struct kcqe *cq_of(const struct ring *ring) {
   return (struct kcqe *)(ring->block->base + KRING_HDR_SIZE +
                          (uint64_t)ring->nslots * sizeof(struct ksqe));
+}
+
+// Wrap-safe consumption test shared by every scheme that retires an
+// outstanding event CQE: has the user-owned cq_head (read once, never
+// trusted beyond comparison) passed the CQE at monotonic index
+// ev_index? Caller holds the lock that guards the event's bookkeeping
+// (stripe(ring block) for groups regs, the route lock for irq claims).
+static inline bool cqe_consumed(struct ring *ring, uint32_t ev_index) {
+  uint32_t consumed =
+      atomic_load_explicit(&hdr_of(ring)->cq_head, memory_order_acquire);
+  return (int32_t)(consumed - ev_index) > 0;
 }
 
 static inline struct thread **side_waiter(ublock *b, bool owner) {
@@ -66,13 +92,20 @@ bool ring_post_locked(struct ring *ring, uint64_t type, uint64_t a,
 bool channel_post(struct ring *ring, uint64_t type, uint64_t a, uint64_t b,
                   uint64_t status);
 
+// IRQ/data-plane post: no g_umem and no stripe held. The caller supplies
+// lifetime pinning (an IRQ route lock). Acquires the ring and optional group
+// stripes in ranked order, so an IRQ ring registered in a wait-group wakes it
+// without entering the control plane.
+bool channel_post_data(struct ring *ring, uint64_t type, uint64_t a,
+                       uint64_t b, uint64_t status, uint32_t *index_out);
+
 // ---------------------------------------------------------------------------
 // schemes/shares.c — scheme -1
 // ---------------------------------------------------------------------------
 
 // Post KEV_SHARE for every un-notified edge pointing at p, until the CQ
 // fills. g_umem held, no stripes (takes p's list lock).
-void shares_replay(struct process *p);
+void shares_replay(struct ring *ring);
 
 // ---------------------------------------------------------------------------
 // schemes/tree.c — scheme -3
@@ -80,7 +113,7 @@ void shares_replay(struct process *p);
 
 // Post KEV_CHILD_DEAD for every un-notified dead child, until the CQ
 // fills. g_umem held, no stripes.
-void tree_replay(struct process *p);
+void tree_replay(struct ring *ring);
 
 // ---------------------------------------------------------------------------
 // schemes/groups.c — scheme -2
@@ -114,5 +147,14 @@ void groups_reg_died(struct reg *r);
 // (there is nobody left to tell). g_umem held, no stripes; frees the
 // regs and the vec, not the ring struct.
 void groups_endpoint_destroy(struct ring *group);
+
+// ---------------------------------------------------------------------------
+// schemes/irq.c — scheme -4
+// ---------------------------------------------------------------------------
+
+uint64_t irq_exec(struct thread *curr, struct ring *ring,
+                  const struct ksqe *sqe);
+void irq_replay(struct ring *ring);
+void irq_endpoint_destroy(struct ring *ring);
 
 #endif // channel_internal_h_INCLUDED

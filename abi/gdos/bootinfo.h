@@ -45,7 +45,7 @@ struct bootinfo {
   uint32_t fb_format;
 
   // Memory at handoff (informational; authority over memory stays with
-  // the kernel allocator + quota model). Page counts of the EFI map:
+  // the kernel allocator). Page counts of the EFI map:
   // every descriptor, and the EFI_CONVENTIONAL_MEMORY subset.
   uint64_t mem_total_pages;
   uint64_t mem_usable_pages;

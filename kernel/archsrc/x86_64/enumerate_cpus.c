@@ -13,21 +13,10 @@ struct cpu_list enumerate_cpus(const struct acpi_madt *madt) {
     return list;
   }
 
-  const uint8_t *p = (const uint8_t *)madt + sizeof(*madt);
-  const uint8_t *end = (const uint8_t *)madt + madt->header.length;
-
-  while (p + sizeof(struct acpi_madt_entry_header) <= end) {
-    const struct acpi_madt_entry_header *eh =
-        (const struct acpi_madt_entry_header *)p;
-
-    // A zero-length entry would loop forever; an over-long one is malformed.
-    if (eh->length < sizeof(*eh) || p + eh->length > end) {
-      break;
-    }
-
+  madt_for_each(madt, eh) {
     if (eh->type == ACPI_MADT_LOCAL_APIC) {
       const struct acpi_madt_local_apic *lapic =
-          (const struct acpi_madt_local_apic *)p;
+          (const struct acpi_madt_local_apic *)eh;
       bool enabled = (lapic->flags & 0x1) != 0;
       bool online_capable = (lapic->flags & 0x2) != 0;
       if ((enabled || online_capable) && list.count < MAX_CPUS) {
@@ -38,8 +27,6 @@ struct cpu_list enumerate_cpus(const struct acpi_madt *madt) {
         };
       }
     }
-
-    p += eh->length;
   }
 
   return list;
