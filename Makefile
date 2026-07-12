@@ -4,8 +4,7 @@
 .PHONY: all kernel userspace clean cleanall runkernel
 
 all: kernel userspace
-	mkdir -p out
-	cp -rT root out/root
+	mkdir -p out out/root
 	cp -rT efi out/efi
 	mkdir -p out/root/EFI/BOOT out/root/boot
 	cp kernel/out/kernel.efi out/root/EFI/BOOT/BOOTX64.efi

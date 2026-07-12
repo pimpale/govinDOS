@@ -24,9 +24,7 @@ CFLAGS := \
 	-mgeneral-regs-only \
 	-fno-stack-protector \
 	-O1 \
-	-I$(U)/../abi \
-	-I$(U)/lib/sys \
-	-I$(U)/lib/c
+	-I$(U)/../abi
 
 LDFLAGS := \
 	-flavor link \
@@ -37,17 +35,19 @@ LDFLAGS := \
 	-dynamicbase \
 	-debug:none
 
-# The libraries, as prerequisites for program links. The rules below
-# build a lib if it's missing so a component can be built standalone
-# from a clean tree; staleness across components is the orchestrator's
-# job (userspace/Makefile builds in dependency order).
-LIBS := $(U)/lib/sys/out/sys.a $(U)/lib/c/out/c.a
+# Library selection: a component's Makefile names the libraries it pulls
+# in by setting ULIBS (directory names under lib/) before including this
+# file. Only the ABI headers are universal; each selected library
+# contributes its include dir, and LIBS expands to the archives for the
+# program link, in the order given. The pattern rule builds a lib if
+# it's missing so a component can be built standalone from a clean tree;
+# staleness across components is the orchestrator's job
+# (userspace/Makefile builds in dependency order).
+CFLAGS += $(foreach l,$(ULIBS),-I$(U)/lib/$(l))
+LIBS := $(foreach l,$(ULIBS),$(U)/lib/$(l)/out/$(l).a)
 
-$(U)/lib/sys/out/sys.a:
-	$(MAKE) -C $(U)/lib/sys
-
-$(U)/lib/c/out/c.a:
-	$(MAKE) -C $(U)/lib/c
+$(U)/lib/%.a:
+	$(MAKE) -C $(patsubst %/out/,%,$(dir $@))
 
 out/%.c.o: %.c
 	@mkdir -p $(dir $@)

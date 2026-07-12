@@ -1,7 +1,8 @@
-#include "upe.h"
+#include "pe.h"
 
-#include "string.h"
-#include "usys.h"
+#include <string.h>
+
+#include "sys.h"
 
 // Minimal on-disk PE32+ structures (only the fields we read) — the same
 // shapes as kernel/src/pe.c.
@@ -78,19 +79,15 @@ static uint64_t page_ceil(uint64_t v) {
   return (v + UPAGE_SIZE - 1) & ~(UPAGE_SIZE - 1);
 }
 
-// SYSERR values are small negatives of u64; anything in the top page of
-// the address space is an error, not a base.
-static int is_err(uint64_t v) { return v >= (uint64_t)-4096; }
-
 static uint64_t fail(const char *why) {
-  print("upe: ");
+  print("pe: ");
   print(why);
   print("\n");
   return 0;
 }
 
-uint64_t upe_spawn(const uint8_t *image, uint64_t len, uint64_t arg,
-                   uint64_t stack_len) {
+uint64_t pe_spawn(const uint8_t *image, uint64_t len, uint64_t arg,
+                  uint64_t stack_len) {
   if (len < sizeof(struct dos_header)) {
     return fail("image too short");
   }
@@ -121,22 +118,22 @@ uint64_t upe_spawn(const uint8_t *image, uint64_t len, uint64_t arg,
   uint64_t image_size = page_ceil(opt->size_of_image);
 
   // One block for the whole image, written here, moved to the embryo
-  // below. VM_MAP zeroes, so the VirtualSize > raw_size tail (.bss) is
+  // below. VM_ALLOC zeroes, so the VirtualSize > raw_size tail (.bss) is
   // already right.
-  uint64_t base = sys2(SYS_VM_MAP, image_size, VM_PROT_READ | VM_PROT_WRITE);
-  if (is_err(base)) {
-    return fail("vm_map(image) failed");
+  uint64_t base = sys_vm_alloc(image_size, VM_PROT_READ | VM_PROT_WRITE);
+  if (sys_iserr(base)) {
+    return fail("vm_alloc(image) failed");
   }
   memcpy((uint8_t *)base, image, opt->size_of_headers);
   for (uint16_t i = 0; i < coff->n_sections; i++) {
     const struct section_header *s = &sections[i];
     if ((uint64_t)s->virtual_address + s->raw_size > image_size ||
         (uint64_t)s->raw_offset + s->raw_size > len) {
-      sys2(SYS_VM_UNMAP, base, 0);
+      sys_vm_free(base);
       return fail("section out of bounds");
     }
     memcpy((uint8_t *)(base + s->virtual_address), image + s->raw_offset,
-               s->raw_size);
+           s->raw_size);
   }
 
   // Base relocations against the block's address — which is also the
@@ -145,13 +142,14 @@ uint64_t upe_spawn(const uint8_t *image, uint64_t len, uint64_t arg,
   uint64_t delta = base - opt->image_base;
   if (delta != 0 && opt->n_data_dirs > PE_DIR_BASERELOC &&
       opt->dirs[PE_DIR_BASERELOC].size != 0) {
-    const uint8_t *rel = (const uint8_t *)(base + opt->dirs[PE_DIR_BASERELOC].va);
+    const uint8_t *rel =
+        (const uint8_t *)(base + opt->dirs[PE_DIR_BASERELOC].va);
     const uint8_t *rel_end = rel + opt->dirs[PE_DIR_BASERELOC].size;
     while (rel + 8 <= rel_end) {
       uint32_t page_rva = *(const uint32_t *)rel;
       uint32_t block_size = *(const uint32_t *)(rel + 4);
       if (block_size < 8) {
-        sys2(SYS_VM_UNMAP, base, 0);
+        sys_vm_free(base);
         return fail("bad reloc block");
       }
       const uint16_t *entry = (const uint16_t *)(rel + 8);
@@ -162,7 +160,7 @@ uint64_t upe_spawn(const uint8_t *image, uint64_t len, uint64_t arg,
         if (type == RELOC_DIR64) {
           *(uint64_t *)(base + page_rva + off) += delta;
         } else if (type != RELOC_ABSOLUTE) {
-          sys2(SYS_VM_UNMAP, base, 0);
+          sys_vm_free(base);
           return fail("unsupported reloc type");
         }
       }
@@ -173,25 +171,24 @@ uint64_t upe_spawn(const uint8_t *image, uint64_t len, uint64_t arg,
   // Embryo construction (§5): image and stack move down the tree edge,
   // then the parent sets the moved image's per-section W^X — its one
   // window of authority over another process's views.
-  uint64_t pid = sys0(SYS_PROC_CREATE);
-  if (is_err(pid)) {
-    sys2(SYS_VM_UNMAP, base, 0);
+  uint64_t pid = sys_proc_create();
+  if (sys_iserr(pid)) {
+    sys_vm_free(base);
     return fail("proc_create failed");
   }
-  uint64_t stack = sys2(SYS_VM_MAP, stack_len, VM_PROT_READ | VM_PROT_WRITE);
-  if (is_err(stack)) {
-    sys2(SYS_VM_UNMAP, base, 0);
-    sys1(SYS_PROC_KILL, pid);
-    return fail("vm_map(stack) failed");
+  uint64_t stack = sys_vm_alloc(stack_len, VM_PROT_READ | VM_PROT_WRITE);
+  if (sys_iserr(stack)) {
+    sys_vm_free(base);
+    sys_proc_kill(pid);
+    return fail("vm_alloc(stack) failed");
   }
-  if (is_err(sys2(SYS_VM_MOVE, base, pid)) ||
-      is_err(sys2(SYS_VM_MOVE, stack, pid))) {
-    sys1(SYS_PROC_KILL, pid);
+  if (sys_iserr(sys_vm_move(base, pid)) || sys_iserr(sys_vm_move(stack, pid))) {
+    sys_proc_kill(pid);
     return fail("vm_move failed");
   }
 
   // Header page read-only, then each section per its characteristics.
-  sys4(SYS_VM_PROTECT, base, UPAGE_SIZE, VM_PROT_READ, pid);
+  sys_vm_protect_for(base, UPAGE_SIZE, VM_PROT_READ, pid);
   for (uint16_t i = 0; i < coff->n_sections; i++) {
     const struct section_header *s = &sections[i];
     uint64_t prot = 0;
@@ -204,15 +201,14 @@ uint64_t upe_spawn(const uint8_t *image, uint64_t len, uint64_t arg,
     if (s->characteristics & SEC_EXEC) {
       prot |= VM_PROT_EXEC;
     }
-    uint64_t size =
-        page_ceil(s->virtual_size ? s->virtual_size : s->raw_size);
-    sys4(SYS_VM_PROTECT, base + s->virtual_address, size, prot, pid);
+    uint64_t size = page_ceil(s->virtual_size ? s->virtual_size : s->raw_size);
+    sys_vm_protect_for(base + s->virtual_address, size, prot, pid);
   }
 
-  uint64_t tid = sys4(SYS_THREAD_SPAWN, pid, base + opt->entry_point,
-                      stack + stack_len, arg);
-  if (is_err(tid)) {
-    sys1(SYS_PROC_KILL, pid);
+  uint64_t tid =
+      sys_thread_spawn(pid, base + opt->entry_point, stack + stack_len, arg);
+  if (sys_iserr(tid)) {
+    sys_proc_kill(pid);
     return fail("thread_spawn failed");
   }
   return pid;

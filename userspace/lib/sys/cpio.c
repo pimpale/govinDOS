@@ -1,6 +1,6 @@
 #include "cpio.h"
 
-#include "string.h"
+#include <string.h>
 
 #define CPIO_HDR_SIZE 110
 #define CPIO_FILESIZE_OFF (6 + 6 * 8)  // 7th 8-hex-digit field

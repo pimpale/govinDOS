@@ -59,6 +59,9 @@ struct address_space {
   // stores, so a racing reader sees either the old or the new PTE — the
   // same guarantee the hardware walker gets.
   _Atomic bool mut_lock;
+  // Holders keep the AS alive across a flush done outside the locks that
+  // made it reachable (umem teardown). as_free requires zero.
+  _Atomic uint64_t pins;
 };
 
 struct address_space *g_as_kernel = nullptr;
@@ -430,6 +433,7 @@ struct address_space *as_identity_mapping(void) {
     pdpt[i] = (i * GIB) | leaf_base | PTE_PS;
   }
   as->root[0] = (uint64_t)pdpt | intermediate_flags();
+  atomic_store_explicit(&as->pins, 0, memory_order_relaxed);
   return as;
 }
 
@@ -442,12 +446,28 @@ struct address_space *as_clone(struct address_space *src) {
   as->min_dirty = DIRTY_EMPTY_MIN;
   as->max_dirty = DIRTY_EMPTY_MAX;
   atomic_store_explicit(&as->mut_lock, false, memory_order_relaxed);
+  atomic_store_explicit(&as->pins, 0, memory_order_relaxed);
   return as;
+}
+
+void as_pin(struct address_space *as) {
+  atomic_fetch_add_explicit(&as->pins, 1, memory_order_acquire);
+}
+
+void as_unpin(struct address_space *as) {
+  uint64_t prev = atomic_fetch_sub_explicit(&as->pins, 1, memory_order_release);
+  asserts(prev != 0, "as_unpin: underflow\n");
+}
+
+bool as_has_pins(const struct address_space *as) {
+  return atomic_load_explicit(&as->pins, memory_order_acquire) != 0;
 }
 
 void as_free(struct address_space *as) {
   // Caller guarantees no CPU has this AS current (see the drain in the
-  // reaper) and no concurrent mutators remain; the lock is for form.
+  // reaper), no pins remain, and no concurrent mutators remain; the lock
+  // is for form.
+  asserts(!as_has_pins(as), "as_free: pinned\n");
   as_lock(as);
   free_table(4, as->root);
   as_unlock(as);
@@ -566,9 +586,11 @@ static void tlb_invalidate_local(uint64_t min, uint64_t max) {
 // Cross-CPU TLB shootdown mailbox. Only one shootdown is in flight at a
 // time (serialized by g_tlb_busy), so a single global slot is enough.
 //
-//   .as       : the address space whose dirty range needs invalidating.
-//               Remote CPUs short-circuit if they're not running it.
-//   .min/.max : the dirty range to invalidate.
+//   .ases/.nases: the address spaces whose dirty ranges need
+//               invalidating (the initiator's array outlives the wait).
+//               Remote CPUs short-circuit if they're running none of
+//               them.
+//   .min/.max : the union dirty range to invalidate.
 //   .need_mask: bit i set means logical CPU i must invalidate and ack.
 //               The initiator spins until it reaches zero.
 //
@@ -580,13 +602,23 @@ static void tlb_invalidate_local(uint64_t min, uint64_t max) {
 // spinner waits for the slot). The mask makes acking idempotent and
 // callable from a polling loop, so slot-waiters ack by hand.
 static struct {
-  struct address_space *as;
+  struct address_space *const *ases;
+  size_t nases;
   uint64_t min;
   uint64_t max;
   _Atomic uint64_t need_mask;
 } g_tlb_req;
 
 static _Atomic bool g_tlb_busy;
+
+static bool tlb_req_matches(const struct address_space *as) {
+  for (size_t i = 0; i < g_tlb_req.nases; i++) {
+    if (g_tlb_req.ases[i] == as) {
+      return true;
+    }
+  }
+  return false;
+}
 
 // Service the in-flight shootdown if it targets this CPU. Idempotent;
 // safe to call from any IRQs-off spin loop. The request fields are
@@ -599,7 +631,7 @@ static void tlb_service_local(void) {
        bit) == 0) {
     return;
   }
-  if (g_cpu_state_table[me].current_as == g_tlb_req.as) {
+  if (tlb_req_matches(g_cpu_state_table[me].current_as)) {
     tlb_invalidate_local(g_tlb_req.min, g_tlb_req.max);
   }
   atomic_fetch_and_explicit(&g_tlb_req.need_mask, ~bit, memory_order_release);
@@ -612,18 +644,35 @@ void paging_handle_tlb_shootdown(void) {
 
 void paging_service_shootdown(void) { tlb_service_local(); }
 
-int as_flush(struct address_space *as) {
-  as_lock(as);
-  if (!has_dirty(as)) {
-    as_unlock(as);
-    return 0;
-  }
-
+int as_flush_multi(struct address_space *const *ases, size_t n) {
   asserts(g_cpu_state_table_len <= 64, "as_flush: need_mask is 64 bits");
 
+  // Snapshot-and-clear each AS's dirty range under its own lock, one at
+  // a time (no multi-lock ordering problem), accumulating the union.
+  // Anything dirtied after its clear belongs to that mutator's own
+  // subsequent as_flush — every as_flag caller flushes — so nothing is
+  // lost; at worst we invalidate a range someone else also invalidates.
+  uint64_t min = DIRTY_EMPTY_MIN;
+  uint64_t max = DIRTY_EMPTY_MAX;
+  for (size_t i = 0; i < n; i++) {
+    struct address_space *as = ases[i];
+    as_lock(as);
+    if (has_dirty(as)) {
+      if (as->min_dirty < min) {
+        min = as->min_dirty;
+      }
+      if (as->max_dirty > max) {
+        max = as->max_dirty;
+      }
+      clear_dirty(as);
+    }
+    as_unlock(as);
+  }
+  if (min >= max) {
+    return 0; // nothing dirty anywhere
+  }
+
   uint64_t me = cpu_state_whoami();
-  uint64_t min = as->min_dirty;
-  uint64_t max = as->max_dirty;
 
   // Acquire the shootdown slot with IRQs off (we may already be at
   // depth > 0, e.g. syscall context). While spinning we keep servicing
@@ -637,14 +686,15 @@ int as_flush(struct address_space *as) {
 
   // Publish the request. Targets only consult these after seeing their
   // bit in need_mask (acquire), which is store-released below.
-  g_tlb_req.as = as;
+  g_tlb_req.ases = ases;
+  g_tlb_req.nases = n;
   g_tlb_req.min = min;
   g_tlb_req.max = max;
 
-  // Target every other CPU currently running this AS.
+  // Target every other CPU currently running any of these ASes.
   uint64_t targets = 0;
   for (uint32_t i = 0; i < g_cpu_state_table_len; i++) {
-    if (i != me && g_cpu_state_table[i].current_as == as) {
+    if (i != me && tlb_req_matches(g_cpu_state_table[i].current_as)) {
       targets |= 1ull << i;
     }
   }
@@ -658,7 +708,7 @@ int as_flush(struct address_space *as) {
   }
 
   // Do the local flush while remote CPUs are working.
-  if (g_cpu_state_table[me].current_as == as) {
+  if (tlb_req_matches(g_cpu_state_table[me].current_as)) {
     tlb_invalidate_local(min, max);
   }
 
@@ -671,8 +721,7 @@ int as_flush(struct address_space *as) {
 
   atomic_store_explicit(&g_tlb_busy, false, memory_order_release);
   irq_enable();
-
-  clear_dirty(as);
-  as_unlock(as);
   return 0;
 }
+
+int as_flush(struct address_space *as) { return as_flush_multi(&as, 1); }

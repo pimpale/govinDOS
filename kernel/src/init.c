@@ -104,7 +104,7 @@ static void umem_selftest(void) {
           "umem selftest: owner's protect leaked into sharer view");
 
   // Owner free revokes the sharer and restores pristine everywhere.
-  asserts(umem_free(a, (uint64_t)blk, 0) == 0, "umem selftest: free failed");
+  asserts(umem_free(a, (uint64_t)blk) == 0, "umem selftest: free failed");
   asserts(!user_range_ok(b, (uint64_t)blk, PAGE_SIZE, false),
           "umem selftest: revoke left sharer access");
   asserts(!user_range_ok(a, (uint64_t)blk, PAGE_SIZE, false),
@@ -171,7 +171,7 @@ static void channel_selftest(void) {
           "channel selftest: scheme on a shared block allowed");
 
   // Teardown through the ordinary death paths: a's blocks revoke out of
-  // b's AS, b's channel block dies with its kchan endpoint.
+  // b's AS, b's channel block dies with its ring endpoint.
   destroy_test_process(a);
   destroy_test_process(b);
   printf("channel: selftest ok\n");
@@ -190,7 +190,9 @@ static void process_selftest(void) {
   uint8_t *blk = umem_alloc(parent, PAGE_SIZE, PAGE_R | PAGE_W);
   blk[42] = 0x42; // survives the move (same physical identity address)
   umem_lock();
+  umem_proc_lock(parent);
   ublock *b = umem_owned_locked(parent, (uint64_t)blk);
+  umem_proc_unlock(parent);
   asserts(b != nullptr && umem_move_locked(b, parent, child, true) == 0,
           "process selftest: move down failed");
   umem_unlock();
@@ -217,7 +219,9 @@ static void process_selftest(void) {
 
   // Claim the block back up out of the zombie before reaping frees it.
   umem_lock();
+  umem_proc_lock(child);
   b = umem_owned_locked(child, (uint64_t)blk);
+  umem_proc_unlock(child);
   asserts(b != nullptr && umem_move_locked(b, child, parent, true) == 0,
           "process selftest: move up failed");
   umem_unlock();
@@ -233,7 +237,7 @@ static void process_selftest(void) {
     asserts(rc == REAP_MORE || rc == REAP_DONE,
             "process selftest: reap stalled");
   } while (rc != REAP_DONE);
-  asserts(umem_free(parent, (uint64_t)blk, 0) == 0,
+  asserts(umem_free(parent, (uint64_t)blk) == 0,
           "process selftest: claimed block not owned");
   destroy_test_process(parent);
   printf("process: selftest ok\n");

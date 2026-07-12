@@ -1,7 +1,7 @@
-// Instantiation of the generic vec template for `kreg_ptr`. The only
+// Instantiation of the generic vec template for `reg_ptr`. The only
 // translation unit that pulls in <vec/vec_impl.h> for this element type,
 // so the out-of-line functions exist exactly once.
 
 #include "channel.h"
-#define VEC_DTYPE kreg_ptr
+#define VEC_DTYPE reg_ptr
 #include <vec/vec_impl.h>

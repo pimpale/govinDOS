@@ -1,4 +1,5 @@
 U := ..
+ULIBS := sys c
 include $(U)/build.mk
 
 # The programs packaged into init's initfs, pulled from the sibling

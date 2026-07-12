@@ -99,12 +99,17 @@ notified bit per share edge, and per-scheme endpoint state
 for kernel channels (§2). The ublock sharer machinery is the single
 source of truth for who participates, and its revoke path is the single
 teardown authority. There is no session object, no per-process session
-list, no IPC registry.
+list, no IPC registry. (Locking, as implemented 2026-07-11: the wait/
+doorbell data plane runs on per-process list locks + per-block stripe
+locks and never takes the global umem lock — see §7's lock-split entry
+and memory-design.md §5.)
 
 ### Syscalls
 
-`SYS_VM_MAP`, `SYS_VM_UNMAP`, `SYS_VM_PROTECT`, `SYS_VM_UNSHARE` are
-unchanged from memory-design.md.
+`SYS_VM_ALLOC`, `SYS_VM_FREE`, `SYS_VM_PROTECT`, `SYS_VM_UNSHARE` are
+unchanged from memory-design.md. (Renamed from `VM_MAP`/`VM_UNMAP`
+2026-07-11: in a SASOS everything is already mapped in principle —
+these verbs create and destroy blocks, they don't position anything.)
 
 - `SYS_VM_SHARE(base, target, prot) -> 0` — `target` is signed.
   - **User pid (> 0): maps immediately.** The whole owned block at
@@ -138,21 +143,28 @@ unchanged from memory-design.md.
     context** — bounded, non-blocking commands only — posting a
     completion CQE per command, then returns 0. Malformed SQEs consume
     a slot and complete with an error status; they never fail the
-    doorbell itself.
+    doorbell itself. The drain is bounded twice over: at most
+    `RING_SQ_BATCH` (1024, compile-time) SQEs per doorbell — enough to
+    amortize the syscall — executed in `RING_SQ_CHUNK` (64) slices
+    with the control-plane lock dropped and the ring re-resolved
+    between slices, so a full SQ can't turn one doorbell into a
+    machine-wide stall. Leftovers wait for the next doorbell;
+    userspace (lib/sys kring) re-rings until the `sq_head` mirror
+    catches up to what it published.
 
 - `SYS_BLOCK_WAIT(addr, expected) -> 0` — (may park.) `addr` is any
   4-byte-aligned address inside a block the caller has a view of
-  (`SYSERR_INVAL` otherwise). Under the channel lock: load the 32-bit
-  word at `addr`; if it differs from `expected`, return 0 immediately;
-  else park in the caller's side slot until a wake: the peer's doorbell
-  or, on a kernel channel, the kernel posting a CQE (returns 0); or
-  revocation (`SYSERR_DEAD`). Parking on a user channel whose peer
-  process is no longer live fails `SYSERR_DEAD` up front (a live-pid
-  index check, §4) — only threads already parked at the death wait for
-  reap-time revocation. Doorbell and post take the same lock, so
-  a wake between the caller's last look at the word and its park cannot
-  be lost — the protocol is verbatim today's `ring_wait_user`,
-  generalized to a caller-chosen word. The loaded word is untrusted:
+  (`SYSERR_INVAL` otherwise). Under the block's stripe lock: load the
+  32-bit word at `addr`; if it differs from `expected`, return 0
+  immediately; else park in the caller's side slot until a wake: the
+  peer's doorbell or, on a kernel channel, the kernel posting a CQE
+  (returns 0); or revocation (`SYSERR_DEAD`). Parking on a user channel
+  whose peer process is no longer live fails `SYSERR_DEAD` up front (a
+  live-pid index check, §4) — only threads already parked at the death
+  wait for reap-time revocation. Doorbell, post, and park all take that
+  same stripe, so a wake between the caller's last look at the word and
+  its park cannot be lost — the protocol is verbatim the old
+  `ring_wait_user`, generalized to a caller-chosen word. The loaded word is untrusted:
   the kernel only compares it, and a lying peer can only misdirect
   waiters who chose to rendezvous with it. `SYSERR_EXIST` if the side
   already has a waiter — SPSC is a rule, one thread per side per
@@ -166,11 +178,11 @@ far side is the scheme; it has no sharer entry.
 ### Establishment flow
 
 ```
-server:  VM_MAP -> ch; VM_SHARE(ch, -1)        // share channel, once
+server:  VM_ALLOC -> ch; VM_SHARE(ch, -1)      // share channel, once
          BLOCK_WAIT on it; EV_SHARE {pid, base|order} arrives (mapped)
          validate size/peer — VM_UNSHARE if unwanted —
          else ack CQE in the new channel; DOORBELL(base)
-client:  VM_MAP -> base; write ring header; VM_SHARE(base, server_pid)
+client:  VM_ALLOC -> base; write ring header; VM_SHARE(base, server_pid)
          BLOCK_WAIT(&sh->cq_tail, seen) until the server's ack lands
 ```
 
@@ -690,3 +702,52 @@ rings/dummydev (and their kthreads) had to go with it.
   until reaped and every edge is unlinked by then; the doc's healed-lazy
   pair scheme becomes necessary only if anything ever caches references
   across the reap boundary.
+
+### The umem lock split (2026-07-11)
+
+The single umem lock this doc assumed throughout was split into the
+hierarchy described in memory-design.md §5 (g_umem control plane →
+per-process list locks → per-block stripe locks, all
+shootdown-servicing). What it means for the channel machinery
+specifically — the authoritative comments live in `umem.h`,
+`channel.c`, and `channel_internal.h`:
+
+- **Two planes.** `SYS_BLOCK_WAIT` and `SYS_BLOCK_DOORBELL` on user
+  channels — *including* `KEV_READY` delivery into a wait-group when
+  the far side is registered — run on list lock + stripes only;
+  unrelated channels never contend. Ring drains, replays, registration
+  surgery (`KGROUP_ADD`/`DEL`), and teardown stay under `g_umem`: they
+  execute commands against cross-block control state (regs vec, share
+  edges' notified bits, `p->children`) whose invariants pair with
+  `g_umem` structures, and the drain's `sq_head` cursor wants a
+  serializer anyway.
+- **CQ publication is stripe-scoped, uniformly.** The full-check, CQE
+  write, `cq_count` bump, and owner-side wake happen under
+  stripe(ring block) for every scheme. The asymmetry to remember:
+  holding the stripe does NOT by itself license posting for shares/
+  tree — their posts must stay atomic with level-state flips
+  (`notified`/`death_notified`) that live under `g_umem`. Groups'
+  wake-state (`pending`/`armed`/`ev_index`/`dead`) lives under
+  stripe(group block) instead, which is exactly what makes data-plane
+  delivery legal there.
+- **The one two-stripe holder** is the data-plane channel→group wake
+  pair, acquired in ascending stripe-index order with
+  release-reacquire-revalidate on descending discovery
+  (`wake_user_side_ranked`). A reg observed in a side slot is pinned
+  while that slot's stripe is held (every detach clears the slot under
+  it before anything frees); a dying group marks its regs `dead` under
+  the group stripe before detaching, so a racing waker refuses a ring
+  mid-teardown and drops the wake — correct, since the only possible
+  listener is the group being destroyed. Control-plane code never
+  holds two stripes (g_umem pins regs, so it posts in sequential
+  single-stripe sections); ascending pairs can't cycle with each other
+  or with single holders.
+- **`channel_block_torn` contract**: callers mutate channel identity
+  first (edge pushed/removed, owner swapped, lists unlinked), then
+  call torn *without* the stripe — torn takes it itself, wakes/
+  detaches, and posts the owed KEV_DEADs afterward. Post-mutation
+  parkers fail classification; pre-mutation parkers are woken by torn.
+- **Layout**: per-scheme logic moved to `kernel/src/schemes/{shares,
+  tree,groups}.c` over the shared internals in `channel_internal.h`;
+  `channel.c` keeps the plumbing, data-plane syscalls, drains, and
+  teardown.

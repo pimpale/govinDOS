@@ -1,4 +1,5 @@
 U := ../..
+ULIBS := sys c
 include $(U)/build.mk
 
 all: out/tests.exe

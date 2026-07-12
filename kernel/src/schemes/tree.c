@@ -1,0 +1,37 @@
+// Scheme -3: tree (the SIGCHLD slot of the signal decomposition). The
+// per-process channel announcing dead children (KEV_CHILD_DEAD). Level
+// state: the zombies themselves — a dead child sits in p->children
+// until reaped, its death_notified bit is the queue entry. Everything
+// here runs under g_umem (posts take the ring's stripe inside
+// channel_post).
+
+#include "channel_internal.h"
+
+#include "syscall.h"
+#include "thread.h"
+
+// Post KEV_CHILD_DEAD for every un-notified dead child, until the CQ
+// fills.
+void tree_replay(struct process *p) {
+  struct ring *ring = p->tree_ch;
+  if (ring == nullptr) {
+    return;
+  }
+  for (uint32_t i = 0; i < vec_process_ptr_len(p->children); i++) {
+    struct process *c;
+    vec_process_ptr_get(p->children, i, &c);
+    if (c->state == PROC_DEAD && !c->death_notified) {
+      if (!channel_post(ring, KEV_CHILD_DEAD, c->pid, 0, 0)) {
+        return;
+      }
+      c->death_notified = true;
+    }
+  }
+}
+
+void channel_child_dead_notify(struct process *parent, struct process *child) {
+  struct ring *ring = parent->tree_ch;
+  if (ring != nullptr && channel_post(ring, KEV_CHILD_DEAD, child->pid, 0, 0)) {
+    child->death_notified = true;
+  }
+}

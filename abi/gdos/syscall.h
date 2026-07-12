@@ -25,7 +25,10 @@
 #define SYS_GETUID      3 // ()                     -> uid
 #define SYS_GETPID      4 // ()                     -> pid
 
-// Memory blocks are the vm_map unit (power-of-two pages). vm_protect
+// Memory blocks are the vm_alloc unit (power-of-two pages). alloc/free,
+// not map/unmap: in a SASOS the whole address space is already mapped in
+// principle — these verbs create and destroy blocks (and the views that
+// make them accessible), they don't position anything. vm_protect
 // re-flags a page-aligned sub-range of a block in the caller's own view
 // (or, with a pid, an own embryo's view — the parent applying W^X to the
 // image it wrote); prot 0 makes it inaccessible. vm_share maps a whole
@@ -34,8 +37,8 @@
 // dying + being reaped) revokes every view. vm_move transfers ownership
 // along tree edges only: down into an own embryo, up out of an own
 // zombie child.
-#define SYS_VM_MAP     5 // (len, prot)             -> base
-#define SYS_VM_UNMAP   6 // (base, len)             -> 0
+#define SYS_VM_ALLOC   5 // (len, prot)             -> base
+#define SYS_VM_FREE    6 // (base)                  -> 0
 #define SYS_VM_PROTECT 7 // (base, len, prot[, pid])-> 0
 #define SYS_VM_SHARE   8 // (base, target, prot)    -> 0 (target signed)
 #define SYS_VM_UNSHARE 9 // (base)                  -> 0
@@ -64,7 +67,7 @@
 #define REAP_DONE 0
 #define REAP_MORE 1
 
-// vm_map prot bits (user-facing; translated to paging flags internally).
+// vm_alloc prot bits (user-facing; translated to paging flags internally).
 #define VM_PROT_READ  1u
 #define VM_PROT_WRITE 2u
 #define VM_PROT_EXEC  4u

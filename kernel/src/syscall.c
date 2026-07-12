@@ -57,7 +57,8 @@ static bool vm_prot_ok(uint64_t prot, bool allow_none) {
   return (prot & VM_PROT_READ) != 0;
 }
 
-static uint64_t sys_vm_map(struct thread *curr, uint64_t len, uint64_t prot) {
+static uint64_t sys_vm_alloc(struct thread *curr, uint64_t len,
+                             uint64_t prot) {
   if (len == 0 || len > (64ull << 20) || !vm_prot_ok(prot, false)) {
     return SYSERR_INVAL;
   }
@@ -68,9 +69,8 @@ static uint64_t sys_vm_map(struct thread *curr, uint64_t len, uint64_t prot) {
   return (uint64_t)base;
 }
 
-static uint64_t sys_vm_unmap(struct thread *curr, uint64_t base,
-                             uint64_t len) {
-  if (umem_free(curr->proc, base, len) != 0) {
+static uint64_t sys_vm_free(struct thread *curr, uint64_t base) {
+  if (umem_free(curr->proc, base) != 0) {
     return SYSERR_PERM;
   }
   return 0;
@@ -141,12 +141,12 @@ void syscall_entry(struct trap_frame *tf) {
     tf->rax = curr->proc->pid;
     return;
 
-  case SYS_VM_MAP:
-    tf->rax = sys_vm_map(curr, a0, a1);
+  case SYS_VM_ALLOC:
+    tf->rax = sys_vm_alloc(curr, a0, a1);
     return;
 
-  case SYS_VM_UNMAP:
-    tf->rax = sys_vm_unmap(curr, a0, a1);
+  case SYS_VM_FREE:
+    tf->rax = sys_vm_free(curr, a0);
     return;
 
   case SYS_VM_PROTECT:

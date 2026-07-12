@@ -20,9 +20,10 @@
 // There is no kernel work queue and no reaper thread: the chunking
 // mechanism for teardown is the syscall boundary itself.
 //
-// All tree/state mutations run under the umem lock — the same lock that
-// guards blocks, share edges, and channel state — so liveness checks,
-// revocation, and death can never disagree.
+// All tree/state mutations run under g_umem, the umem control-plane
+// lock (hierarchy in umem.h) — the same lock that guards share edges
+// and ring state — so liveness checks, revocation, and death can never
+// disagree.
 
 // Create an embryo. `parent` may be nullptr only for kernel-driven
 // creations (init, boot selftests). The child inherits `uid` from the

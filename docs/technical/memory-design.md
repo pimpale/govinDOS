@@ -167,17 +167,45 @@ struct ublock {
   uint64_t        base;      // identity VA == PA, buddy-aligned
   uint8_t         order;     // size = PAGE_SIZE << order
   struct process *owner;     // never null while the block lives
-  vec_process_ptr sharers;   // processes other than owner with a view
-  struct spinlock lock;
+  vec_share_edge  sharers;   // processes other than owner with a view
 };
 
 struct process {
   ...
-  struct spinlock mem_lock;
+  struct svclock  ulock;      // list lock (see "Locking as implemented")
   vec_ublock_ptr  blocks;     // owned
   vec_ublock_ptr  shared_in;  // shared to me by others
 };
 ```
+
+### Locking as implemented (2026-07-11)
+
+The first implementation used one global umem lock for everything.
+That was split (same day, after profiling the design on paper) into a
+three-level hierarchy, acquired strictly top-down; every level is an
+`svclock` — a spinlock whose waiters keep servicing TLB shootdowns,
+because each can be held across `as_flush` by some path:
+
+1. **`g_umem`** — the control-plane lock: every ownership-graph
+   mutation (free, share, unshare, move, reap, kill, the pid registry)
+   and all kernel-ring/group bookkeeping (ipc-process-design.md §7).
+   Blocks are freed only under it, so holding it pins every ublock.
+2. **`p->ulock`** — sole guard of `p->blocks`/`p->shared_in`, reads
+   included. Finding a block in a list you hold pins it: a freer must
+   unlink from every list first. `SYS_BLOCK_WAIT` holds it across its
+   user-word load and `umem_protect` flags under it, which is what
+   makes a concurrent guard (`prot == 0`) unable to yank a mapping
+   between wait's access check and its kernel load.
+3. **Stripes** — a static lock array indexed by hash(block base),
+   guarding each block's channel slots. The lock's storage outlives
+   any block, which makes lock-then-look safe without lifetime
+   machinery (the full data-plane rules live in umem.h and
+   ipc-process-design.md §7).
+
+Consequences: the IPC data plane never touches `g_umem`; `umem_alloc`
+takes no global lock at all (per-uid accounts are lock-free CAS, the
+buddy has its own lock, the list push is `p->ulock`); and revocation's
+flush round runs with *no* locks held (free path below).
 
 The `ublock` list is the **sole authority** on ownership and lifetime; the
 page trees remain the authority for access checks (`user_range_ok` is
@@ -218,12 +246,26 @@ Notes:
 
 ### Free path (also the owner-exit path per block)
 
-1. Lock the ublock. For owner's AS and each sharer's AS:
-   `as_flag(as, base, end, PAGE_KERNEL_PRISTINE)` + `as_flush(as)`.
-2. `buddy_page_free`.
-3. Unlink from owner's `blocks` and every sharer's `shared_in`.
+Two phases (as implemented 2026-07-11 — the flush is the single
+longest thing the old global lock ever covered, so it moved outside):
 
-Step 1-before-2 ordering is the pristinity/TLB rule from §2.
+1. **Under `g_umem`** (`block_release_prepare`): unlink from the
+   owner's `blocks` and every sharer's `shared_in` (their list locks,
+   one at a time), tear the channel state (`channel_block_torn` — its
+   stripe acquisition drains out any data-plane holder that resolved
+   the block before the unlinks), `as_flag(.., PAGE_KERNEL_PRISTINE)`
+   every view, and **pin** each viewing AS (`as_pin`).
+2. **With no locks held** (`umem_release_finish`): flush every view in
+   **one combined shootdown round** (`as_flush_multi` — union dirty
+   range, one IPI per target CPU regardless of sharer count), unpin,
+   `buddy_page_free`, uncharge.
+
+Flush-before-buddy-free is the pristinity/TLB rule from §2. The pins
+are what let the flush leave the lock: a concurrently-reaped sharer's
+`as_free` step returns SYSERR_AGAIN while pins remain (reap already
+has that retry shape for its thread/CPU drains), and once a zombie's
+lists are empty no new pin can target its AS, so the gate clears in
+bounded time.
 
 ## 6. Owner-death policy for shared blocks: **revoke** (option 1)
 

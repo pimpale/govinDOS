@@ -68,8 +68,16 @@ struct address_space *as_identity_mapping(void);
 // create a deep copy of an address space
 struct address_space *as_clone(struct address_space* src);
 
-// Frees the address space and its children
+// Frees the address space and its children. The AS must be unpinned.
 void as_free(struct address_space *as);
+
+// Pin an address space against as_free: teardown paths that flush a
+// range out of a foreign AS *after* dropping the locks that made the AS
+// reachable hold a pin across the flush. as_free is never called on a
+// pinned AS — the reaper treats pins != 0 as "still draining" (retry).
+void as_pin(struct address_space *as);
+void as_unpin(struct address_space *as);
+bool as_has_pins(const struct address_space *as);
 
 // get data about an address in a given tab
 int as_getinfo(const struct address_space *as, uint64_t addr,
@@ -96,6 +104,12 @@ void as_switch(struct address_space *as);
 
 // invalidate dirty pages
 int as_flush(struct address_space *as);
+
+// Flush n address spaces in ONE cross-CPU shootdown round: each AS's
+// dirty range is snapshotted and cleared, and a single IPI round
+// invalidates the union range on every CPU running any of them. This is
+// what keeps multi-view revocation O(1) rounds instead of O(sharers).
+int as_flush_multi(struct address_space *const *ases, size_t n);
 
 //////////////////////////////////////////////////////
 // Cross-CPU shootdown (interrupt dispatch glue)

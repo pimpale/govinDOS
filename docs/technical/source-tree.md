@@ -15,12 +15,13 @@ govindos/
 │   └── gdos/                # the kernel↔userspace contract (see below)
 ├── kernel/
 │   ├── src/  archsrc/x86_64/  vendor/
+│   │   └── src/schemes/     # one file per kernel-channel scheme (shares, tree, groups)
 └── userspace/
     ├── Makefile             # orchestrator: dependency order + assembly, no compiling
     ├── build.mk             # shared toolchain/flags/rules for all components
     ├── fs/                  # static skeleton of the userspace filesystem (etc/os-release, ...)
     ├── lib/
-    │   ├── sys/             # the OS interface: syscall stubs, kring, upe loader, cpio
+    │   ├── sys/             # the OS interface: syscall wrappers, kring, PE loader, cpio
     │   ├── c/               # minimal libc — no POSIX, for first-party code
     │   └── posix/           # (future) POSIX layer for porting; a client of sys + c
     ├── bin/                 # one self-contained directory per program
@@ -108,10 +109,19 @@ sake — uniformity that hides real difference is worse than none.
 
 - Shared contract: `#include <gdos/syscall.h>` (angle brackets, via
   `-I../abi`).
-- Within userspace: build.mk adds `-I$(U)/lib/sys -I$(U)/lib/c`, so
-  `#include "usys.h"`, `"string.h"`, `"cpio.h"`, `"upe.h"` from any
-  component. `lib/c`'s headers use the standard names (`string.h`,
+- Within userspace: a component's Makefile picks its libraries by
+  setting `ULIBS` (names under `lib/`) before including build.mk, which
+  turns that into `-I$(U)/lib/<l>` include dirs and the archive list
+  `LIBS` for the link. Library headers are included with angle brackets
+  — `#include <sys.h>`, `<kring.h>`, `<pe.h>`, `<cpio.h>`, `<string.h>`
+  — the same way as the ABI's `<gdos/...>`: everything a component
+  consumes without owning. Quoted includes are for a directory's own
+  headers only. `lib/c`'s headers use the standard names (`string.h`,
   `strlen`, `memcpy`) — freestanding builds get no compiler-provided
   libc headers, so there is no collision, and code reads like normal C.
+  (lib/sys names carry no `u` prefix: everything in userspace is
+  userland, so `usys.h`/`upe.c`/`ukring` would say nothing — the prefix
+  only earns its keep in the kernel tree, where `pe.c` and `syscall.h`
+  already mean the kernel's own.)
 - Kernel: unchanged (`-Isrc -Iarchsrc/x86_64 -Ivendor -Isrc/stdlib`)
   plus `-I../abi`.

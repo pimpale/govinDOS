@@ -9,6 +9,11 @@
 // block's layout is private convention; this file governs only channels
 // whose far end is the kernel.
 //
+// This header holds only what is common to every scheme: the header, the
+// (current) SQE/CQE shapes, and the event-bit convention. Each scheme's
+// ops, event types, and scheme id live in their own gdos/kring_*.h — in
+// principle a scheme could even define its own entry layouts.
+//
 // Header at offset 0, then sq[nslots], then cq[nslots], all 32-byte
 // entries; nslots = 32 << block order. The kernel keeps authoritative
 // indices in its endpoint and never trusts the in-block copies:
@@ -56,19 +61,9 @@ static_assert(sizeof(struct kcqe) == 32, "kring ABI: cqe size");
 #define KRING_SQ_HEAD_OFF 8
 #define KRING_SQ_TAIL_OFF 12
 
-// Scheme ids (the negative target space of SYS_VM_SHARE).
-#define KSCHEME_SHARES ((int64_t)-1) // one per process; where shares announce
-#define KSCHEME_GROUPS ((int64_t)-2) // wait-groups (many per process)
-#define KSCHEME_TREE   ((int64_t)-3) // one per process; child-death events
-
-// Event CQE types (top bit set to keep them disjoint from SQE ops).
-#define KEV_SHARE      (1ull << 63 | 1) // a = sharer pid, b = base | order
-#define KEV_CHILD_DEAD (1ull << 63 | 2) // a = dead child pid
-#define KEV_READY      (1ull << 63 | 3) // a = cookie (wait-groups)
-#define KEV_DEAD       (1ull << 63 | 4) // a = cookie (wait-groups)
-
-// Wait-group SQE ops (scheme -2).
-#define KGROUP_ADD 1 // a = channel base, b = cookie
-#define KGROUP_DEL 2 // a = channel base
+// Event CQE types set the top bit to stay disjoint from SQE ops (which
+// completions echo); schemes number their events in the low bits.
+#define KEV_EVENT_BIT (1ull << 63)
+#define KEV(n) (KEV_EVENT_BIT | (n))
 
 #endif // gdos_kring_h_INCLUDED

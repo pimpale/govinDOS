@@ -141,7 +141,8 @@ void process_thread_exited(struct thread *t) {
 // Reaping: one bounded step per call, deepest zombie first
 // ---------------------------------------------------------------------------
 
-static uint64_t reap_step_locked(struct process *target) {
+static uint64_t reap_step_locked(struct process *target,
+                                 struct umem_release *rel) {
   asserts(target->state == PROC_DEAD, "reap: target not dead");
 
   // Post-order cursor: nothing ever reparents, so the dead subtree is
@@ -154,8 +155,8 @@ static uint64_t reap_step_locked(struct process *target) {
     asserts(z->state == PROC_DEAD, "reap: live process inside dead subtree");
   }
 
-  if (umem_reap_one_block_locked(z)) {
-    return REAP_MORE;
+  if (umem_reap_one_block_locked(z, rel)) {
+    return REAP_MORE; // caller runs umem_release_finish after unlocking
   }
   if (umem_reap_one_view_locked(z)) {
     return REAP_MORE;
@@ -167,6 +168,13 @@ static uint64_t reap_step_locked(struct process *target) {
     return SYSERR_AGAIN;
   }
   if (!z->as_freed) {
+    // Three drains gate the AS free, all of the same shape. Pins: an
+    // in-flight block release may still be flushing this AS outside
+    // g_umem (umem_release_finish); each pin lasts one lock-free flush
+    // round, and once z's lists are empty no new pin can target z->as.
+    if (as_has_pins(z->as)) {
+      return SYSERR_AGAIN;
+    }
     // No CPU may still have the page tree loaded. Idle CPUs switch to
     // g_as_kernel and dispatch switches per-thread, so with the threads
     // culled this drains promptly (a CPU-bound hostile thread is forced
@@ -203,9 +211,14 @@ static uint64_t reap_step_locked(struct process *target) {
 }
 
 uint64_t process_reap_step(struct process *target) {
+  struct umem_release rel = {0};
   umem_lock();
-  uint64_t rc = reap_step_locked(target);
+  uint64_t rc = reap_step_locked(target, &rel);
   umem_unlock();
+  // The flush round + buddy return of a freed block run with no locks
+  // held — the reap syscall's bounded step includes them, the rest of
+  // the machine doesn't.
+  umem_release_finish(&rel);
   return rc;
 }
 
@@ -279,14 +292,16 @@ static struct process *find_child_locked(struct process *me, uint64_t pid) {
 }
 
 uint64_t proc_sys_reap(struct thread *curr, uint64_t pid) {
+  struct umem_release rel = {0};
   umem_lock();
   struct process *child = find_child_locked(curr->proc, pid);
   if (child == nullptr || child->state != PROC_DEAD) {
     umem_unlock();
     return SYSERR_INVAL;
   }
-  uint64_t rc = reap_step_locked(child);
+  uint64_t rc = reap_step_locked(child, &rel);
   umem_unlock();
+  umem_release_finish(&rel);
   return rc;
 }
 
@@ -298,8 +313,10 @@ uint64_t proc_sys_vm_move(struct thread *curr, uint64_t base, uint64_t pid) {
   struct process *target = umem_proc_lookup_locked(pid);
   if (target != nullptr && target->parent == me &&
       target->state == PROC_EMBRYO) {
+    umem_proc_lock(me);
     ublock *b = umem_owned_locked(me, base);
-    if (b == nullptr || b->kch != nullptr) {
+    umem_proc_unlock(me); // b stays pinned by g_umem
+    if (b == nullptr || b->ring != nullptr) {
       umem_unlock();
       return SYSERR_INVAL;
     }
@@ -312,8 +329,10 @@ uint64_t proc_sys_vm_move(struct thread *curr, uint64_t base, uint64_t pid) {
   // inspection and exec-image recycling are libraries built on this).
   struct process *child = find_child_locked(me, pid);
   if (child != nullptr && child->state == PROC_DEAD) {
+    umem_proc_lock(child);
     ublock *b = umem_owned_locked(child, base);
-    if (b == nullptr || b->kch != nullptr) {
+    umem_proc_unlock(child);
+    if (b == nullptr || b->ring != nullptr) {
       umem_unlock();
       return SYSERR_INVAL;
     }
@@ -328,6 +347,8 @@ uint64_t proc_sys_vm_move(struct thread *curr, uint64_t base, uint64_t pid) {
 
 uint64_t proc_sys_vm_protect_for(struct thread *curr, uint64_t base,
                                  uint64_t len, uint64_t prot, uint64_t pid) {
+  // g_umem pins the looked-up embryo across the protect (which itself
+  // only takes the target's list lock).
   umem_lock();
   struct process *target = umem_proc_lookup_locked(pid);
   if (target == nullptr || target->parent != curr->proc ||
@@ -335,7 +356,7 @@ uint64_t proc_sys_vm_protect_for(struct thread *curr, uint64_t base,
     umem_unlock();
     return SYSERR_INVAL;
   }
-  int rc = umem_protect_locked(target, base, len, (paging_flags_t)prot);
+  int rc = umem_protect(target, base, len, (paging_flags_t)prot);
   umem_unlock();
   return rc == 0 ? 0 : SYSERR_PERM;
 }

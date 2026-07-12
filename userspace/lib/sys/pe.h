@@ -1,12 +1,12 @@
-#ifndef upe_h_INCLUDED
-#define upe_h_INCLUDED
+#ifndef pe_h_INCLUDED
+#define pe_h_INCLUDED
 
 // Userland PE32+ loader: kernel/src/pe.c's logic as a library, run over
 // syscalls (ipc-process-design.md §5). The kernel's own loader remains
 // boot-only (it loads exactly init); every other process is built by its
 // parent through this path:
 //
-//   VM_MAP a block, write headers + sections, relocate against the
+//   VM_ALLOC a block, write headers + sections, relocate against the
 //   block's address (SASOS: the child will see the same addresses),
 //   PROC_CREATE an embryo, VM_MOVE it the image and a stack, set
 //   per-section W^X on the embryo's views, THREAD_SPAWN.
@@ -17,7 +17,7 @@
 // first thread with `arg`. stack_len is the stack block size in bytes
 // (power-of-two pages). Returns the child pid, or 0 on failure (bad
 // image / out of memory), with the reason printed.
-uint64_t upe_spawn(const uint8_t *image, uint64_t len, uint64_t arg,
-                   uint64_t stack_len);
+uint64_t pe_spawn(const uint8_t *image, uint64_t len, uint64_t arg,
+                  uint64_t stack_len);
 
-#endif // upe_h_INCLUDED
+#endif // pe_h_INCLUDED

@@ -1,6 +1,7 @@
 #include "spinlock.h"
 
 #include "irq.h"
+#include "paging.h"
 
 static inline void spinlock_relax(void) {
 #if defined(__x86_64__) || defined(__i386__)
@@ -40,6 +41,19 @@ void spinlock_lock(struct spinlock *lock) {
 }
 
 void spinlock_unlock(struct spinlock *lock) {
+  atomic_store_explicit(&lock->locked, false, memory_order_release);
+  irq_enable();
+}
+
+void svclock_lock(struct svclock *lock) {
+  irq_disable();
+  while (atomic_exchange_explicit(&lock->locked, true, memory_order_acquire)) {
+    paging_service_shootdown();
+    spinlock_relax();
+  }
+}
+
+void svclock_unlock(struct svclock *lock) {
   atomic_store_explicit(&lock->locked, false, memory_order_release);
   irq_enable();
 }

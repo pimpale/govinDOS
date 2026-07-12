@@ -55,25 +55,29 @@ typedef struct share_edge {
 #include <vec/vec.h>
 #undef VEC_DTYPE
 
-struct kchan;
-struct kreg;
+struct ring;
+struct reg;
 
 struct ublock {
   uint64_t base; // identity VA == PA; buddy-block aligned
   uint8_t order; // bytes = PAGE_SIZE << order
+  // owner and sharers are written under g_umem + stripe(base) together,
+  // so holding either makes them safe to read.
   struct process *owner;
   vec_share_edge *sharers; // processes other than owner with a view
 
-  // Channel state (channel.c, under the umem lock). Each side holds at
-  // most one of: a parked thread, or a wait-group registration —
-  // registered XOR parked, the SPSC rule (SYSERR_EXIST otherwise).
+  // Channel state (channel.c, under stripe(base) — the per-block lock
+  // stripe, level 3 of the hierarchy below). Each side holds at most one
+  // of: a parked thread, or a wait-group registration — registered XOR
+  // parked, the SPSC rule (SYSERR_EXIST otherwise).
   struct thread *owner_waiter;
   struct thread *sharer_waiter;
-  struct kreg *owner_reg;
-  struct kreg *sharer_reg;
+  struct reg *owner_reg;
+  struct reg *sharer_reg;
   // Non-null iff this block is a kernel channel; owned here, freed by the
-  // revoke path (channel_block_torn).
-  struct kchan *kch;
+  // revoke path (channel_block_torn). Written under g_umem + stripe(base)
+  // like owner/sharers; ring *internals* are control-plane state (g_umem).
+  struct ring *ring;
 };
 
 // One-time init (lock + registry). Call before the first user process.
@@ -90,22 +94,23 @@ void umem_process_register(struct process *p);
 // block base or nullptr (out of memory / over the uid's limit).
 void *umem_alloc(struct process *p, size_t len, paging_flags_t prot);
 
-// Free a block owned by `p`. base must be the exact block base and len
-// must round to the block size (len == 0 skips the size check). Revokes
-// every sharer's view, restores all views to pristine, flushes, and only
-// then returns the block to the buddy. -1 if base isn't an owned block.
-int umem_free(struct process *p, uint64_t base, size_t len);
+// Free a block owned by `p`. base must be the exact block base — blocks
+// are the unit, so the base alone is unambiguous. Revokes every
+// sharer's view, restores all views to pristine, flushes every view in
+// one shootdown round (outside the control-plane lock), and only then
+// returns the block to the buddy. -1 if base isn't an owned block.
+int umem_free(struct process *p, uint64_t base);
 
 // Re-flag [base, base+len) — page-aligned, inside a single block `p` has
 // a view of (owned or shared-in) — in p's AS only. prot == 0 makes the
 // sub-range inaccessible (a user-placed guard); anything else is
 // sanitized to prot|PAGE_U. Per-view: sharers' mappings are unaffected.
-// The _locked variant is for callers already under the umem lock (the
-// parent-sets-embryo-views path, which must pin the target).
+// Takes only p's list lock (the flag + flush run under it: that is what
+// makes SYS_BLOCK_WAIT's user-word load safe against a concurrent
+// guard). Callers targeting another process (the parent-sets-embryo-
+// views path) must pin the target — hold g_umem across the lookup+call.
 int umem_protect(struct process *p, uint64_t base, size_t len,
                  paging_flags_t prot);
-int umem_protect_locked(struct process *p, uint64_t base, size_t len,
-                        paging_flags_t prot);
 
 // Map the whole block at `base` (owned by `p`) into the process with pid
 // `target_pid` as prot|PAGE_U, on the spot (consent is keeping: the target
@@ -121,13 +126,33 @@ int umem_unshare(struct process *p, uint64_t base);
 
 // ---------------------------------------------------------------------------
 // Reap-step primitives and ownership transfer (process.c, which owns the
-// tree checks; these own the block mechanics). All run under the umem
-// lock (the *_locked convention).
+// tree checks; these own the block mechanics). All run under g_umem (the
+// *_locked convention).
 // ---------------------------------------------------------------------------
 
+// Deferred tail of a block free: the flush + buddy-return that must NOT
+// run under g_umem (the flush waits for cross-CPU acks — the single
+// longest thing the old big lock ever covered). Filled under g_umem by
+// the unlink phase, consumed by umem_release_finish after dropping it.
+// Every viewing AS is pinned (as_pin) so a concurrent reap cannot
+// as_free it out from under the flush. b == nullptr means "nothing".
+struct umem_release {
+  ublock *b;
+  struct address_space **ases; // owner + sharers, pinned; malloc'd
+  uint32_t nases;
+  uint64_t uid; // uncharge target (owner may be unreachable by then)
+};
+
+// Flush all views in ONE shootdown round, unpin, return the block to
+// the buddy, uncharge, free the metadata. No locks held. Idempotent on
+// a zeroed struct.
+void umem_release_finish(struct umem_release *rel);
+
 // Revoke + free one owned block of `p` / drop one of p's shared-in
-// views, waking parked peers SYSERR_DEAD. False if none left.
-bool umem_reap_one_block_locked(struct process *p);
+// views, waking parked peers SYSERR_DEAD. False if none left. The block
+// variant only unlinks under g_umem: the caller must run
+// umem_release_finish(rel) after dropping the lock.
+bool umem_reap_one_block_locked(struct process *p, struct umem_release *rel);
 bool umem_reap_one_view_locked(struct process *p);
 
 // Final reap step: free p's (now empty) block lists.
@@ -146,19 +171,56 @@ struct process *umem_proc_lookup_locked(uint64_t pid);
 void umem_proc_unregister_locked(struct process *p);
 
 // ---------------------------------------------------------------------------
-// Kernel-internal (channel.c): the umem lock guards all channel state too
-// — waiter slots, share-edge notified bits, kchan endpoints — so the
-// revoke path and the data-plane syscalls can never disagree about block
-// lifetime. The locked lookups below are only valid under the lock.
+// The umem lock hierarchy (shared with channel.c). Three levels, acquired
+// strictly top-down; each is a shootdown-servicing svclock because each
+// can be held across as_flush by some path:
+//
+//   1. g_umem (umem_lock/umem_unlock) — the control-plane lock. Every
+//      ownership-graph mutation (free, share, unshare, move, reap, kill,
+//      the pid registry) and all kernel-ring/group internals run under
+//      it. Blocks are freed only under it, so holding it pins every
+//      ublock.
+//   2. p->ulock (umem_proc_lock/unlock) — sole guard of p->blocks and
+//      p->shared_in, reads included. Finding a block in a list you hold
+//      pins it: a freer unlinks from every list before tearing down.
+//   3. stripes (umem_stripe_*) — static lock array indexed by
+//      hash(block base). Guard the block's waiter/reg slots and
+//      serialize park vs wake vs tear; the lock's storage outlives any
+//      block, which is what makes lock-then-look safe without the
+//      global lock.
+//
+// The data plane (SYS_BLOCK_WAIT / SYS_BLOCK_DOORBELL on user channels,
+// including KEV_READY delivery into a wait-group) takes list lock ->
+// stripes and never touches g_umem: unrelated channels never contend.
+// Its soundness rules:
+//   - take the stripe BEFORE dropping the list lock that made the block
+//     reachable, and never touch the block after dropping the stripe;
+//   - never take a list lock while holding a stripe;
+//   - the only two-stripe holder is the data-plane channel->group wake
+//     pair, acquired in ASCENDING stripe-index order (release,
+//     reacquire, revalidate on descending discovery — channel.c's
+//     wake_user_side_ranked). Control-plane code never holds two
+//     stripes at once: g_umem pins regs and rings, so it posts in
+//     sequential single-stripe sections. Ascending pairs cannot cycle
+//     with each other, and single holders cannot cycle with anyone.
 // ---------------------------------------------------------------------------
 
 void umem_lock(void);
 void umem_unlock(void);
 
-// Block with this exact base owned by `p`, or nullptr.
+void umem_proc_lock(struct process *p);
+void umem_proc_unlock(struct process *p);
+
+uint32_t umem_stripe(uint64_t base);
+void umem_stripe_lock(uint32_t idx);
+void umem_stripe_unlock(uint32_t idx);
+
+// Block with this exact base owned by `p`, or nullptr. Caller holds
+// p's list lock (umem_proc_lock), or g_umem plus certainty that p
+// cannot allocate concurrently.
 ublock *umem_owned_locked(struct process *p, uint64_t base);
 // Block containing [addr, addr+len) that `p` has a view of (owned or
-// shared-in), or nullptr.
+// shared-in), or nullptr. Same locking contract.
 ublock *umem_view_locked(struct process *p, uint64_t addr, uint64_t len);
 
 #endif // umem_h_INCLUDED

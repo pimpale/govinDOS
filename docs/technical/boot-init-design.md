@@ -188,8 +188,9 @@ Implementation map (paths per the source-tree reorg of
 rewritten `init_setup`), `vendor/efi/simple_file_system_protocol.h` +
 `vendor/efi/graphics_output_protocol.h` (new protocol headers;
 `locate_protocol` got a real type in `efi.h`). Userspace:
-`lib/sys/usys.h` (syscall stubs), `lib/sys/cpio.c` (newc reader),
-`lib/sys/upe.c` (the §5 loader), `init/init.c`, `init/bootfs.asm`,
+`lib/sys/usys.h` (syscall stubs; now `sys.h`), `lib/sys/cpio.c` (newc
+reader), `lib/sys/upe.c` (the §5 loader; now `pe.c`), `init/init.c`,
+`init/bootfs.asm`,
 `bin/tests/tests.c` (hello.c, renamed and demoted to a mid-tree
 process). hello.c, `user_pe_blob.asm`, and the kernel-embedded userspace
 build are gone.
@@ -210,7 +211,7 @@ build are gone.
   user view drops to PAGE_R** via the existing `umem_protect` — no new
   kernel surface anywhere in the design; the whole §3 handoff is one
   `umem_alloc` + struct copy + re-flag.
-- **upe.c error paths kill but do not reap** a half-built embryo (the
+- **pe.c error paths kill but do not reap** a half-built embryo (the
   zombie waits for init's reap loop). Boot-path failures are
   print-and-continue in init, panic-grade in practice.
 - **Found and fixed while landing: a latent `group_await` race in the

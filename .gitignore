@@ -3,4 +3,5 @@ out/
 tmp/
 obj/
 build/
+references/
 .cache/

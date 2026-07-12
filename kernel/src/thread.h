@@ -9,6 +9,7 @@
 // archsrc/<arch>/arch_thread.h provides struct arch_thread, the arch-private
 // per-thread state (saved kernel SP, FPU/SIMD save area, etc.).
 #include "arch_thread.h"
+#include "spinlock.h"
 
 struct address_space;
 typedef struct process process;
@@ -108,17 +109,20 @@ struct process {
   // remains).
   bool as_freed;
 
-  // User memory (umem.c, guarded by its lock): blocks this process owns,
-  // and blocks other processes have shared with it.
+  // User memory (umem.c): blocks this process owns, and blocks other
+  // processes have shared with it. The two vecs are guarded by ulock —
+  // the per-process list lock, level 2 of the umem lock hierarchy
+  // (umem.h) — for ALL access, read or write.
+  struct svclock ulock;
   struct vec_ublock_ptr *blocks;
   struct vec_ublock_ptr *shared_in;
 
   // Kernel scheme endpoints (channel.c, umem lock): the shares channel
   // (-1) and the tree channel (-3), each at most one per process,
-  // pointing at kchans hanging off owned blocks; cleared by the revoke
+  // pointing at rings hanging off owned blocks; cleared by the revoke
   // path when those blocks die.
-  struct kchan *share_ch;
-  struct kchan *tree_ch;
+  struct ring *share_ch;
+  struct ring *tree_ch;
 };
 
 // Spawn a user thread that starts at `entry` in ring 3 on `user_stack_top`
