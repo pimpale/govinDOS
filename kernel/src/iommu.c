@@ -11,7 +11,7 @@
 #include "stdlib/stdlib.h"
 #include "syscall.h"
 
-#include <gdos/kring_iommu.h>
+#include <gdosabi/kring_iommu.h>
 
 #define IOMMU_MAX_DOMAINS 64
 #define IOMMU_MAX_DEVICES 256

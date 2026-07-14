@@ -7,11 +7,11 @@ promised, and it must obey that document's design law: bounded
 non-blocking commands, registrations for interest, events for results,
 no kernel threads, no deferred kernel work.
 
-Planned implementation map: `abi/gdos/kring_irq.h` (scheme id, ops,
+Planned implementation map: `abi/gdosabi/kring_irq.h` (scheme id, ops,
 events), `kernel/src/schemes/irq.c` (claims, ack protocol, replay,
 route table), `kernel/archsrc/x86_64/ioapic.c` (new: RTE
 program/mask/unmask, MADT parse), `interrupts.c` (device-vector
-dispatch branch), `lib/sys/kring.c` (driver-side wrappers).
+dispatch branch), `packages/gdoslib-dev/kring.c` (driver-side wrappers).
 
 ## 0. Decisions log
 
@@ -115,7 +115,7 @@ several devices, or one device's several MSI-X vectors, multiplexes one
 ring — the `cookie` tells events apart). Ring creation is the ordinary
 `SYS_VM_SHARE(base, -4, prot)`; capability gating is deferred (§0).
 
-`abi/gdos/kring_irq.h`:
+`abi/gdosabi/kring_irq.h`:
 
 | SQE | fields | effect |
 |---|---|---|

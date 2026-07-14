@@ -3,6 +3,9 @@
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "acpi.h"
 #include "debug.h"
@@ -11,39 +14,36 @@
 #include "lapic.h"
 #include "paging.h"
 #include "platform_mem.h"
-#include "stdlib/stdio.h"
-#include "stdlib/stdlib.h"
-#include "stdlib/string.h"
 
-#include <gdos/kring_iommu.h>
+#include <gdosabi/kring_iommu.h>
 
-#define VTD_REG_CAP    0x08
-#define VTD_REG_ECAP   0x10
-#define VTD_REG_GCMD   0x18
-#define VTD_REG_GSTS   0x1C
+#define VTD_REG_CAP 0x08
+#define VTD_REG_ECAP 0x10
+#define VTD_REG_GCMD 0x18
+#define VTD_REG_GSTS 0x1C
 #define VTD_REG_RTADDR 0x20
-#define VTD_REG_CCMD   0x28
-#define VTD_REG_FSTS   0x34
-#define VTD_REG_FECTL  0x38
+#define VTD_REG_CCMD 0x28
+#define VTD_REG_FSTS 0x34
+#define VTD_REG_FECTL 0x38
 #define VTD_REG_FEDATA 0x3C
 #define VTD_REG_FEADDR 0x40
 #define VTD_REG_FEUADDR 0x44
 
-#define VTD_GCMD_TE   (1u << 31)
+#define VTD_GCMD_TE (1u << 31)
 #define VTD_GCMD_SRTP (1u << 30)
-#define VTD_GSTS_TES  (1u << 31)
+#define VTD_GSTS_TES (1u << 31)
 #define VTD_GSTS_RTPS (1u << 30)
 
-#define VTD_CCMD_ICC         (1ull << 63)
-#define VTD_CCMD_GLOBAL      (1ull << 61)
-#define VTD_IOTLB_IVT        (1ull << 63)
-#define VTD_IOTLB_GLOBAL     (1ull << 60)
-#define VTD_CONTEXT_PRESENT  (1ull << 0)
-#define VTD_ROOT_PRESENT     (1ull << 0)
-#define VTD_SL_READ          (1ull << 0)
-#define VTD_SL_WRITE         (1ull << 1)
-#define VTD_SL_PS            (1ull << 7)
-#define VTD_ADDR_MASK        0x000FFFFFFFFFF000ull
+#define VTD_CCMD_ICC (1ull << 63)
+#define VTD_CCMD_GLOBAL (1ull << 61)
+#define VTD_IOTLB_IVT (1ull << 63)
+#define VTD_IOTLB_GLOBAL (1ull << 60)
+#define VTD_CONTEXT_PRESENT (1ull << 0)
+#define VTD_ROOT_PRESENT (1ull << 0)
+#define VTD_SL_READ (1ull << 0)
+#define VTD_SL_WRITE (1ull << 1)
+#define VTD_SL_PS (1ull << 7)
+#define VTD_ADDR_MASK 0x000FFFFFFFFFF000ull
 
 #define VTD_WAIT_LIMIT 10000000u
 
@@ -128,8 +128,7 @@ static void free_slpt(uint64_t *table, int level) {
     return;
   if (level > 1)
     for (uint32_t i = 0; i < 512; i++)
-      if ((table[i] & (VTD_SL_READ | VTD_SL_WRITE)) &&
-          !(table[i] & VTD_SL_PS))
+      if ((table[i] & (VTD_SL_READ | VTD_SL_WRITE)) && !(table[i] & VTD_SL_PS))
         free_slpt((uint64_t *)(table[i] & VTD_ADDR_MASK), level - 1);
   free(table);
 }
@@ -146,8 +145,8 @@ static uint64_t *slpt_entry(struct iommu_hw_domain *domain, uint64_t iova,
       if (child == nullptr)
         return nullptr;
       memset(child, 0, PAGE_SIZE);
-      table[idx] = ((uint64_t)child & VTD_ADDR_MASK) | VTD_SL_READ |
-                   VTD_SL_WRITE;
+      table[idx] =
+          ((uint64_t)child & VTD_ADDR_MASK) | VTD_SL_READ | VTD_SL_WRITE;
     }
     table = (uint64_t *)(table[idx] & VTD_ADDR_MASK);
   }
@@ -164,8 +163,7 @@ bool vtd_init_required(const struct acpi_rsdp *rsdp) {
   }
   printf("vtd: DMAR len=%u haw=%u flags=%u\n", dmar->header.length,
          dmar->host_address_width, dmar->flags);
-  if (dmar->header.length < sizeof(*dmar) ||
-      dmar->host_address_width < 38)
+  if (dmar->header.length < sizeof(*dmar) || dmar->host_address_width < 38)
     return false;
 
   const struct dmar_drhd *chosen = nullptr;
@@ -202,8 +200,8 @@ bool vtd_init_required(const struct acpi_rsdp *rsdp) {
   g_regs = (volatile uint8_t *)(uintptr_t)chosen->register_base;
   if (!platform_mem_protect(chosen->register_base, PAGE_SIZE))
     return false;
-  as_flag(g_as_kernel, chosen->register_base,
-          chosen->register_base + PAGE_SIZE, PAGE_R | PAGE_W | PAGE_UC);
+  as_flag(g_as_kernel, chosen->register_base, chosen->register_base + PAGE_SIZE,
+          PAGE_R | PAGE_W | PAGE_UC);
   as_flush(g_as_kernel);
   g_cap = read64(VTD_REG_CAP);
   g_ecap = read64(VTD_REG_ECAP);
@@ -235,16 +233,14 @@ bool vtd_init_required(const struct acpi_rsdp *rsdp) {
     return false;
   }
   write32(VTD_REG_FSTS, read32(VTD_REG_FSTS));
-  write32(VTD_REG_FEADDR,
-          0xFEE00000u | ((uint32_t)x86_lapic_id() << 12));
+  write32(VTD_REG_FEADDR, 0xFEE00000u | ((uint32_t)x86_lapic_id() << 12));
   write32(VTD_REG_FEUADDR, 0);
   write32(VTD_REG_FEDATA, VECTOR_IOMMU_FAULT);
   write32(VTD_REG_FECTL, 0); // clear interrupt-mask bit
   g_gcmd |= VTD_GCMD_TE;
   write32(VTD_REG_GCMD, g_gcmd);
   if (!wait32(VTD_REG_GSTS, VTD_GSTS_TES, true)) {
-    printf("vtd: translation-enable timeout gsts=%08X\n",
-           read32(VTD_REG_GSTS));
+    printf("vtd: translation-enable timeout gsts=%08X\n", read32(VTD_REG_GSTS));
     return false;
   }
   printf("vtd: cap=%016llX ecap=%016llX reg=%016llX\n", g_cap, g_ecap,
@@ -359,8 +355,8 @@ bool vtd_map(struct iommu_hw_domain *domain, uint64_t iova, uint64_t phys,
                 ((iova + mapped * PAGE_SIZE) & ((2ull << 20) - 1)) == 0 &&
                 ((phys + mapped * PAGE_SIZE) & ((2ull << 20) - 1)) == 0 &&
                 pages - mapped >= 512;
-    uint64_t *leaf = slpt_entry(domain, iova + mapped * PAGE_SIZE,
-                                huge ? 2 : 1, true);
+    uint64_t *leaf =
+        slpt_entry(domain, iova + mapped * PAGE_SIZE, huge ? 2 : 1, true);
     if (leaf == nullptr || (*leaf & (VTD_SL_READ | VTD_SL_WRITE)))
       break;
     *leaf = ((phys + mapped * PAGE_SIZE) & VTD_ADDR_MASK) | bits |
@@ -372,8 +368,8 @@ bool vtd_map(struct iommu_hw_domain *domain, uint64_t iova, uint64_t phys,
       bool huge = g_superpage_2m &&
                   ((iova + i * PAGE_SIZE) & ((2ull << 20) - 1)) == 0 &&
                   mapped - i >= 512;
-      uint64_t *leaf = slpt_entry(domain, iova + i * PAGE_SIZE,
-                                  huge ? 2 : 1, false);
+      uint64_t *leaf =
+          slpt_entry(domain, iova + i * PAGE_SIZE, huge ? 2 : 1, false);
       if (leaf != nullptr)
         *leaf = 0;
       i += huge ? 512 : 1;
@@ -392,8 +388,8 @@ bool vtd_unmap(struct iommu_hw_domain *domain, uint64_t iova, uint64_t pages) {
     bool huge = g_superpage_2m &&
                 ((iova + i * PAGE_SIZE) & ((2ull << 20) - 1)) == 0 &&
                 pages - i >= 512;
-    uint64_t *leaf = slpt_entry(domain, iova + i * PAGE_SIZE,
-                                huge ? 2 : 1, false);
+    uint64_t *leaf =
+        slpt_entry(domain, iova + i * PAGE_SIZE, huge ? 2 : 1, false);
     if (leaf == nullptr || !(*leaf & (VTD_SL_READ | VTD_SL_WRITE)))
       return false;
     *leaf = 0;

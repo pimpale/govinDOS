@@ -6,7 +6,7 @@
 #include "stdlib/stdlib.h"
 #include "stdlib/string.h"
 
-#include <gdos/syscall.h>
+#include <gdosabi/syscall.h>
 
 #define PLATFORM_MAX_PROTECTED 32
 #define PLATFORM_MAX_ECAM 8

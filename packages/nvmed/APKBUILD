@@ -1,0 +1,20 @@
+# Maintainer: gpi <gpimpale29@gmail.com>
+pkgname=nvmed
+pkgver=0.1.0
+pkgrel=0
+pkgdesc="GovindOS NVMe driver service"
+url="https://github.com/pimpale/govindos"
+arch="x86_64-govindos"
+license="LicenseRef-GovindOS"
+options="!check !strip !tracedeps !archcheck !usrmerge"
+source=""
+
+builddir="$startdir"
+
+build() {
+	make -C "$builddir"
+}
+
+package() {
+	make -C "$builddir" install DESTDIR="$pkgdir"
+}

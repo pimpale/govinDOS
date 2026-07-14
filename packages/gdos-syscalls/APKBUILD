@@ -1,0 +1,15 @@
+# Maintainer: gpi <gpimpale29@gmail.com>
+pkgname=gdos-syscalls
+pkgver=0.1.0
+pkgrel=0
+pkgdesc="GovindOS userspace syscall wrappers"
+url="https://github.com/pimpale/govindos"
+arch="noarch"
+license="LicenseRef-GovindOS"
+depends="gdos-abi"
+options="!check !strip !tracedeps"
+source=""
+
+package() {
+	make -C "$startdir" install DESTDIR="$pkgdir"
+}

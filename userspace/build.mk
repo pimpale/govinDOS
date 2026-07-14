@@ -1,8 +1,8 @@
-# Shared toolchain, flags, and rules for every userspace component
-# (docs/technical/source-tree.md). Each component directory has its own
-# Makefile that owns building that directory into its own out/; those
-# Makefiles set U (the relative path back to userspace/) and include
-# this file. Nothing here defines what a component builds — only how.
+# Shared toolchain, generated sysroot, flags, and rules for every userspace
+# component (docs/technical/package-build.md). Each component sets U (the
+# relative path back to userspace/) and may select a SYSROOT_STAGE before
+# including this file. Public headers and libraries are consumed from the
+# generated sysroot, exactly as future ports will consume them.
 #
 # Same toolchain as the kernel. -fixed:no keeps the .reloc section:
 # every process loads at a fresh address in the single AS, so loaders
@@ -17,6 +17,12 @@ LD   := lld-link
 AR   := llvm-ar
 NASM := nasm
 
+GDOS_ROOT := $(abspath $(U)/..)
+include $(GDOS_ROOT)/mk/apk.mk
+SYSROOT := $(GDOS_ROOT)/out/sysroot
+SYSROOT_STAGE ?= full
+SYSROOT_READY := $(GDOS_ROOT)/out/stamps/sysroot-$(SYSROOT_STAGE)
+
 CFLAGS := \
 	-std=c23 \
 	-target x86_64-unknown-windows \
@@ -24,7 +30,7 @@ CFLAGS := \
 	-mgeneral-regs-only \
 	-fno-stack-protector \
 	-O1 \
-	-I$(U)/../abi
+	-I$(SYSROOT)/usr/include
 
 LDFLAGS := \
 	-flavor link \
@@ -35,21 +41,21 @@ LDFLAGS := \
 	-dynamicbase \
 	-debug:none
 
-# Library selection: a component's Makefile names the libraries it pulls
-# in by setting ULIBS (directory names under lib/) before including this
-# file. Only the ABI headers are universal; each selected library
-# contributes its include dir, and LIBS expands to the archives for the
-# program link, in the order given. The pattern rule builds a lib if
-# it's missing so a component can be built standalone from a clean tree;
-# staleness across components is the orchestrator's job
-# (userspace/Makefile builds in dependency order).
-CFLAGS += $(foreach l,$(ULIBS),-I$(U)/lib/$(l))
-LIBS := $(foreach l,$(ULIBS),$(U)/lib/$(l)/out/$(l).a)
+# ULIBS names development packages already installed into the sysroot. There
+# are no source-tree include paths here: this is the boundary that lets an
+# in-tree daemon and a ported library use the same compiler environment.
+LIBS := $(foreach l,$(ULIBS),$(SYSROOT)/usr/lib/$(l).a)
 
-$(U)/lib/%.a:
-	$(MAKE) -C $(patsubst %/out/,%,$(dir $@))
+# A direct component build can bootstrap a missing sysroot. As before,
+# cross-component staleness belongs to the userspace orchestrator; the order-
+# only edge keeps an unchanged sysroot stamp from rebuilding every object.
+$(SYSROOT_READY):
+	$(MAKE) -C $(U) sysroot-$(SYSROOT_STAGE)
 
-out/%.c.o: %.c
+$(SYSROOT)/usr/lib/%.a: | $(SYSROOT_READY)
+	@test -f $@ || { echo "missing sysroot library: $@" >&2; exit 1; }
+
+out/%.c.o: %.c | $(SYSROOT_READY)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -MMD -MP -MF $@.d -c -o $@ $<
 

@@ -328,7 +328,7 @@ recycled memory during that sequence.
 
 ## 6. Driver ring ABI
 
-The ABI lives in `abi/gdos/kring_iommu.h`. Every command completion is the
+The ABI lives in `abi/gdosabi/kring_iommu.h`. Every command completion is the
 ordinary kring completion: it echoes `op`, `a`, and `b`, with `status` equal
 to zero or `SYSERR_*`. Domain names are driver-selected cookies scoped to
 the ring, so no command needs to return a newly allocated handle.

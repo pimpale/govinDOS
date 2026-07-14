@@ -151,7 +151,7 @@ delegation needs no dedicated verbs: the call produces an ordinary
 device-backed ublock, so handing it to a driver is `SYS_VM_SHARE` (or
 `SYS_VM_MOVE`), and revocation is the existing unshare/kill/reap machinery.
 
-Provisional ABI in `abi/gdos/syscall.h`, named in the `SYS_VM_*` family
+Provisional ABI in `abi/gdosabi/syscall.h`, named in the `SYS_VM_*` family
 because the result is a ublock:
 
 | syscall | arguments | effect |

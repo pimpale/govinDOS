@@ -1,0 +1,3 @@
+# Package roots requested for the normal development image. Dependencies are
+# resolved from each package's .PKGINFO, so this remains intentionally small.
+gdos-base

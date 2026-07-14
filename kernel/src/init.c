@@ -27,7 +27,7 @@
 #include <efi/efi.h>
 #include <efi/graphics_output_protocol.h>
 #include <efi/types.h>
-#include <gdos/bootinfo.h>
+#include <gdosabi/bootinfo.h>
 
 #define AP_TRAMPOLINE_BASE 0x8000
 
@@ -155,21 +155,18 @@ static void device_block_selftest(const struct acpi_rsdp *rsdp,
     asserts(umem_map_device(a, mmio, PAGE_SIZE,
                             VM_DEVICE_READ | VM_DEVICE_WRITE) == 0,
             "devmem selftest: MMIO map failed");
-    asserts(umem_map_device(b, mmio, PAGE_SIZE, VM_DEVICE_READ) ==
-                SYSERR_EXIST,
+    asserts(umem_map_device(b, mmio, PAGE_SIZE, VM_DEVICE_READ) == SYSERR_EXIST,
             "devmem selftest: overlapping device block allowed");
     asserts(umem_share(a, mmio, b->pid, PAGE_R) == 0,
             "devmem selftest: BAR-style share failed");
     paging_flags_t f;
     bool present;
     asserts(as_getinfo(b->as, mmio, &f, &present) == 0 && present &&
-                (f & (PAGE_U | PAGE_UC)) == (PAGE_U | PAGE_UC) &&
-                !(f & PAGE_W),
+                (f & (PAGE_U | PAGE_UC)) == (PAGE_U | PAGE_UC) && !(f & PAGE_W),
             "devmem selftest: shared cache/rights not inherited");
     asserts(umem_unshare(b, mmio) == 0,
             "devmem selftest: BAR-style unshare failed");
-    asserts(umem_free(a, mmio) == 0,
-            "devmem selftest: device free failed");
+    asserts(umem_free(a, mmio) == 0, "devmem selftest: device free failed");
   }
 
   destroy_test_process(a);
@@ -367,8 +364,7 @@ static void init_setup(const uint8_t *image, size_t image_len) {
 
   printf("init: pid=%llu entry=%016llX bootinfo=%016llX\n", p->pid, entry,
          (uint64_t)bi);
-  process_spawn_thread(p, entry, (uint64_t)stack + 4 * PAGE_SIZE,
-                       (uint64_t)bi);
+  process_spawn_thread(p, entry, (uint64_t)stack + 4 * PAGE_SIZE, (uint64_t)bi);
 }
 
 [[noreturn]] static void ap_main() {
@@ -402,9 +398,9 @@ efi_status_t efi_main(efi_handle_t handle, struct efi_system_table *system) {
   // get_memory_map — anything that changes the map invalidates mmap_key
   // and exit_boot_services would bounce.
   uint64_t init_image_len = 0;
-  const uint8_t *init_image = esp_read_file(
-      handle, system, (const efi_char16_t *)u"\\boot\\init.exe",
-      &init_image_len);
+  const uint8_t *init_image =
+      esp_read_file(handle, system, (const efi_char16_t *)u"\\boot\\init.exe",
+                    &init_image_len);
   asserts(init_image != nullptr, "init: \\boot\\init.exe missing from ESP");
   printf("init: read \\boot\\init.exe (%llu bytes)\n", init_image_len);
   bootinfo_capture(system);

@@ -1,18 +1,20 @@
-# Top-level build: builds the kernel, stages the EFI boot tree in out/root,
-# and can boot the result in qemu (`make runkernel`).
+# Top-level build: builds the kernel, asks the userspace package graph to
+# assemble out/image-root, stages the EFI tree in out/root, and can boot the
+# result in qemu (`make runkernel`).
 
-.PHONY: all kernel userspace clean cleanall runkernel
+.PHONY: all kernel userspace clean cleanall runkernel compdb
+
+COMPDB ?= compile_commands.json
 
 all: kernel userspace
+	rm -rf out/root
 	mkdir -p out out/root
 	cp -rT efi out/efi
+	cp -a out/image-root/. out/root/
 	mkdir -p out/root/EFI/BOOT out/root/boot
 	cp kernel/out/kernel.efi out/root/EFI/BOOT/BOOTX64.efi
-	cp userspace/out/init.exe out/root/boot/init.exe
-	# The userspace filesystem tree, merged onto the ESP for now — EFI/
-	# and boot/ don't collide with the unix dirs. Moves to its own
-	# partition once a real filesystem exists.
-	cp -rT userspace/out/fs out/root
+	# The package-selected filesystem is merged onto the ESP for now. It moves
+	# to its own partition once the filesystem service is persistent.
 
 # Always recurse; the sub-Makefiles decide what is out of date.
 kernel:
@@ -20,6 +22,15 @@ kernel:
 
 userspace:
 	$(MAKE) -C userspace
+
+# Optional clangd database refresh. Bear observes the real compiler commands,
+# including the generated sysroot path and target ABI flags. Clean only the
+# compile-producing subprojects so recursive make does not inherit `-B` and
+# rebuild every sysroot stage once per component.
+compdb:
+	$(MAKE) -C kernel clean
+	$(MAKE) -C userspace clean
+	bear --output $(COMPDB) -- $(MAKE) kernel userspace
 
 # Add -d int to the qemu invocation to trace interrupts.
 runkernel: all out/nvme.img

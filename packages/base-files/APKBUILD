@@ -1,0 +1,14 @@
+# Maintainer: gpi <gpimpale29@gmail.com>
+pkgname=base-files
+pkgver=0.1.0
+pkgrel=0
+pkgdesc="GovindOS base filesystem skeleton"
+url="https://github.com/pimpale/govindos"
+arch="noarch"
+license="LicenseRef-GovindOS"
+options="!check !strip !tracedeps"
+source=""
+
+package() {
+	make -C "$startdir" install DESTDIR="$pkgdir"
+}

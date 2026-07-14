@@ -26,11 +26,11 @@
 // gdos/kring_*.h per scheme (ids, KEV_* event types, ops) — lives in the
 // shared ABI headers (the kernel↔userspace contract). This header adds
 // the kernel-side endpoint state and entry points.
-#include <gdos/kring.h>
-#include <gdos/kring_irq.h>
-#include <gdos/kring_iommu.h>
-#include <gdos/kring_shares.h>
-#include <gdos/kring_tree.h>
+#include <gdosabi/kring.h>
+#include <gdosabi/kring_irq.h>
+#include <gdosabi/kring_iommu.h>
+#include <gdosabi/kring_shares.h>
+#include <gdosabi/kring_tree.h>
 
 // Kernel-channel endpoint. Lives on the ublock (b->ring); owner-only.
 // CQ publication (cq_count, CQ slots, the full-check) happens under

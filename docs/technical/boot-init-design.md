@@ -166,7 +166,7 @@ directly.
 2. **Bootinfo block + entry ABI** (§3). RSDP capture unblocks future
    userspace ACPI work; do it in the same pass as the file read since
    both are pre-`ExitBootServices`.
-3. **The initfs.** `initdata.cpio` from a new `userspace/initfs/`
+3. **The initfs.** `initdata.cpio` built by `packages/gdos-init/`
    staging tree, incbin'd into init.exe (`bootfs_start`/`bootfs_end`).
    Split the test suite out of init into a child binary shipped in the
    archive; port pe.c's loading logic to a userland library so init
@@ -183,15 +183,16 @@ conversation (it owns the name-registry scheme too).
 
 Implementation map (paths per the source-tree reorg of
 [source-tree.md](source-tree.md), which landed the same day):
-`kernel/src/espfile.c/h` (boot-services file read), `abi/gdos/bootinfo.h`
+`kernel/src/espfile.c/h` (boot-services file read), `abi/gdosabi/bootinfo.h`
 (the shared struct), `kernel/src/init.c` (`bootinfo_capture` + the
 rewritten `init_setup`), `vendor/efi/simple_file_system_protocol.h` +
 `vendor/efi/graphics_output_protocol.h` (new protocol headers;
 `locate_protocol` got a real type in `efi.h`). Userspace:
-`lib/sys/usys.h` (syscall stubs; now `sys.h`), `lib/sys/cpio.c` (newc
-reader), `lib/sys/upe.c` (the §5 loader; now `pe.c`), `init/init.c`,
+`packages/gdoslib-dev/sys.h` (syscall conveniences),
+`packages/gdoslib-dev/cpio.c` (newc reader),
+`packages/gdoslib-dev/pe.c` (the §5 loader), `packages/gdos-init/init.c`,
 `init/bootfs.asm`,
-`bin/tests/tests.c` (hello.c, renamed and demoted to a mid-tree
+`packages/tests/tests.c` (hello.c, renamed and demoted to a mid-tree
 process). hello.c, `user_pe_blob.asm`, and the kernel-embedded userspace
 build are gone.
 

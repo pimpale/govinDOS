@@ -1,0 +1,15 @@
+# Maintainer: gpi <gpimpale29@gmail.com>
+pkgname=gdos-base
+pkgver=0.1.0
+pkgrel=0
+pkgdesc="GovindOS base system metapackage"
+url="https://github.com/pimpale/govindos"
+arch="noarch"
+license="LicenseRef-GovindOS"
+depends="base-files gdos-init"
+options="!check !strip !tracedeps"
+source=""
+
+package() {
+	make -C "$startdir" install DESTDIR="$pkgdir"
+}

@@ -14,7 +14,7 @@ Implementation map: `channel.c/h` (channels, private events, kernel ring ABI,
 schemes, waiter slots), `process.c/h` (tree, embryo, kill, zombies,
 reap steps), `umem.c/h` (share edges, revoke authority, VM_MOVE
 mechanics, live-pid index), `syscall.c/h` (dispatch; SYSCALL/SYSRET),
-`userspace/bin/tests/tests.c` (the ring-3 test suite for all of it —
+`packages/tests/tests.c` (the ring-3 test suite for all of it —
 formerly hello.c, which doubled as init until the boot-init design split
 the roles; see [boot-init-design.md](boot-init-design.md)).
 
@@ -146,7 +146,7 @@ these verbs create and destroy blocks, they don't position anything.)
     with the control-plane lock dropped and the ring re-resolved
     between slices, so a full SQ can't turn one doorbell into a
     machine-wide stall. Leftovers wait for the next doorbell;
-    userspace (lib/sys kring) re-rings until the `sq_head` mirror
+    userspace (`packages/gdoslib-dev/kring.c`) re-rings until the `sq_head` mirror
     catches up to what it published.
 
 - `SYS_BLOCK_WAIT(addr, expected) -> 0` — (may park.) `addr` is any

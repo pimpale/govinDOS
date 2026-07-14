@@ -1,0 +1,21 @@
+# Maintainer: gpi <gpimpale29@gmail.com>
+pkgname=gdos-init
+pkgver=0.1.0
+pkgrel=0
+pkgdesc="GovindOS initial userspace and embedded initfs"
+url="https://github.com/pimpale/govindos"
+arch="x86_64-govindos"
+license="LicenseRef-GovindOS"
+depends="nvmed pcid tests"
+options="!check !strip !tracedeps !archcheck"
+source=""
+
+builddir="$startdir"
+
+build() {
+	make -C "$builddir"
+}
+
+package() {
+	make -C "$builddir" install DESTDIR="$pkgdir"
+}

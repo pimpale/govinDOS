@@ -11,7 +11,7 @@
 // the convention is plain Win64 — arguments live in the frame's
 // rcx/rdx/r8/r9.
 
-#include <gdos/syscall.h>
+#include <gdosabi/syscall.h>
 
 struct trap_frame;
 

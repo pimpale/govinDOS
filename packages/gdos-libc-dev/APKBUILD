@@ -1,0 +1,21 @@
+# Maintainer: gpi <gpimpale29@gmail.com>
+pkgname=gdos-libc-dev
+pkgver=0.1.0
+pkgrel=0
+pkgdesc="GovindOS freestanding C library development files"
+url="https://github.com/pimpale/govindos"
+arch="x86_64-govindos"
+license="LicenseRef-GovindOS"
+depends="gdos-syscalls"
+options="!check !strip !tracedeps !archcheck"
+source=""
+
+builddir="$startdir"
+
+build() {
+	make -C "$builddir"
+}
+
+package() {
+	make -C "$builddir" install DESTDIR="$pkgdir"
+}
