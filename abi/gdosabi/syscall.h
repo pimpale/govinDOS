@@ -63,8 +63,9 @@
 // ublock at its identity address. The base/length are page aligned; flags are
 // VM_DEVICE_* below. Success returns 0 (the block's name is `base`).
 #define SYS_VM_MAP_DEVICE 17 // (base, len, flags)        -> 0
+#define SYS_VM_SIZE       18 // (base)                    -> block bytes
 
-#define SYS_MAX          18
+#define SYS_MAX          19
 
 // SYS_PROC_REAP results: one more bounded step done / the subtree is
 // fully gone. SYSERR_AGAIN means culling/drain hasn't caught up — call

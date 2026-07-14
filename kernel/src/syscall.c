@@ -79,6 +79,11 @@ static uint64_t sys_vm_free(struct thread *curr, uint64_t base) {
   return 0;
 }
 
+static uint64_t sys_vm_size(struct thread *curr, uint64_t base) {
+  uint64_t bytes = umem_size(curr->proc, base);
+  return bytes == 0 ? SYSERR_PERM : bytes;
+}
+
 static uint64_t sys_vm_protect(struct thread *curr, uint64_t base,
                                uint64_t len, uint64_t prot, uint64_t pid) {
   if (!vm_prot_ok(prot, true)) {
@@ -165,6 +170,10 @@ void syscall_entry(struct trap_frame *tf) {
 
   case SYS_VM_MAP_DEVICE:
     tf->rax = umem_map_device(curr->proc, a0, a1, (uint32_t)a2);
+    return;
+
+  case SYS_VM_SIZE:
+    tf->rax = sys_vm_size(curr, a0);
     return;
 
   case SYS_BLOCK_DOORBELL:

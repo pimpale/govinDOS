@@ -79,6 +79,11 @@ static void umem_selftest(void) {
 
   uint8_t *blk = umem_alloc(a, 2 * PAGE_SIZE, PAGE_R | PAGE_W);
   asserts(blk != nullptr, "umem selftest: alloc failed");
+  asserts(umem_size(a, (uint64_t)blk) == 2 * PAGE_SIZE,
+          "umem selftest: size query failed");
+  asserts(umem_size(a, (uint64_t)blk + PAGE_SIZE) == 0 &&
+              umem_size(b, (uint64_t)blk) == 0,
+          "umem selftest: size query accepted non-owner/base");
   asserts(blk[0] == 0 && blk[2 * PAGE_SIZE - 1] == 0,
           "umem selftest: block not zeroed");
 

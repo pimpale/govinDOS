@@ -25,6 +25,7 @@
 // locals only.
 
 #include <stdint.h>
+#include <stdlib.h>
 
 #include <gdosabi/kring_shares.h>
 #include <gdosabi/kring_tree.h>
@@ -46,6 +47,10 @@ static void test_memory(void) {
   uint64_t base = sys_vm_alloc(8192, VM_PROT_READ | VM_PROT_WRITE);
   print("pe: vm_alloc base=");
   print_hex(base);
+  print("pe: vm_size=");
+  print_hex(sys_vm_size(base));
+  print("pe: mid-block vm_size rc=");
+  print_hex(sys_vm_size(base + 4096));
 
   const char *msg = "pe: printing from vm_alloc'd page\n";
   const char *msg2 = "pe: printing from a read-only page\n";
@@ -106,6 +111,43 @@ static void test_memory(void) {
   // (expect SYSERR_FAULT, ...fffe).
   print("pe: kernel-ptr debug_write rc=");
   print_hex(sys_debug_write((const void *)0x1000, 16));
+}
+
+static void test_realloc(void) {
+  uint8_t *ptr = malloc(17);
+  if (ptr == nullptr || sys_vm_size((uint64_t)ptr) != 4096) {
+    print("tests: REALLOC ALLOCATION FAILED\n");
+    free(ptr);
+    return;
+  }
+
+  for (uint8_t i = 0; i < 17; i++) {
+    ptr[i] = (uint8_t)(i + 1);
+  }
+
+  uint8_t *grown = realloc(ptr, 4097);
+  if (grown == nullptr) {
+    print("tests: REALLOC GROW FAILED\n");
+    free(ptr);
+    return;
+  }
+
+  bool contents_ok = true;
+  for (uint8_t i = 0; i < 17; i++) {
+    if (grown[i] != (uint8_t)(i + 1)) {
+      contents_ok = false;
+    }
+  }
+  bool size_ok = sys_vm_size((uint64_t)grown) == 8192;
+  uint8_t *shrunk = realloc(grown, 16);
+  bool shrink_ok = shrunk == grown;
+  uint64_t base = (uint64_t)shrunk;
+  free(shrunk);
+  bool free_ok = sys_vm_size(base) == SYSERR_PERM;
+
+  print(contents_ok && size_ok && shrink_ok && free_ok
+            ? "tests: realloc/vm_size ok\n"
+            : "tests: REALLOC/VM_SIZE FAILED\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -410,6 +452,7 @@ void _start(uint64_t arg) {
   print("tests: back from yield\n");
 
   test_memory();
+  test_realloc();
   test_local_event();
 
   // Tree channel: our children's deaths arrive here (we are a mid-tree

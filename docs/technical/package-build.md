@@ -14,7 +14,7 @@ There is no local package metadata generator or filesystem merge script.
 ## Build pipeline
 
 ```text
-packages/<name>/{APKBUILD, source, Makefile}
+packages/<name>/{APKBUILD, source/, Makefile}
        │ make compiles against out/sysroot
        │ abuild package() installs into $pkgdir
        ▼
@@ -47,6 +47,8 @@ These directories operate at different levels:
 `packages/` answers “what is this package and how is it built?” Its `APKBUILD`
 owns `pkgname`, `pkgver`, dependencies, options, and the `build()`/`package()`
 phases. First-party userspace source is colocated with that formula.
+When a package needs a source subdirectory, it uses `source/`, not `src/`:
+`src/` is abuild's default extraction workspace and `abuild clean` removes it.
 
 `mk/` answers “how does the monorepo invoke the package toolchain?”
 `mk/package.mk` maps a component artifact to `abuild rootpkg`.

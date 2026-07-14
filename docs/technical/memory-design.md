@@ -334,6 +334,10 @@ User threads are stackless in the kernel; their death costs nothing here.
 - `SYS_VM_ALLOC` currently fails only when the global buddy allocator is out
   of memory. A later capability design may add explicit resource-budget
   objects without coupling allocation to user identities.
+- `SYS_VM_SIZE(base)` returns the usable byte capacity of an exact block base
+  owned by the caller. This is the rounded ublock size, not the caller's
+  original requested length; a non-base or non-owned address returns
+  `SYSERR_PERM`.
 - Permission checks are ublock checks: only the owner may free or share; a
   sharer may only flag/unshare its own view.
 - Zero-on-alloc (§5) and per-process page trees enforce isolation.

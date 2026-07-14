@@ -109,6 +109,11 @@ void umem_process_register(struct process *p);
 // block base or nullptr (out of memory).
 void *umem_alloc(struct process *p, size_t len, paging_flags_t prot);
 
+// Return the usable byte capacity of the block at this exact base owned by
+// `p`. The capacity is the page/power-of-two-rounded allocation size, not the
+// original requested length. Returns 0 if base is not an owned block.
+uint64_t umem_size(struct process *p, uint64_t base);
+
 // Create a device-backed block over an existing physical range. Success is
 // zero; the identity base is the block name.
 uint64_t umem_map_device(struct process *p, uint64_t base, uint64_t len,

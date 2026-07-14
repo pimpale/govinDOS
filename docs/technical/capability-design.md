@@ -1,465 +1,400 @@
-# Capability design: cryptographic capabilities, partitioned exercise
+# Capability design: grants, macaroon tokens, and the cap channel
 
-Status: **planned 2026-07-14; revised same day — sparse blobs + `SYS_CAP_ADOPT`
-are the universal transfer mechanism, and flat trust domains replace the
-earlier per-process adopt-deny bit as the containment failsafe.**
+Status: **planned 2026-07-14, revised twice same day. Final shape: kernel
+state is a small tree of revocation anchors ("grants"); authority is
+HMAC-chained tokens attenuated and transferred entirely in userspace;
+grant management is a kernel scheme (`KSCHEME_CAP = -2`), not syscalls.**
 Companion to [ipc-process-design.md](ipc-process-design.md),
 [irq-design.md](irq-design.md), [iommu-design.md](iommu-design.md), and
-[pci-design.md](pci-design.md). This is the "general capability model" those
-documents defer to: it replaces the four `TODO(capability)` authorization
-stubs (`umem.c` VM_MAP_DEVICE no-policy, `irq.c` direct-child provenance ×2,
-`iommu.c` first-claim attach) and the "userspace is trusted in v1" caveats
-in the PCI/IOMMU docs.
+[pci-design.md](pci-design.md). This is the "general capability model"
+those documents defer to: it replaces the four `TODO(capability)`
+authorization stubs (`umem.c` VM_MAP_DEVICE no-policy, `irq.c`
+direct-child provenance ×2, `iommu.c` first-claim attach) and the
+"userspace is trusted in v1" caveats in the PCI/IOMMU docs.
 
-## Why sparse-first
+## Why this shape
 
-Most authority in a grown system is **userspace authority**: filesystem
-rights, port/network rights, service-object rights. Two govindos facts
-decide the mechanism for those:
+Most authority in a grown system is **userspace authority** — filesystem
+rights, port rights, service-object rights — and two govindos facts decide
+the mechanism:
 
-1. The kernel cannot and should not model server semantics. A kernel cap
-   type per server concept is unbounded work and unportable policy.
-2. Govindos IPC makes kernel-mediated per-object handles uneconomical.
-   On seL4 or Fuchsia, "cap to a file" is cheap because an open file is a
-   kernel channel/endpoint and handles ride kernel-copied messages. Here a
-   connection is a whole shared block with two waiter slots, and no
-   message ever passes through the kernel. The natural shape is one ring
-   per client↔server pair with **many objects multiplexed over it** — so
-   object authority must be expressible as *data in the ring*. That is a
-   cryptographic token by definition.
+1. The kernel cannot and should not model server semantics; a kernel cap
+   type per server concept is unbounded and unportable.
+2. Govindos IPC makes kernel-mediated per-object handles uneconomical. A
+   connection is a whole shared block; no message ever passes through the
+   kernel. The natural shape is one ring per client↔server pair with many
+   objects multiplexed over it — so object authority must be expressible
+   as *data in the ring*. That is a cryptographic token by definition.
 
-So the model is **one idiom, two verifiers**. All authority travels as
-opaque blobs in rings:
+So there is **one idiom**: authority is token bytes, attenuated offline
+macaroon-style, copied over rings with no kernel involvement. Userspace
+servers verify tokens for their own objects under their own secrets (§8).
+The kernel verifies tokens for kernel objects under the boot key — it is
+just another server that happens to enforce at the hardware. Because even
+grant *management* happens over a channel (§5), the kernel's authority
+service is **substitutable**: a client cannot tell whether its authority
+ring is serviced by the kernel or by an interposing supervisor (§6).
 
-- **Userspace objects** (files, ports, service objects): tokens issued and
-  verified by the owning server under its own secret (§8). The kernel
-  never sees them; zero kernel design or porting surface.
-- **Kernel objects** (device memory, IRQ routes, IOMMU attach): the same
-  transport, but a blob is inert until `SYS_CAP_ADOPT` mints it into the
-  caller's cap table, and **all exercise takes table handles**. Sparse
-  transport, partitioned exercise.
+Kernel state exists only where revocation (or a trust-domain crossing)
+is wanted. That is the deliberate cost model: *revocability is what
+kernel state is for*. Everything between revocation points is bytes.
 
-The exercise layer stays partitioned because govindos teardown — revoke on
-death, bounded reap, "liveness, revocation, and death can never disagree" —
-is an *enumeration* property, and pure verify-at-use sparse caps are
-anti-enumeration: the kernel could no longer answer "what can this process
-do", and revocation degenerates into blacklists or epoch bumps. ADOPT
-costs one syscall per grant and buys those invariants back for exactly the
-resources where they are load-bearing (DMA, interrupts, MMIO).
-
-Containment is honest about its limits: even perfect confinement cannot
-stop a cap holder from *proxying* for a peer that owns it (a buffer
-overflow makes any process a puppet), so leakage-resistance is a matter of
-degree, not kind. The first wall is trusted processes not leaking blobs.
-The second wall — the failsafe — is the **trust domain** (§3): a leaked
-kernel-cap blob is unadoptable across a jail boundary.
+Containment is honest about its limits: no design stops a token holder
+from proxying for a peer that owns it (a buffer overflow makes any
+process a puppet), so leakage-resistance is a matter of degree, not
+kind. The first wall is trusted processes not leaking tokens. The second
+wall — the failsafe — is the **trust domain** (§4): a leaked kernel
+token is unexercisable across a jail boundary.
 
 ## 0. Decisions log
 
-- **No untyped/retype, no CSpace.** The kernel keeps its allocator and
-  per-process accounting; the cap table is flat, kernel-allocated, charged
-  to its owner. This buys authority hygiene, not seL4-class verification,
-  and the document says so plainly.
-- **A handle is a name, not a secret**; rights live in the slot, never in
-  the handle value; generation stamps make stale handles fail loudly
-  (the `irq_route` pattern).
-- **Rights and parameters are diminish-only**, via `SYS_CAP_MINT`
-  (attenuate-then-export is the delegation idiom).
-- **Blobs are claims on live slots, not freestanding authority.** A blob
-  references the exporting slot `{pid, index, generation}` + MAC; adoption
-  requires that slot to still exist and links the adopted cap as its
-  derivation child. Zero kernel state per blob; revoking or dropping the
-  exporting slot (or the exporter dying) kills every outstanding blob
-  automatically. Multi-adopt is allowed — each adoption is a new
-  enumerable child (one-shot blobs would need a kernel nonce table).
-- **Per-boot MAC key.** Blobs are transport, never persistence. MAC
-  compare is constant-time; tag ≥ 128 bits.
-- **Pids are never reused** (monotonic 64-bit allocation). Blob safety
-  requires it; the phase-2 identity split (§10) wants it anyway.
-- **Trust domains are the containment failsafe**: a flat immutable label,
-  equality-checked at the single ADOPT choke point. Chosen over the
-  earlier `PROC_NO_ADOPT` bit because it composes with unmodified
-  programs — inside a jail the full cap machinery works; only the
-  boundary is a wall.
-- **Embryo `CAP_MOVE` is the one non-blob transfer** and the one
-  sanctioned domain crossing: parent-driven construction places birth
-  authority directly, pre-seal.
-- **The hybrid boundary is a bright line.** Everything reachable through a
-  scheme SQE takes cap handles; the core VM/proc ABI keeps tree rules
-  until phase 2 (§10). This coincides with the existing rule "schemes
-  exist only where the kernel delivers events back".
-- **Cap checks add to, never replace, kernel safety checks.** A CAP_DEVMEM
-  grant does not exempt `umem_map_device` from validating that the range
-  is genuinely non-RAM device memory.
+- **No per-process cap tables, no handles, no untyped/retype.** The only
+  kernel capability state is the global grant tree (§1). This buys
+  authority hygiene and structural containment, not seL4-class
+  verification, and the document says so plainly.
+- **Tokens are bearer within a trust domain.** Accepted per the
+  degree-not-kind argument; the domain wall is anchor-side and
+  unconditional (§4), never a caveat an issuer might forget.
+- **Attenuation is conjunctive.** A token's effective authority is the
+  anchor grant's params ∩ every caveat. Chaining MACs (parent MAC keys
+  the child link) makes narrowing one-way; conjunction makes userspace
+  minting safe. Unknown caveat type → reject. Fail closed.
+- **Caveat vocabulary is closed and tiny** (§2.2): per-type parameter
+  narrowing plus PID binding. No expiry (no wall clock contract), no
+  third-party caveats, no predicates. Extensions get new type codes.
+- **Revocation authority = grant ancestry.** A grant may be revoked or
+  dropped by its creator or by the creator of any ancestor grant. Reap
+  revokes a zombie's created grants (§7). No separate revoke-tokens.
+- **Sub-grants are where you buy revocation granularity.** A leaked
+  attenuated token cannot be individually revoked — you revoke its
+  anchor. Convention: sub-grant at every trust boundary, attenuate
+  freely within one. The domain rule forces a sub-grant at exactly
+  those boundaries anyway, so mechanics and policy align.
+- **Middleman death does not sever delegation.** Tokens reference
+  anchors, not holders; an intermediary dying leaves downstream tokens
+  valid unless it created a sub-grant (then reap kills that subtree).
+  Death-coupling is chosen per delegation by sub-grant placement.
+- **Grant management is a scheme, not syscalls.** The capability system
+  adds **zero syscalls** (the table stays at `SYS_VM_SIZE 18` /
+  `SYS_MAX 19`); it changes two signatures (§5.1) and adds scheme -2.
+  The scheme earns its ring under the "kernel delivers events back"
+  rule via `KEV_CAP_GRANT_DEAD`, and multi-step revocation rides the
+  existing bounded doorbell-drain discipline instead of a caller retry
+  loop.
+- **The authority ring is inherited, like stdin** (§6). The client
+  library uses the cap ring it was given and only creates a kernel one
+  (`VM_SHARE(base, KSCHEME_CAP)`) as the default. This one convention
+  makes the entire authority interface interposable.
+- **Per-boot key; nothing persists.** Tokens and grants are transport
+  and runtime state; durable authority is a userspace concern (§8).
+  MAC compares are constant-time; tags are 16 bytes.
+- **Cap checks add to, never replace, kernel safety checks.** A devmem
+  token does not exempt `umem_map_device` from validating that the
+  range is genuinely non-RAM device memory.
+- **Enumeration is deliberately partial** (§9): "what could this
+  process exercise" is unanswerable in general (authority is bytes),
+  but fully answerable per *domain* — which is where the question
+  matters.
 
-## 1. Kernel objects
-
-### 1.1 Handle
-
-```
-handle (u64):
-  [63:32] generation — copied from the slot at mint; 0 never used
-  [31:0]  slot index — dense index into the holder's cap table
-  value 0 = CAP_NULL
-```
-
-Validation at a use site is one bounded lookup under a lock the operation
-already holds: index in range → slot type matches the op → generation
-matches → rights cover the op. Bad handle or wrong type/generation is
-`SYSERR_INVAL`; insufficient rights is `SYSERR_PERM`. Handles resolve only
-in the caller's own table; leaking a handle value grants nothing.
-
-### 1.2 Slot
+## 1. Grants
 
 ```c
-// One slot in a process's cap table (kernel-side, table charged to the
-// owner's account). generation bumps on every free, skipping 0, so a
-// stale handle or blob can never alias the slot's next tenant.
-struct cap {
-  uint8_t  type;       // CAP_NULL / CAP_DEVMEM / CAP_IRQ_ROUTE / CAP_IOMMU_DEV
-  uint32_t rights;     // CAPR_MINT | CAPR_EXPORT | per-type bits; diminish-only
-  uint32_t generation;
-  union {              // per-type object reference / parameters
-    struct { uint64_t base, len; uint32_t flags; } devmem;
-    struct { struct irq_route *route; } irq;
-    struct { uint16_t rid; } iommu_dev;   // requester id (group variant later)
+// A revocation anchor. The global grant tree is the kernel's entire
+// capability state — the boot roots plus one node per deliberate
+// delegation/containment boundary. Guarded by g_umem (the control
+// plane), so grant liveness can never disagree with process liveness
+// or revocation in flight.
+struct grant {
+  uint64_t id;             // monotonic, never reused
+  uint8_t  type;           // GRANT_DEVMEM / GRANT_IRQ_ROUTE / GRANT_IOMMU_DEV
+  union {                  // effective params: parent's ∩ the creating
+    struct { uint64_t base, len; uint32_t flags; } devmem;   // chain's caveats,
+    struct { struct irq_route *route; } irq;                 // flattened at
+    struct { uint16_t rid; } iommu_dev;                      // creation
   };
-  // Derivation tree, intrusive. dparent's slot may belong to another
-  // process (adoption links across tables). Walked by bounded revoke;
-  // a slot with children cannot DROP.
-  struct cap *dparent, *dchildren, *dsibling;
-  struct process *holder;
+  uint64_t domain;         // exercise gate (§4)
+  struct process *creator; // revocation authority + reap tie + KEV target
+  struct grant *parent, *children, *sibling; // bounded-revoke tree
+  bool dead;               // set under g_umem; verification checks the
+                           // whole ancestor chain (depth is small)
 };
 ```
 
-Tables, slots, and derivation links live under `g_umem` (the control plane
-already guarding the pid registry, share edges, and ring state), so cap
-validity can never disagree with liveness or revocation. Per-route /
-per-object delivery state keeps its own locks; the cap layer only decides
-whether an operation may begin.
+Grant types v1 mirror the hardware authority gaps:
 
-`CAPR_EXPORT` gates both `SYS_CAP_EXPORT` and embryo `SYS_CAP_MOVE`.
-Per-type rights reuse existing flag vocabularies where one exists
-(CAP_DEVMEM rights are the `VM_DEVICE_*` bits).
+- **GRANT_DEVMEM {base, len, flags}** — authority to map any page-aligned
+  subrange with any subset of `flags` (`VM_DEVICE_*`). Root covers all
+  non-RAM platform space. `pcid` sub-grants or attenuates BAR ranges for
+  drivers (pci-design's "future BAR-range capability"; ECAM authority is
+  a devmem token over the ECAM window).
+- **GRANT_IRQ_ROUTE {route}** — claim/bind/release one `irq_route`. Root
+  is route-wildcard. MSI routes allocate hardware state, so they
+  materialize via `KIRQ_MSI` (§5.2), which creates a child grant.
+- **GRANT_IOMMU_DEV {rid}** — attach/detach that requester id to a
+  caller-owned domain. Root is rid-wildcard, delegated init → `pcid`,
+  which owns topology discovery. Replaces first-claim-wins; realizes
+  iommu-design §5's capability placeholder (per-rid; groups after ACS).
 
-### 1.3 Types (v1)
+## 2. Tokens
 
-- **CAP_DEVMEM {base, len, flags}** — authority to `SYS_VM_MAP_DEVICE`
-  any page-aligned subrange with any subset of `flags`. Root cap covers
-  all non-RAM platform space, all flag bits; `pcid` mints narrowed
-  BAR-range children for drivers (pci-design's "future BAR-range
-  capability"; ECAM authority is a devmem cap over the ECAM window).
-- **CAP_IRQ_ROUTE {route}** — authority over one `irq_route`: claim,
-  bind, release. Root is a route-wildcard parent with MINT held by init;
-  per-GSI children are pure mints. MSI routes allocate hardware state, so
-  they materialize via the `KIRQ_MSI` scheme op (presenting a parent
-  cap), not a pure mint.
-- **CAP_IOMMU_DEV {rid}** — authority to attach/detach that requester id
-  to a caller-owned domain. Root is rid-wildcard with MINT, delegated
-  init → `pcid`, which owns topology discovery and mints per-device
-  children. Replaces first-claim-wins; realizes iommu-design §5's
-  `CAP_IOMMU_SPACE` placeholder (per-rid first; group caps after ACS).
+### 2.1 Wire format
 
-## 2. Blobs
+```
+token  = hdr { version u8, ncaveats u8, grant_id u64 }
+         ‖ caveat[0..ncaveats)          // ncaveats ≤ 8
+         ‖ mac[16]
+caveat = { type u8, pad[7], p0 u64, p1 u64 }   // 24 bytes, fixed
 
-```c
-#define CAP_BLOB_SIZE 32
-struct cap_blob {          // opaque to userspace; layout is kernel-private
-  uint64_t pid;            // exporting process (never reused)
-  uint32_t index, generation; // exporting slot
-  uint8_t  mac[16];        // MAC_k over the above; k is per-boot
-};
+mac_0 = MAC(k_boot, hdr)
+mac_i = MAC(mac_{i-1}, caveat_i)        // parent MAC keys the child link
 ```
 
-A blob is *transport*: it confers nothing until adopted, and it carries no
-authority state — validity is entirely "does the referenced slot still
-exist". Consequences, all free of new kernel state:
+Total ≤ 218 bytes; parsing is fixed-offset arithmetic on bounded input —
+this is the one new attacker-facing parser in the kernel and it is kept
+trivial on purpose. A root token is a bare header + MAC, written by the
+kernel (bootinfo, `KCAP_SUBGRANT`, `KIRQ_MSI`). Everything longer was
+made in userspace by `gdoslib` `token.c`: appending a caveat needs only
+the token itself (the parent MAC is the key), so attenuation is offline,
+zero-syscall, and works across arbitrary delegation hops. Verification
+recomputes the chain under `k_boot`, checks the anchor grant and all its
+ancestors live, then intersects params.
 
-- Exporter drops the slot, has it revoked, or dies → every outstanding
-  blob from it is dead (`SYSERR_DEAD` at adopt).
-- Attenuation before export: `CAP_MINT` a narrowed child, export that;
-  revoking the narrowed slot kills exactly that delegation chain.
-- A blob may be adopted multiple times; each adoption is a derivation
-  child of the exporting slot — enumerable and revocable as a subtree.
-- Blobs never survive reboot (per-boot key); persistence is a userspace
-  concern (§8).
+### 2.2 Caveats (closed vocabulary)
 
-## 3. Trust domains
-
-A trust domain is a flat `uint64_t` label on every process: inherited from
-the parent at `PROC_CREATE`, immutable for life, never reused. Init is
-domain 0. `SYS_PROC_CREATE(PROC_NEW_DOMAIN)` starts the embryo in a fresh
-domain — that is the entire lifecycle: no kernel object, no cap type,
-nothing to reap, and jails nest for free.
-
-One rule, at one choke point:
-
-> `SYS_CAP_ADOPT` requires the adopter's domain to equal the exporting
-> slot holder's domain.
-
-Domains are immutable, so the check races nothing. The blob format is
-unchanged — the domain is derived from the live exporting slot, not
-carried in the blob.
-
-What this buys: within a domain (the common case — the base system is one
-domain), blobs flow freely over rings with no ceremony; a compromised or
-buggy trusted process that leaks a blob *inside* the domain has leaked to
-processes that could already have proxied through it — degree, not kind.
-Across a jail boundary, a leaked kernel-cap blob is **inert**: the second
-wall holds even when the first fails. Any unmodified program can run
-jailed; nothing needs to be designed for confinement.
-
-Crossings:
-
-- **Embryo `CAP_MOVE`** (§4) crosses domains by design: the parent
-  constructing a jailed child places its birth authority directly,
-  pre-seal. This is the deliberate, parent-driven act that defines the
-  jail's kernel authority.
-- **Accepted limitation:** granting *new* kernel authority to an
-  already-running jailed process is impossible except by an outside proxy
-  operating on its behalf. That is the failsafe working as intended. If a
-  real need appears, a gated cross-domain export can be added without
-  blob-format changes.
-- Userspace tokens (§8) are not domain-checked by the kernel — servers
-  may adopt the same discipline in their verifiers if they care (a
-  caveat naming the client, §8), but that is server policy.
-
-## 4. Syscall surface
-
-New syscalls (numbers continue from `SYS_VM_MAP_DEVICE 17`):
-
-```c
-#define SYS_CAP_MINT   18 // (handle, rights, p0, p1) -> new handle
-#define SYS_CAP_EXPORT 19 // (handle, buf)            -> 0; writes CAP_BLOB_SIZE bytes
-#define SYS_CAP_ADOPT  20 // (buf)                    -> handle
-#define SYS_CAP_REVOKE 21 // (handle)                 -> REAP_* | SYSERR_AGAIN
-#define SYS_CAP_DROP   22 // (handle)                 -> 0 | SYSERR_EXIST
-#define SYS_CAP_MOVE   23 // (handle, pid)            -> handle in embryo's table
-#define SYS_MAX        24
-```
-
-- **SYS_CAP_MINT (handle, rights, p0, p1)** — derive a child cap. Needs
-  `CAPR_MINT`. `rights` ⊆ parent's; `p0/p1` narrow type parameters
-  (devmem: sub-base/len; irq: GSI; iommu: rid) within the parent's;
-  0/0 = same as parent. Links under the parent; charged to the caller.
-  Bounded: one slot, one link.
-- **SYS_CAP_EXPORT (handle, buf)** — write the blob for this slot to a
-  user buffer. Needs `CAPR_EXPORT`. The slot itself is untouched; export
-  any number of times. The caller then sends the bytes over any ring it
-  likes — the kernel is not in that path.
-- **SYS_CAP_ADOPT (buf)** — verify the blob (constant-time), require the
-  exporting slot live (`SYSERR_DEAD` otherwise) and same trust domain
-  (`SYSERR_PERM`), then mint a slot in the caller's table with the
-  exported slot's type/rights/params, linked as its derivation child.
-  Returns the new handle. Malformed/bad-MAC blobs are `SYSERR_INVAL`.
-- **SYS_CAP_REVOKE (handle)** — destroy the cap's *derived subtree* (the
-  cap survives; drop yourself with DROP). One bounded step per call:
-  unlink and free one deepest-first descendant slot, wherever it lives;
-  `REAP_MORE` until `REAP_DONE`. Objects with live claims (a revoked
-  route cap whose route is claimed to a ring) are torn down in the same
-  step via the object's existing bounded teardown hook. Outstanding
-  blobs from revoked slots die implicitly (§2).
-- **SYS_CAP_DROP (handle)** — free the slot. `SYSERR_EXIST` while
-  derivation children exist (revoke first), mirroring `VM_FREE` on a
-  scheme block. Never cascades.
-- **SYS_CAP_MOVE (handle, pid)** — transfer the slot (not a copy) into an
-  **own embryo's** table, pre-seal only; needs `CAPR_EXPORT`. The one
-  non-blob transfer and the one sanctioned domain crossing. Returns the
-  embryo-side handle value, which the parent passes via the image /
-  `THREAD_SPAWN` arg convention. Derivation links are preserved.
-
-### 4.1 Changed syscalls
-
-- **SYS_PROC_CREATE (flags)** — gains its first argument.
-  `PROC_NEW_DOMAIN (1u)`: the embryo starts a fresh trust domain (§3).
-- **SYS_VM_MAP_DEVICE (cap, base, len, flags)** — gains a leading
-  CAP_DEVMEM handle (4 args, within the register convention). Requested
-  range ⊆ cap range, `flags` ⊆ cap flags ∩ rights; existing kernel range
-  validation (non-RAM, alignment, FIRMWARE only on ACPI backing)
-  unchanged on top.
-
-Everything else in the core ABI (`VM_*`, `BLOCK_*`, `PROC_KILL/REAP`,
-`THREAD_SPAWN`, `GETPID`) is untouched in phase 1.
-
-### 4.2 Changed scheme ops
-
-IRQ ring (`kring_irq.h`), replacing both provenance stubs:
-
-```c
-#define KIRQ_CLAIM   1 // a = CAP_IRQ_ROUTE handle (was: bare GSI), b = cookie
-#define KIRQ_RELEASE 2 // a = CAP_IRQ_ROUTE handle
-#define KIRQ_ACK     3 // a = GSI/pseudo-gsi, b = seq (UNCHANGED, see below)
-#define KIRQ_MSI     4 // a = parent CAP_IRQ_ROUTE handle (was: child pid)
-                       // completion: a = MSI addr/data pack, b = new route cap handle
-#define KIRQ_BIND    5 // a = CAP_IRQ_ROUTE handle (was: granted route id), b = cookie
-```
-
-`KIRQ_ACK` stays handle-free deliberately: acking is scoped to a route
-already claimed/bound *to this ring*, so the ring is the authority context
-and the hot path stays a raw indexed op. Authority is spent at claim/bind,
-not per interrupt. `KIRQ_MSI` no longer names a target process: pcid
-allocates against its own parent cap, receives the route cap in the
-completion, programs MSI address/data into the device (its job per
-irq-design), and exports the route cap to the driver over their ring;
-the driver adopts and `KIRQ_BIND`s it. The "direct child" restriction
-disappears — pcid and drivers can be siblings.
-
-IOMMU ring (`kring_iommu.h`):
-
-```c
-#define KIOMMU_DEVICE_ATTACH 3 // requester field = CAP_IOMMU_DEV handle (was: bare rid)
-#define KIOMMU_DEVICE_DETACH 4 // same
-```
-
-`DOMAIN_CREATE/DESTROY` and `MAP_BLOCK/UNMAP_BLOCK` are unchanged: domains
-are implicitly self-owned and mapping is already restricted to the
-caller's own ublocks — possession-based by construction. This is the
-"SQE's requester field becomes a capability handle" swap iommu-design §5
-reserved space for.
-
-Scheme *creation* policy (`channel_scheme_create`) stays open: an IRQ or
-IOMMU ring whose owner holds no caps is inert, so gating creation adds
-nothing (resolves the init.c selftest note "creation policy moves to
-capabilities later").
-
-## 5. Death, reap, and revocation
-
-A cap is reachable from two directions and must die from both:
-
-1. **Holder dies.** The zombie's cap table is torn down by new
-   `process_reap_step` step types: "revoke one derivation edge under a
-   held cap", then "drop one held cap", deepest-first, one per step.
-   Caps are reaped before owned blocks (a route cap's teardown may need
-   to release a claim on a ring living in an owned block — verify this
-   ordering against `channel_block_destroyable` sequencing at
-   implementation time).
-2. **Granter dies.** Caps derived from the dead process's slots — adopted
-   copies held by live processes anywhere — are part of the derivation
-   subtrees revoked in (1). Delegated authority dies with the delegator;
-   the holders survive, minus the grant. Composes with recursive kill in
-   reap's own bounded budget.
-
-Blobs add nothing to any of this: they are stateless claims that fail at
-adopt time once their slot is gone. There is no object→cap reverse index
-in v1: the only objects caps reference (routes, rids, devmem ranges) are
-static platform resources that never die. Cap *targets* that die arrive
-with phase-2 CAP_PROC (§10).
-
-## 6. Bootstrap
-
-The kernel mints the root set into init's table (domain 0) before sealing
-it, and describes it in a new bootinfo section (array of
-`{handle, type, rights, p0, p1}`):
-
-- one CAP_DEVMEM, all non-RAM space, all flags, MINT|EXPORT;
-- one CAP_IRQ_ROUTE parent (route-wildcard), MINT|EXPORT;
-- one CAP_IOMMU_DEV parent (rid-wildcard), MINT|EXPORT.
-
-Init delegates by attenuate-then-export over its rings (or embryo
-CAP_MOVE at spawn): devmem and iommu parents to `pcid`; route caps flow
-pcid → drivers as devices are claimed. The kernel never expresses policy
-beyond "possession of a sufficient cap" — who deserves what is entirely
-init's and pcid's construction, which is the microkernel answer to
-sandboxing: confinement is the connectivity-and-domain graph, not a
-kernel policy engine. Boot selftests get a kernel-side mint hook (they
-already run pre-init with kernel-driven process creation).
-
-## 7. Conversion table
-
-| Site | Today | After |
+| type | p0, p1 | meaning (conjunctive) |
 |---|---|---|
-| `umem_map_device` (`umem.c` "no caller policy") | any process maps any validated range | CAP_DEVMEM covering range+flags |
-| `allocate_msi` (`irq.c` "direct-child provenance") | `target->parent == curr->proc` | parent CAP_IRQ_ROUTE presented in SQE |
-| `bind_msi` (`irq.c` "target provenance") | `route->target == owner` | CAP_IRQ_ROUTE possession; `route->target` deleted |
-| GSI `claim` (`irq.c`) | open first-claim by GSI number | CAP_IRQ_ROUTE for that GSI |
-| `DEVICE_ATTACH` (`iommu.c` "bare first-claim") | first well-formed unclaimed rid wins | CAP_IOMMU_DEV for that rid |
-| pcid BAR share (pci-design "temporary share") | pcid VM_SHAREs its BAR block | pcid mints+exports sub-range CAP_DEVMEM; driver adopts and maps its own block |
+| CAV_DEVMEM_RANGE | base, len | effective range ∩= [base, base+len) |
+| CAV_DEVMEM_FLAGS | mask, — | effective flags &= mask |
+| CAV_IRQ_GSI | gsi, — | route must be this GSI |
+| CAV_IOMMU_RID | rid, — | requester must be this rid |
+| CAV_PID | pid, — | exerciser/presenter must be this process |
+
+`CAV_PID` is opt-in possession binding (pids are never reused, §7): it
+turns a bearer token into one useless anywhere but the named process —
+for grants where even same-domain leakage is unacceptable. A caveat that
+empties the intersection makes the token valid-but-useless, not invalid.
+
+## 3. Exercise
+
+Exercise sites verify tokens where the objects live; nothing about
+enforcement moves to the channel (interposing *enforcement* would be
+forgery, §6):
+
+- **SYS_VM_MAP_DEVICE (token_ptr, token_len, flags)** — signature
+  change: the token's effective devmem range *is* the mapping (narrow in
+  userspace instead of passing base/len), `flags` ⊆ effective flags.
+  Existing kernel range validation (non-RAM, alignment, FIRMWARE only on
+  ACPI backing) unchanged on top.
+- **IRQ ring**: `KIRQ_CLAIM` / `KIRQ_BIND` / `KIRQ_RELEASE` present a
+  route token by offset+length *within the ring's block* (`sqe->a` =
+  offset, `sqe->b` = length, `sqe->c` = cookie where one applies),
+  replacing bare GSIs / granted route ids. `KIRQ_ACK` stays token-free:
+  acking is scoped to a route already bound to this ring — the ring is
+  the authority context and the hot path stays a raw indexed op.
+  Authority is spent at claim/bind, not per interrupt.
+- **IOMMU ring**: `KIOMMU_DEVICE_ATTACH/DETACH` present a device token
+  the same way (the "requester field becomes a capability" swap
+  iommu-design §5 reserved). `DOMAIN_*` and `*_MAP_BLOCK` are unchanged:
+  domains are self-owned and mapping is already restricted to the
+  caller's own ublocks — possession-based by construction.
+
+Exercise additionally requires `caller.domain == anchor.domain` (§4).
+V1 has no hot path carrying tokens — every token-checked op is
+setup-time — so per-exercise HMAC cost is irrelevant.
+
+## 4. Trust domains
+
+A flat `uint64_t` label on every process: inherited at `PROC_CREATE`,
+immutable for life, never reused. Init is domain 0.
+`SYS_PROC_CREATE(PROC_NEW_DOMAIN)` starts the embryo in a fresh domain —
+that is the entire lifecycle: no kernel object, nothing to reap, jails
+nest for free, and **any unmodified program can run jailed**.
+
+Two anchor-side rules, no token cooperation required:
+
+1. **Exercise**: the caller's domain must equal the anchor grant's.
+2. **Crossing**: `KCAP_SUBGRANT` may target another domain — creating a
+   grant is precisely the deliberate act that arms a jail.
+
+A leaked token is inert outside its anchor's domain: the second wall
+holds even when the first (nobody leaks) fails. Because crossings work
+on *running* processes, a jail can be granted new authority after birth
+— by its supervisor's explicit sub-grant, never by drift. Within a
+domain, tokens flow with zero ceremony, which is the common case: the
+base system is one domain. (Drivers jailed from *each other* is
+supported — spawn each with `PROC_NEW_DOMAIN` and sub-grant its devmem/
+route/rid tokens into its domain — at the price of a grant per driver.)
+
+## 5. The cap channel (`KSCHEME_CAP = -2`)
+
+Grant management is a kernel scheme, taking the -2 slot (current
+assignments: -1 shares, -3 tree, -4 IRQ, -6 IOMMU). Creation policy is
+open, like every scheme: a cap ring conveys nothing by itself.
+
+```c
+#define KCAP_SUBGRANT 1 // a = token off/len (32/32), b = target domain,
+                        //   c = output offset for the new root token
+                        // completion: a = grant id
+#define KCAP_REVOKE   2 // a = token off/len — kill the anchor's DESCENDANT
+                        //   grants; CQE posts when the subtree is gone
+#define KCAP_DROP     3 // a = token off/len — kill the anchor itself;
+                        //   SYSERR_EXIST while it has children
+#define KCAP_QUERY    4 // a = token off/len — completion: effective params
+                        //   + liveness (debugging, pre-flight validation)
+
+#define KEV_CAP_GRANT_DEAD KEV(7) // to the creator's cap ring when an
+                        // ancestor revocation or creator reap kills a
+                        // grant it created; a = grant id. Posted with
+                        // the KEV_SHARE post-or-replay-bit discipline.
+```
+
+Tokens ride inside the ring's block by offset+length; `SUBGRANT` writes
+the new root token back into the block at the caller-chosen offset.
+Authority checks: `SUBGRANT` needs only a valid chain (the new grant's
+params are the chain's flattened effective params — sub-granting also
+compresses long chains); `REVOKE`/`DROP` need the caller to be the
+anchor's creator or an ancestor grant's creator.
+
+`KCAP_REVOKE` improves on a syscall retry loop: the SQE simply stays in
+flight across doorbell drains — one bounded chunk of subtree teardown
+per drain within the existing `RING_SQ_BATCH` discipline — and the CQE
+posts on completion. Same bounded-work invariant, no caller-driven
+`REAP_MORE` dance. Grants whose objects hold live claims (a revoked
+route grant whose route is claimed to a ring) tear the claim down in the
+same step via the object's existing bounded teardown hook.
+
+### 5.1 ABI delta, complete
+
+- New scheme -2 with the ops/event above.
+- `SYS_VM_MAP_DEVICE` signature: `(token_ptr, token_len, flags)`.
+- `SYS_PROC_CREATE` gains `flags` (`PROC_NEW_DOMAIN 1u`).
+- Bootinfo gains a section of literal root token bytes (§7).
+- **No new syscalls.** The table stays `SYS_VM_SIZE 18`, `SYS_MAX 19`.
+
+### 5.2 MSI
+
+`KIRQ_MSI` presents a parent route token (offset/len packed in `a`,
+output offset in `b`): the kernel allocates a free route, creates a
+child grant under the presented anchor (creator = caller, domain =
+caller's), and writes a root token for it into the ring block; the
+completion carries the MSI address/data pack. pcid programs the device
+(its job per irq-design) and hands the token bytes to the driver over
+their ring — or sub-grants it into the driver's domain if the driver is
+jailed. The old "target must be a direct child" rule is deleted; pcid
+and drivers can be siblings.
+
+## 6. Interposition
+
+Convention: **a process receives its authority ring like it receives
+stdin.** The gdoslib client uses the cap ring it was handed, creating a
+kernel one only as the default when none was given. Everything the ring
+carries is SQEs and token bytes, so a jail supervisor can service it
+instead of the kernel: filtering, logging, rewriting, or satisfying
+requests by making narrowed `KCAP_SUBGRANT`s against its own broader
+tokens and forwarding the results. The jail cannot tell, and the
+supervisor gains no forgery power — it can only re-delegate what it
+already holds. This is Genode-style parent interposition falling out of
+the IPC design, and it composes with domains: the domain wall stops
+leaked-token exercise; the interposed ring shapes what a jail can even
+request.
+
+Enforcement does not interpose: exercise sites (§3) verify against
+`k_boot` at the object, always. Full kernel-surface virtualization
+(govindos-in-govindos) would need the receive-don't-create convention
+extended to IRQ/IOMMU rings too; the cap ring deliberately sets that
+precedent, but this is an observation, not a v1 goal.
+
+## 7. Death, reap, bootstrap
+
+- **Reap** gains one step type: revoke one grant created by the zombie,
+  deepest-first, before owned blocks are freed (a route grant's teardown
+  may release a claim on a ring living in an owned block — verify this
+  ordering against `channel_block_destroyable` sequencing at
+  implementation time). Grants die with their creators; tokens die with
+  their grants; no other cleanup exists because no other state exists.
+- **Pids are never reused** (monotonic 64-bit): `CAV_PID` and `creator`
+  ties require it; the phase-2 identity split (§10) wants it anyway.
+- **Bootstrap**: the kernel creates the three root grants (creator =
+  init, domain 0) and writes their root tokens as bytes into a new
+  bootinfo section. No pre-seal table population, no minting hook —
+  init reads bytes and starts delegating over rings. Boot selftests
+  drive the grant tree through kernel-side calls as usual.
 
 ## 8. Userspace tokens
 
-The larger half of the design is deliberately not kernel code. Servers
-(a future bootfs/fsd, netd, pcid's topology queries) issue tokens for
-their own objects under their own secrets, verify them on their own
-rings, and define their own revocation. Recommended shape, provided as a
-`gdoslib` helper (`token.c`) so servers share one audited implementation:
+The larger half of the design is deliberately not kernel code, and now
+differs from the kernel half only in *who holds the key*. Servers (a
+future bootfs/fsd, netd, pcid's topology queries) issue tokens for their
+own objects under their own secrets using the same `gdoslib token.c`
+(issue / attenuate / verify), the same wire format, the same conjunctive
+caveat discipline — with server-defined caveat vocabularies (path
+prefix, read-only, byte quota, expiry-by-epoch) the kernel never sees.
+Server-side revocation is the server's state: per-object epochs
+(coarse, stateless) or issuance denylists (fine). A `CAV_PID`-style
+peer-binding caveat is available where bearer-ness is unacceptable —
+the server knows its peer from the share edge.
 
-- **Issue:** `t0 = {object, rights, epoch} ‖ HMAC(k_server, ·)`.
-- **Attenuate offline, macaroon-style:** `t1 = t0 ‖ caveat ‖
-  HMAC(t0.mac, caveat)` — any holder can narrow (path prefix, read-only,
-  expiry, max-bytes) without contacting the server; verification replays
-  the chain under `k_server`.
-- **Bind to a peer (optional):** a caveat naming the presenting client
-  (e.g. the pid on the far side of the ring, which the server knows from
-  the share edge) turns a bearer token into a possession-bound one where
-  it matters.
-- **Revoke:** per-object epoch bump (coarse, stateless) or a server-side
-  denylist of issuance ids (fine, server's state, server's problem).
-
-Stated plainly: userspace authority is **bearer authority** by design —
-a leaked file token is usable by anyone with a ring to that server,
-until epoch/expiry. That is the accepted trade for zero kernel
-involvement, offline attenuation, and portability of server semantics;
-servers that need more bind to peers or expire aggressively. Kernel
-objects get the stronger ADOPT story because DMA and interrupts are
-where a durable leak is unrecoverable.
-
-Tokens are opaque bytes to the kernel; nothing here appears in the ABI
-headers except nothing at all.
+Stated plainly: userspace authority is bearer authority by design,
+bounded by domain walls only if servers choose to check domains (the
+kernel does not check for them). That is the accepted trade for zero
+kernel involvement, offline attenuation, and portable server semantics.
 
 ## 9. Invariants
 
-- Kernel authority is enumerable at exercise: "what kernel objects can
-  process P operate" is P's cap table, answerable under `g_umem`. Blobs
-  in flight are claims, not authority, and add zero kernel state.
-- Handles are meaningless outside their table; blobs are inert outside
-  the exporter's trust domain and dead after the exporting slot dies.
-- Rights and parameters only ever shrink along derivation edges (mint,
-  adopt, embryo move all preserve or diminish).
-- A jail's kernel authority is bounded by birth placement plus what
-  same-domain peers export to it; a fresh-domain jail with no placement
-  can never acquire any, regardless of what leaks into its rings.
-- Every cap operation is bounded; every unbounded teardown is a
-  caller-driven `REAP_MORE` loop.
-- No cap check replaces a safety check.
+- Kernel capability state is exactly the grant tree: small, enumerable
+  under `g_umem`, every node deliberately created, every node revocable
+  in bounded steps.
+- Effective authority only ever shrinks: along caveat chains
+  (conjunction), along sub-grants (flattened intersection), never
+  otherwise.
+- A domain's exercisable kernel authority is enumerable: the grants
+  labeled with it. "What could process P do" is deliberately not
+  answerable below domain granularity — authority between anchors is
+  bytes.
+- A leaked token is: dead if its anchor chain is dead, inert outside
+  its anchor's domain, useless outside `CAV_PID` if bound, and
+  otherwise usable only by same-domain processes — which could have
+  proxied through the leaker anyway (degree, not kind).
+- Every cap operation is bounded; unbounded teardown is chunked across
+  doorbell drains with a CQE at the end.
+- No token check replaces a safety check.
 
 ## 10. Deferred
 
-- **CAP_PROC (phase 2).** Replace pid-as-authority Fuchsia-style: keep
-  the never-reused numeric id as pure identity (events, logs, `GETPID`),
-  move KILL/REAP/SPAWN/MOVE_IN/PROTECT to CAP_PROC handles with rights
-  bits; `PROC_CREATE` returns handle + id; the embryo window becomes a
-  rights diminishment at seal. Costs that make it phase 2: every proc
-  syscall changes shape; kernel-posted events (`KEV_CHILD_DEAD`) need
-  mint-time cookies; processes are the first cap targets that *die*,
-  requiring per-process lists of caps referencing them, walked by reap.
-  Reap authority stays parent-only regardless — reap decides where
-  salvaged blocks go (tree edges), not just who may trigger it.
-- **Cross-domain export**, gated on a future domain-referencing cap, if
-  granting new kernel authority into a running jail ever becomes a real
-  need (§3).
-- **Group caps / ACS.** CAP_IOMMU_DEV is per-rid until pci-design's ACS
-  work defines isolation groups.
-- **Persistence.** The kernel key is per-boot; durable authority is a
-  userspace concern (servers re-issue tokens; init re-delegates from the
-  root set).
+- **Process authority (phase 2).** KILL/REAP/SPAWN/MOVE_IN/PROTECT are
+  still pid+tree-checked. The token translation: process-object grants
+  with rights caveats, `GETPID`-style ids staying pure identity. Costs
+  parked: every proc syscall changes shape; kernel events need
+  grant-cookie plumbing; processes would be the first grant *params*
+  that die, needing object→grant back-references. Reap authority stays
+  parent-only regardless — reap decides where salvaged blocks go (tree
+  edges), not just who may trigger it.
+- **Group grants / ACS.** GRANT_IOMMU_DEV is per-rid until pci-design's
+  ACS work defines isolation groups.
+- **Persistence.** `k_boot` is per-boot by design; durable authority is
+  re-issued by servers / re-delegated by init from the root grants.
+- **Full receive-don't-create virtualization** of scheme rings (§6).
 
 ## 11. Implementation order
 
-1. Cap table + slot/generation/derivation core under `g_umem`; MINT and
-   DROP; accounting; selftests.
-2. Bounded REVOKE and the reap step types (holder-death and granter-death
-   paths); kill/reap selftests with cross-process derivation.
-3. Root cap minting + bootinfo section; init plumbing; domain label on
-   `struct process` + `PROC_CREATE(flags)`/`PROC_NEW_DOMAIN`.
-4. Per-boot key, EXPORT/ADOPT with domain check; blob selftests
-   (stale slot, dead exporter, cross-domain, bad MAC).
-5. Embryo CAP_MOVE.
-6. Convert `SYS_VM_MAP_DEVICE` (CAP_DEVMEM); delete the umem.c TODO;
-   pcid mints driver sub-ranges.
-7. Convert the IRQ scheme ops (CLAIM/MSI/BIND/RELEASE by handle); delete
-   both irq.c TODOs and `route->target`.
-8. Convert `KIOMMU_DEVICE_ATTACH/DETACH`; delete the iommu.c first-claim
-   hook; update nvmed + QEMU harness.
-9. `gdoslib` token.c (issue/attenuate/verify) + first server adoption.
-10. Docs pass: retire the "trusted userspace v1" caveats in
-    pci-design/iommu-design; note divergences here.
+1. Grant tree under `g_umem` (create/link/dead-mark/ancestor-liveness);
+   token verifier (parse, chain MAC, conjunctive intersection) +
+   `k_boot`; selftests including malformed-token fuzzing.
+2. `gdoslib token.c` (issue/attenuate/verify — shared by kernel
+   selftests and future servers).
+3. Root grants + bootinfo token section; domain label on
+   `struct process` + `PROC_CREATE(flags)` / `PROC_NEW_DOMAIN`.
+4. Scheme -2: SUBGRANT/DROP/QUERY, then multi-drain REVOKE +
+   `KEV_CAP_GRANT_DEAD`; reap step for creator death. Selftests: stale
+   anchor, dead ancestor, cross-domain exercise/subgrant, revoke racing
+   exercise.
+5. Convert `SYS_VM_MAP_DEVICE` to token signature; delete the umem.c
+   TODO; pcid attenuates driver sub-ranges.
+6. Convert IRQ scheme ops (CLAIM/BIND/RELEASE by token; MSI per §5.2);
+   delete both irq.c TODOs and `route->target`.
+7. Convert `KIOMMU_DEVICE_ATTACH/DETACH`; delete the iommu.c
+   first-claim hook; update nvmed + QEMU harness.
+8. Authority-ring inheritance convention in gdoslib; jail-supervisor
+   interposition selftest.
+9. Docs pass: retire the "trusted userspace v1" caveats in
+   pci-design/iommu-design; note divergences here.

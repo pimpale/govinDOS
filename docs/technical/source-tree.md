@@ -35,6 +35,8 @@ govindos/
   userspace syscall API exported as `<gdos/...>` and depends on `gdos-abi`.
 - A first-party userspace package owns its source, APKBUILD, and component
   Makefile in one directory under `packages/`. Its local `out/` is private.
+- A package may keep its implementation in `source/`; it must not use abuild's
+  reserved `src/` extraction directory for checked-in files.
 - Public artifacts cross component boundaries only through `.apk` packages and
   the generated sysroot. No program adds another package's source directory to
   its include or library paths.

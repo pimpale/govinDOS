@@ -63,6 +63,10 @@ static inline uint64_t sys_vm_alloc(uint64_t len, uint64_t prot) {
 static inline uint64_t sys_vm_free(uint64_t base) {
   return sys1(SYS_VM_FREE, base);
 }
+// Returns the usable, rounded byte capacity of an exact owned block base.
+static inline uint64_t sys_vm_size(uint64_t base) {
+  return sys1(SYS_VM_SIZE, base);
+}
 static inline uint64_t sys_vm_protect(uint64_t base, uint64_t len,
                                       uint64_t prot) {
   return sys3(SYS_VM_PROTECT, base, len, prot);

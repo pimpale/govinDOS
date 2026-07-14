@@ -204,6 +204,14 @@ void *umem_alloc(struct process *p, size_t len, paging_flags_t prot) {
   return base;
 }
 
+uint64_t umem_size(struct process *p, uint64_t base) {
+  umem_proc_lock(p);
+  ublock *b = umem_owned_locked(p, base);
+  uint64_t bytes = b == nullptr ? 0 : ublock_bytes(b);
+  umem_proc_unlock(p);
+  return bytes;
+}
+
 uint64_t umem_map_device(struct process *p, uint64_t base, uint64_t len,
                          uint32_t flags) {
   paging_flags_t kernel_flags;

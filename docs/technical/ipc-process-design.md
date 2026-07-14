@@ -101,8 +101,9 @@ and memory-design.md §5.)
 
 ### Syscalls
 
-`SYS_VM_ALLOC`, `SYS_VM_FREE`, `SYS_VM_PROTECT`, `SYS_VM_UNSHARE` are
-unchanged from memory-design.md. (Renamed from `VM_MAP`/`VM_UNMAP`
+`SYS_VM_ALLOC`, `SYS_VM_FREE`, `SYS_VM_SIZE`, `SYS_VM_PROTECT`,
+`SYS_VM_UNSHARE` are unchanged from memory-design.md. (Renamed from
+`VM_MAP`/`VM_UNMAP`
 2026-07-11: in a SASOS everything is already mapped in principle —
 these verbs create and destroy blocks, they don't position anything.)
 

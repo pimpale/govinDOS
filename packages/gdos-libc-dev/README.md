@@ -2,10 +2,10 @@
 
 Not all functions are included!
 
-Serial must be turned on before approximately any of these functions can be used.
-This is because it is the main way to panic. Without it, it'll just crash silently.
-
-If the allocator is not yet set up, functions that need to allocate will panic.
-
 Uses the public `<gdos/sys.h>` syscall wrappers for allocation, exit, and
 debug-console output. It does not require `gdoslib` at link time.
+
+The allocator is deliberately stateless: each allocation is backed directly by
+`sys_vm_alloc`, `realloc` obtains its usable capacity from `sys_vm_size`, and
+`free` releases the corresponding VM block. Locking is unnecessary because
+there is no shared allocator state.
