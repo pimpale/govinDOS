@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+#include <gdosabi/kring_cap.h>
+
 // The bootinfo block (docs/technical/boot-init-design.md §3): everything
 // only discoverable before exit_boot_services, handed to init as one
 // read-only ublock whose base is init's sole entry argument (rcx).
@@ -15,7 +17,7 @@
 // symbols) and a command line (no use case yet).
 
 #define BOOTINFO_MAGIC 0x00544F4F42564F47ULL // "GOVBOOT\0" packed LE
-#define BOOTINFO_VERSION 1
+#define BOOTINFO_VERSION 2
 
 // fb_format values (EFI_GRAPHICS_PIXEL_FORMAT, frozen here so userspace
 // doesn't need the EFI headers).
@@ -49,6 +51,10 @@ struct bootinfo {
   // every descriptor, and the EFI_CONVENTIONAL_MEMORY subset.
   uint64_t mem_total_pages;
   uint64_t mem_usable_pages;
+
+  struct cap_token cap_devmem;
+  struct cap_token cap_irq;
+  struct cap_token cap_iommu;
 };
 
 #endif // gdos_bootinfo_h_INCLUDED

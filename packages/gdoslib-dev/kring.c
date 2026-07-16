@@ -3,6 +3,8 @@
 #include <stdatomic.h>
 #include <stdint.h>
 
+#include <string.h>
+
 #include <gdos/sys.h>
 
 // The header words are shared with the kernel: acquire on its mirrors
@@ -33,6 +35,15 @@ uint64_t kring_create(struct kring *r, int64_t scheme, uint64_t len) {
   }
   kring_attach(r, base);
   return 0;
+}
+
+uint64_t kring_cap_open(struct kring *r, uint64_t inherited_base,
+                        uint64_t len) {
+  if (inherited_base != 0) {
+    kring_attach(r, inherited_base);
+    return 0;
+  }
+  return kring_create(r, KSCHEME_CAP, len);
 }
 
 uint64_t kring_destroy(struct kring *r) { return sys_vm_free(r->base); }
@@ -102,8 +113,68 @@ static uint64_t irq_submit(struct kring *r, uint64_t op, uint64_t a,
   return kring_submit(r);
 }
 
-uint64_t kring_irq_claim(struct kring *r, uint64_t gsi, uint64_t cookie) {
-  return irq_submit(r, KIRQ_CLAIM, gsi, cookie);
+static uint64_t data_off(const struct kring *r) {
+  return KRING_HDR_SIZE + (uint64_t)r->nslots *
+      (sizeof(struct ksqe) + sizeof(struct kcqe));
+}
+
+static uint64_t wait_completion(struct kring *r, uint64_t op,
+                                struct kcqe *result) {
+  for (;;) {
+    struct kcqe cqe;
+    uint64_t rc = kring_wait_cqe(r, &cqe);
+    if (rc != 0) return rc;
+    kring_ack(r);
+    if (cqe.type == op) {
+      if (result != nullptr) *result = cqe;
+      return cqe.status;
+    }
+  }
+}
+
+uint64_t kring_cap_subgrant(struct kring *r, const struct cap_token *parent,
+                            uint64_t p0, uint64_t p1, uint64_t p2,
+                            uint32_t present, struct cap_token *out) {
+  uint64_t base = data_off(r);
+  struct kcap_subgrant_req *req = (void *)(r->base + base);
+  struct cap_token *in = (void *)(r->base + base + 64);
+  struct cap_token *result = (void *)(r->base + base + 96);
+  *in = *parent;
+  *req = (struct kcap_subgrant_req){.token_off = base + 64,
+      .token_len = CAP_TOKEN_SIZE, .p0 = p0, .p1 = p1, .p2 = p2,
+      .present = present};
+  struct ksqe *sqe = kring_get_sqe(r);
+  if (sqe == nullptr) return SYSERR_AGAIN;
+  *sqe = (struct ksqe){.op = KCAP_SUBGRANT, .a = base, .c = base + 96};
+  uint64_t rc = kring_submit(r);
+  if (rc == 0) rc = wait_completion(r, KCAP_SUBGRANT, nullptr);
+  if (rc == 0) *out = *result;
+  return rc;
+}
+
+uint64_t kring_cap_revoke(struct kring *r, const struct cap_token *token) {
+  uint64_t off = data_off(r);
+  *(struct cap_token *)(r->base + off) = *token;
+  for (;;) {
+    struct ksqe *sqe = kring_get_sqe(r);
+    if (sqe == nullptr) return SYSERR_AGAIN;
+    *sqe = (struct ksqe){.op = KCAP_REVOKE, .a = off,
+                         .b = CAP_TOKEN_SIZE};
+    uint64_t rc = kring_submit(r);
+    if (rc == 0) rc = wait_completion(r, KCAP_REVOKE, nullptr);
+    if (rc != SYSERR_AGAIN) return rc;
+  }
+}
+
+uint64_t kring_irq_claim(struct kring *r, const struct cap_token *token,
+                         uint64_t cookie) {
+  uint64_t off = data_off(r);
+  *(struct cap_token *)(r->base + off) = *token;
+  struct ksqe *sqe = kring_get_sqe(r);
+  if (sqe == nullptr) return SYSERR_AGAIN;
+  *sqe = (struct ksqe){.op = KIRQ_CLAIM, .a = off,
+      .b = CAP_TOKEN_SIZE, .c = cookie};
+  return kring_submit(r);
 }
 
 uint64_t kring_irq_release(struct kring *r, uint64_t gsi) {
@@ -114,10 +185,53 @@ uint64_t kring_irq_ack(struct kring *r, uint64_t gsi, uint64_t seq) {
   return irq_submit(r, KIRQ_ACK, gsi, seq);
 }
 
-uint64_t kring_irq_msi(struct kring *r, uint64_t child_pid) {
-  return irq_submit(r, KIRQ_MSI, child_pid, 0);
+uint64_t kring_irq_msi(struct kring *r, const struct cap_token *parent,
+                       struct cap_token *out, uint64_t *address,
+                       uint32_t *data) {
+  uint64_t off = data_off(r);
+  *(struct cap_token *)(r->base + off) = *parent;
+  struct ksqe *sqe = kring_get_sqe(r);
+  if (sqe == nullptr) return SYSERR_AGAIN;
+  *sqe = (struct ksqe){.op = KIRQ_MSI, .a = off, .b = CAP_TOKEN_SIZE,
+                       .c = off + CAP_TOKEN_SIZE};
+  uint64_t rc = kring_submit(r);
+  struct kcqe cqe;
+  if (rc == 0) rc = wait_completion(r, KIRQ_MSI, &cqe);
+  if (rc == 0) {
+    *out = *(struct cap_token *)(r->base + off + CAP_TOKEN_SIZE);
+    *address = cqe.a;
+    *data = KIRQ_MSI_DATA(cqe.b);
+  }
+  return rc;
 }
 
-uint64_t kring_irq_bind(struct kring *r, uint64_t route_id, uint64_t cookie) {
-  return irq_submit(r, KIRQ_BIND, route_id, cookie);
+uint64_t kring_irq_bind(struct kring *r, const struct cap_token *token,
+                        uint64_t cookie, uint32_t *route_id) {
+  uint64_t off = data_off(r);
+  *(struct cap_token *)(r->base + off) = *token;
+  struct ksqe *sqe = kring_get_sqe(r);
+  if (sqe == nullptr) return SYSERR_AGAIN;
+  *sqe = (struct ksqe){.op = KIRQ_BIND, .a = off, .b = CAP_TOKEN_SIZE,
+                       .c = cookie};
+  uint64_t rc = kring_submit(r);
+  struct kcqe cqe;
+  if (rc == 0) rc = wait_completion(r, KIRQ_BIND, &cqe);
+  if (rc == 0 && route_id != nullptr) *route_id = (uint32_t)cqe.a;
+  return rc;
+}
+
+uint64_t kring_iommu_attach(struct kring *r, uint64_t domain,
+                            const struct cap_token *token,
+                            uint64_t fault_cookie) {
+  uint64_t off = data_off(r);
+  struct kiommu_attach_req *req = (void *)(r->base + off);
+  struct cap_token *in = (void *)(r->base + off + 64);
+  *in = *token;
+  *req = (struct kiommu_attach_req){.domain = domain, .token_off = off + 64,
+      .token_len = CAP_TOKEN_SIZE, .fault_cookie = fault_cookie};
+  struct ksqe *sqe = kring_get_sqe(r);
+  if (sqe == nullptr) return SYSERR_AGAIN;
+  *sqe = (struct ksqe){.op = KIOMMU_DEVICE_ATTACH, .a = off};
+  uint64_t rc = kring_submit(r);
+  return rc == 0 ? wait_completion(r, KIOMMU_DEVICE_ATTACH, nullptr) : rc;
 }

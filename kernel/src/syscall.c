@@ -3,6 +3,7 @@
 #include <stdint.h>
 
 #include "channel.h"
+#include "capability.h"
 #include "cpu_state.h"
 #include "debug.h"
 #include "irq.h"
@@ -169,7 +170,7 @@ void syscall_entry(struct trap_frame *tf) {
     return;
 
   case SYS_VM_MAP_DEVICE:
-    tf->rax = umem_map_device(curr->proc, a0, a1, (uint32_t)a2);
+    tf->rax = cap_map_device(curr->proc, a0, a1, (uint32_t)a2);
     return;
 
   case SYS_VM_SIZE:

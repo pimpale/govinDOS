@@ -12,6 +12,7 @@
 #include "spinlock.h"
 
 struct address_space;
+struct grant;
 typedef struct process process;
 
 // There are no kernel threads (ipc-process-design.md §4): the only
@@ -124,6 +125,10 @@ struct process {
   struct ring *share_ch;
   struct ring *tree_ch;
   struct ring *iommu_ch;
+
+  // Capability grants created by this process. Intrusive, g_umem-only;
+  // creator reap prospectively revokes and drains this list first.
+  struct grant *created_grants;
 };
 
 // Spawn a user thread that starts at `entry` in ring 3 on `user_stack_top`

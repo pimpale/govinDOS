@@ -27,6 +27,7 @@
 // shared ABI headers (the kernel↔userspace contract). This header adds
 // the kernel-side endpoint state and entry points.
 #include <gdosabi/kring.h>
+#include <gdosabi/kring_cap.h>
 #include <gdosabi/kring_irq.h>
 #include <gdosabi/kring_iommu.h>
 #include <gdosabi/kring_shares.h>

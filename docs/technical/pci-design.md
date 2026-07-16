@@ -5,14 +5,17 @@ Status: **planned 2026-07-12.** Companion to
 [memory-design.md](memory-design.md), and
 [ipc-process-design.md](ipc-process-design.md).
 
-Implementation progress (2026-07-12): the QEMU Q35 substrate through step 8
+Implementation progress (updated 2026-07-16): the QEMU Q35 substrate through step 8
 is implemented, including device-backed ublocks, ECAM enumeration, BAR
 delegation, VT-d attachment, MSI/MSI-X setup, and death/restart ordering. The
 first step-10 storage slice is also live: `nvmed` exposes a versioned
 client-owned shared-block protocol with INFO, READ, and WRITE requests, uses a
 driver-owned DMA bounce pool, and services namespace 1 through one NVMe I/O
 queue pair. `pcid` performs a one-block read after the death-path restart as an
-end-to-end smoke test. Multi-namespace discovery, concurrent requests,
+end-to-end smoke test. The general capability model is now live: init passes
+root token bytes to `pcid`, `pcid` sub-grants exact firmware/ECAM/BAR ranges
+before `SYS_VM_MAP_DEVICE`, and requester/IRQ tokens cross the driver handoff.
+Multi-namespace discovery, concurrent requests,
 flush/discard, a name registry, and client-revocation hardening remain.
 
 Govindos follows the seL4 division of labor, without making seL4's full
@@ -42,21 +45,17 @@ normal operation. It never receives ECAM or legacy PCI configuration ports.
   power-state, PCIe-feature, and interrupt-mode changes over an ordinary user
   channel. This keeps an untrusted driver from moving BARs, enabling ATS,
   changing requester identity features, or forging MSI configuration. In v1
-  this split is the intended configuration, not kernel-enforced: any process
-  may call `SYS_VM_MAP_DEVICE` until capabilities add caller policy; the
-  kernel enforces only what physical ranges are mappable.
+  this split is kernel-enforced by devmem grant tokens: `pcid` receives the
+  root from init and maps only exact sub-granted ranges. The kernel also
+  retains its independent physical-range safety validation.
 - **Drivers receive resources, not configuration authority.** A driver gets
-  device-MMIO views for selected BARs, an IRQ ring binding, and the numeric
-  requester ID used by the v1 direct IOMMU interface. BAR access is direct
+  device-MMIO views for selected BARs, an IRQ route token, and an IOMMU
+  requester token. BAR access is direct
   after setup; routine register traffic never passes through `pcid`.
-- **Capabilities are replacement hooks, not a v1 dependency.** V1 applies no
-  caller policy: `SYS_VM_MAP_DEVICE` is callable by any process (trusted
-  userspace), delegation rides the ordinary `SYS_VM_SHARE`/`SYS_VM_MOVE`
-  path, and IRQ/IOMMU keep the existing first-claim rules. The
-  implementation keeps each authorization decision in one function. Later,
-  `CAP_PCI_CONFIG`, `CAP_DEVICE_MEMORY`, `CAP_IRQ`, and
-  `CAP_IOMMU_SPACE` replace those checks without changing enumeration,
-  mapping, DMA, or driver protocols.
+- **Capabilities are the v1 authorization boundary.** The grant/token model
+  in [capability-design.md](capability-design.md) gates device mappings, IRQ
+  allocation/binding, and requester attachment. Ordinary block sharing still
+  carries an already-created BAR mapping to the driver.
 - **`pcid` is trusted but outside the kernel.** A compromised `pcid` can
   reconfigure devices, grant the wrong BAR, destroy device availability, and
   corrupt device-owned data. The kernel still rejects mappings of usable RAM,
@@ -156,7 +155,7 @@ because the result is a ublock:
 
 | syscall | arguments | effect |
 |---|---|---|
-| `SYS_VM_MAP_DEVICE` | physical base, length, flags | create a device-backed ublock over a validated firmware/PCI range at its identity address |
+| `SYS_VM_MAP_DEVICE` | devmem token pointer/length, flags | create a device-backed ublock over the token's exact, independently validated range at its identity address |
 
 The call is synchronous, bounded, and returns 0 or `SYSERR_*`. Rules:
 
@@ -216,20 +215,16 @@ must replace that platform fact with host-bridge windows obtained from ACPI
 arbitrary firmware BAR assignments are accepted. MCFG describes ECAM; it
 does not describe the host bridge's allocatable BAR windows.
 
-### Future capability replacement
+### Capability boundary (implemented)
 
-The mechanism deliberately exposes narrow replacement points:
-
-1. the right to call it at all becomes possession of `CAP_DEVICE_CONTROL` —
-   v1 has no caller check to remove, only this one to add;
-2. `SYS_VM_MAP_DEVICE` becomes mapping a device-frame/config capability;
-3. delegation needs no hook of its own: device blocks inherit whatever
-   capability semantics `SYS_VM_SHARE`/`SYS_VM_MOVE` acquire when ublock
-   delegation itself becomes capability-mediated.
+`SYS_VM_MAP_DEVICE(token, token_len, flags)` maps the exact range in a live
+devmem grant, with flags narrowed by both the grant and the platform safety
+validator. `pcid` creates those grants through `KCAP_SUBGRANT`; device blocks
+then use ordinary `SYS_VM_SHARE`/`SYS_VM_MOVE` delegation.
 
 Nothing in `pcid`'s enumeration logic or a driver's MMIO access changes.
-These stubs should be marked `TODO(capability)` in implementation, but no cap
-table, revocation tree, or capability-aware IPC is required for v1.
+The kernel stores revocation anchors, while token bytes remain ordinary IPC
+data; there is still no per-process capability table.
 
 ## 4. Discovery and topology
 
@@ -326,14 +321,10 @@ struct pci_driver_start {
 };
 ```
 
-The child PID and parent channel are temporary provenance. V1 applies no
-device-mapping caller policy — userspace is trusted until capabilities land,
-so only convention keeps a driver from calling `SYS_VM_MAP_DEVICE` itself.
-The kernel
-still validates every physical range, so no caller reaches RAM or protected
-MMIO regardless. The numeric requester
-ID remains a claim/DoS weakness until the future IOMMU-space capability; it
-does not grant access to another process's RAM.
+The driver receives shared BAR views rather than a devmem token, so it cannot
+create arbitrary device mappings. Its start record carries a requester token
+and IRQ route token; numeric requester identity remains present for
+diagnostics and ring-scoped detach, not as attach authority.
 
 Driver-to-`pcid` control requests include readiness, orderly stop, FLR/reset,
 power-state change, and diagnostic config reads from an allowlisted set.
@@ -350,22 +341,14 @@ and hardware programming belong to `pcid`:
 2. It masks the function's MSI/MSI-X source.
 3. For MSI, it writes the capability in ECAM. For MSI-X, it maps the table
    BAR into itself, writes entries, and applies the required ordering.
-4. The driver binds IRQ event delivery to its IRQ ring through a temporary
-   child grant/claim checked by the IRQ scheme.
+4. The driver binds IRQ event delivery to its IRQ ring with the route token
+   returned by `KIRQ_MSI` and copied through its start record.
 5. `pcid` enables MSI/MSI-X and unmasks the selected entries only after the
    driver reports its queues and IOMMU domain ready.
 
-The IRQ implementation should keep `irq_authorize_bind(process, route)` as
-the future `CAP_IRQ` hook. Until then, `pcid` creates the route for a direct
-child and the kernel records the intended PID. This small IRQ grant is part
-of the MSI milestone; it is not a general capability system.
-
-MSI allocation keeps `irq_authorize_msi_alloc(process)` as the marked
-replacement point, but v1 accepts every process — matching the IOMMU
-first-claim stance of no interim caller policy before capabilities. A
-driver that allocates routes for itself bypasses `pcid` convention but
-gains no memory authority. The future IRQ-control capability makes the
-check real.
+`KIRQ_MSI` requires a live route-wildcard parent token and creates a concrete
+route grant. `KIRQ_BIND` verifies that token at the IRQ object; direct-child
+PID provenance is no longer part of authorization.
 
 INTx is deferred entirely: `_PRT` routing requires AML interpretation,
 which is a stated non-goal until an `acpid` exists. V1 devices must support

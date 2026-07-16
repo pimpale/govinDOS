@@ -121,6 +121,9 @@ void _start(uint64_t arg) {
         .acpi_rsdp = ((const struct bootinfo *)arg)->acpi_rsdp,
         .driver_image = (uint64_t)nvmed,
         .driver_image_length = nvmed_len,
+        .cap_devmem = ((const struct bootinfo *)arg)->cap_devmem,
+        .cap_irq = ((const struct bootinfo *)arg)->cap_irq,
+        .cap_iommu = ((const struct bootinfo *)arg)->cap_iommu,
     };
     resources[0] =
         (struct pe_resource){.base = (uint64_t)&__ImageBase,

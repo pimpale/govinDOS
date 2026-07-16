@@ -1,4 +1,5 @@
 #include "channel_internal.h"
+#include "capability.h"
 
 #include <stdint.h>
 
@@ -8,6 +9,7 @@
 #include "lapic.h"
 #include "spinlock.h"
 #include "stdlib/stdio.h"
+#include "stdlib/string.h"
 #include "syscall.h"
 
 #define IRQ_ROUTE_COUNT (VECTOR_DEVICE_END - VECTOR_DEVICE_BASE + 1)
@@ -45,8 +47,16 @@ static struct irq_route *route_for_gsi(uint64_t gsi) {
   return &g_routes[gsi];
 }
 
+struct irq_route *irq_route_for_gsi_locked(uint64_t gsi) {
+  return route_for_gsi(gsi);
+}
+
 static uint32_t route_id(const struct irq_route *route) {
   return ((uint32_t)route->generation << 16) | route->gsi;
+}
+
+uint32_t irq_route_id_locked(const struct irq_route *route) {
+  return route_id(route);
 }
 
 static struct irq_route *route_for_id(uint64_t id) {
@@ -113,10 +123,11 @@ void irq_deliver(uint8_t vector) {
   x86_lapic_eoi();
 }
 
-static uint64_t claim(struct ring *ring, uint64_t gsi, uint64_t cookie) {
-  struct irq_route *route = route_for_gsi(gsi);
+static uint64_t claim(struct ring *ring, struct irq_route *route,
+                      uint64_t cookie) {
   if (route == nullptr)
     return SYSERR_INVAL;
+  uint64_t gsi = route->gsi;
   if (2 * (ring->nclaims + 1) > ring->nslots)
     return SYSERR_NOMEM;
 
@@ -193,11 +204,14 @@ static uint64_t ack(struct ring *ring, uint64_t gsi, uint64_t seq) {
   return 0;
 }
 
-static uint64_t allocate_msi(struct thread *curr, struct ksqe *sqe) {
-  struct process *target = umem_proc_lookup_locked(sqe->a);
-  // TODO(capability): replace direct-child provenance with CAP_IRQ.
-  if (target == nullptr || target->parent != curr->proc)
-    return SYSERR_INVAL;
+static uint64_t allocate_msi_on_ring(struct thread *curr, struct ring *ring,
+                                     struct ksqe *sqe) {
+  grant *parent;
+  uint64_t rc = cap_verify_ring_locked(ring, sqe->a, sqe->b,
+                                       KCAP_GRANT_IRQ_ROUTE, &parent);
+  if (rc != 0 || sqe->c > ring->block->bytes ||
+      CAP_TOKEN_SIZE > ring->block->bytes - sqe->c)
+    return rc != 0 ? rc : SYSERR_INVAL;
   for (uint32_t i = IRQ_ROUTE_COUNT; i-- > 0;) {
     struct irq_route *route = &g_routes[i];
     if (route->present || route->allocated)
@@ -211,7 +225,7 @@ static uint64_t allocate_msi(struct thread *curr, struct ksqe *sqe) {
     if (route->generation == 0)
       route->generation++;
     route->allocated = true;
-    route->target = target;
+    route->target = curr->proc; // allocation lifetime owner, not bind policy
     route->mode = IRQ_TRIGGER_EDGE;
     route->raised = 0;
     route->acked = 0;
@@ -219,6 +233,15 @@ static uint64_t allocate_msi(struct thread *curr, struct ksqe *sqe) {
     route->spurious_logged = false;
     uint32_t id = route_id(route);
     uint32_t data = VECTOR_DEVICE_BASE + i;
+    struct cap_token token;
+    rc = cap_create_irq_route_locked(curr->proc, parent, route, &token);
+    if (rc != 0) {
+      route->allocated = false;
+      route->target = nullptr;
+      spinlock_unlock(&route->lock);
+      return rc;
+    }
+    memcpy((void *)(ring->block->base + sqe->c), &token, sizeof(token));
     sqe->a = 0xFEE00000ull | ((uint64_t)g_bsp_apic_id << 12);
     sqe->b = KIRQ_MSI_PACK(id, data);
     spinlock_unlock(&route->lock);
@@ -227,15 +250,13 @@ static uint64_t allocate_msi(struct thread *curr, struct ksqe *sqe) {
   return SYSERR_NOMEM;
 }
 
-static uint64_t bind_msi(struct process *owner, struct ring *ring,
-                         uint64_t id, uint64_t cookie) {
-  struct irq_route *route = route_for_id(id);
+static uint64_t bind_msi(struct ring *ring, struct irq_route *route,
+                         uint64_t cookie) {
   if (route == nullptr || route->present ||
       2 * (ring->nclaims + 1) > ring->nslots)
     return SYSERR_INVAL;
   spinlock_lock(&route->lock);
-  // TODO(capability): target provenance becomes route-cap possession.
-  if (!route->allocated || route->target != owner || route->ring != nullptr) {
+  if (!route->allocated || route->ring != nullptr) {
     spinlock_unlock(&route->lock);
     return SYSERR_PERM;
   }
@@ -251,16 +272,28 @@ static uint64_t bind_msi(struct process *owner, struct ring *ring,
 uint64_t irq_exec(struct thread *curr, struct ring *ring,
                   struct ksqe *sqe) {
   switch (sqe->op) {
-  case KIRQ_CLAIM:
-    return claim(ring, sqe->a, sqe->b);
+  case KIRQ_CLAIM: {
+    grant *g;
+    uint64_t rc = cap_verify_ring_locked(ring, sqe->a, sqe->b,
+                                         KCAP_GRANT_IRQ_ROUTE, &g);
+    return rc == 0 ? claim(ring, cap_irq_route(g), sqe->c) : rc;
+  }
   case KIRQ_RELEASE:
     return release(ring, sqe->a);
   case KIRQ_ACK:
     return ack(ring, sqe->a, sqe->b);
   case KIRQ_MSI:
-    return allocate_msi(curr, sqe);
-  case KIRQ_BIND:
-    return bind_msi(curr->proc, ring, sqe->a, sqe->b);
+    return allocate_msi_on_ring(curr, ring, sqe);
+  case KIRQ_BIND: {
+    grant *g;
+    uint64_t rc = cap_verify_ring_locked(ring, sqe->a, sqe->b,
+                                         KCAP_GRANT_IRQ_ROUTE, &g);
+    if (rc != 0) return rc;
+    struct irq_route *route = cap_irq_route(g);
+    rc = bind_msi(ring, route, sqe->c);
+    if (rc == 0) sqe->a = route_id(route);
+    return rc;
+  }
   default:
     return SYSERR_NOSYS;
   }

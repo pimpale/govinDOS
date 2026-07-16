@@ -3,6 +3,7 @@
 #include <stdatomic.h>
 
 #include "channel.h"
+#include "capability.h"
 #include "cpu_state.h"
 #include "debug.h"
 #include "iommu.h"
@@ -183,6 +184,10 @@ static uint64_t reap_step_locked(struct process *target,
     asserts(process_is_dead(z), "reap: live process inside dead subtree");
   }
   materialize_dead_locked(z);
+
+  if (cap_reap_one_locked(z)) {
+    return REAP_MORE;
+  }
 
   if (iommu_reap_one_locked(z)) {
     return REAP_MORE;

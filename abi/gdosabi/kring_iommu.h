@@ -14,6 +14,15 @@
 #define KIOMMU_MAP_BLOCK      5
 #define KIOMMU_UNMAP_BLOCK    6
 
+// KIOMMU_DEVICE_ATTACH uses a = offset of this request within the IOMMU
+// ring block. The capability token itself also lives in that block.
+struct kiommu_attach_req {
+  uint64_t domain;
+  uint64_t token_off;
+  uint64_t token_len;
+  uint64_t fault_cookie;
+};
+
 #define IOMMU_PERM_DEVICE_READ  (1u << 0)
 #define IOMMU_PERM_DEVICE_WRITE (1u << 1)
 

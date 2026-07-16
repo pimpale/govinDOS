@@ -439,8 +439,8 @@ void _start(uint64_t arg) {
   if (command(&iommu, KIOMMU_DOMAIN_CREATE, domain, 0, 0) != 0 ||
       command(&iommu, KIOMMU_MAP_BLOCK, domain, dev.dma,
               IOMMU_PERM_DEVICE_READ | IOMMU_PERM_DEVICE_WRITE) != 0 ||
-      command(&iommu, KIOMMU_DEVICE_ATTACH, domain, setup->requester_id,
-              setup->function_id) != 0) {
+      kring_iommu_attach(&iommu, domain, &setup->iommu_token,
+                         setup->function_id) != 0) {
     print("nvmed: IOMMU setup failed\n");
     sys_exit();
   }
@@ -450,13 +450,9 @@ void _start(uint64_t arg) {
     sys_exit();
   struct kring irq;
   if (kring_create(&irq, KSCHEME_IRQ, PAGE_SIZE) != 0 ||
-      kring_irq_bind(&irq, setup->irq_route, setup->function_id) != 0)
+      kring_irq_bind(&irq, &setup->irq_token, setup->function_id,
+                     nullptr) != 0)
     sys_exit();
-  struct kcqe bind;
-  if (kring_wait_cqe(&irq, &bind) != 0 || bind.type != KIRQ_BIND ||
-      bind.status != 0)
-    sys_exit();
-  kring_ack(&irq);
   signal_state(setup, PCI_DRIVER_IRQ_READY);
   if (!wait_state(setup, PCI_DRIVER_LIVE))
     sys_exit();

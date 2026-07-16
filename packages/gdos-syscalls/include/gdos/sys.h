@@ -3,6 +3,7 @@
 #include <stdint.h>
 
 #include <gdosabi/syscall.h>
+#include <gdosabi/kring_cap.h>
 
 // SYSCALL ABI (gdos/syscall.h): rax = nr, args in r10/rdx/r8/r9, result
 // in rax. rcx and r11 are clobbered by the instruction itself; the
@@ -90,9 +91,9 @@ static inline uint64_t sys_vm_unshare(uint64_t base) {
 static inline uint64_t sys_vm_move(uint64_t base, uint64_t pid) {
   return sys2(SYS_VM_MOVE, base, pid);
 }
-static inline uint64_t sys_vm_map_device(uint64_t base, uint64_t len,
+static inline uint64_t sys_vm_map_device(const struct cap_token *token,
                                          uint64_t flags) {
-  return sys3(SYS_VM_MAP_DEVICE, base, len, flags);
+  return sys3(SYS_VM_MAP_DEVICE, (uint64_t)token, CAP_TOKEN_SIZE, flags);
 }
 
 static inline uint64_t sys_block_doorbell(uint64_t base) {

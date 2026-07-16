@@ -3,6 +3,7 @@
 #include "acpi.h"
 #include "allocator.h"
 #include "channel.h"
+#include "capability.h"
 #include "cpu_hwid.h"
 #include "cpu_setup.h"
 #include "debug.h"
@@ -351,6 +352,9 @@ static void bootinfo_capture(struct efi_system_table *system) {
 static void init_setup(const uint8_t *image, size_t image_len) {
   struct process *p = process_create(nullptr);
   process_set_init(p);
+  capability_bootstrap(p, &g_bootinfo.cap_devmem, &g_bootinfo.cap_irq,
+                       &g_bootinfo.cap_iommu);
+  capability_selftest(p, &g_bootinfo.cap_devmem);
   uint64_t entry = 0;
   int rc = pe_load(p, image, image_len, &entry);
   asserts(rc == 0, "init: PE load failed");
@@ -460,6 +464,7 @@ efi_status_t efi_main(efi_handle_t handle, struct efi_system_table *system) {
 
   // User-memory bookkeeping (ublock registry).
   umem_init();
+  capability_init();
 
   // Guard punch + revert must return the kernel tree to its exact shape.
   paging_merge_selftest();

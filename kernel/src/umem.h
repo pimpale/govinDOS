@@ -119,6 +119,11 @@ uint64_t umem_size(struct process *p, uint64_t base);
 uint64_t umem_map_device(struct process *p, uint64_t base, uint64_t len,
                          uint32_t flags);
 
+// Same operation with g_umem already held, for an atomic capability
+// verification + mapping transaction.
+uint64_t umem_map_device_locked(struct process *p, uint64_t base, uint64_t len,
+                                uint32_t flags);
+
 // Free a block owned by `p`. base must be the exact block base — blocks
 // are the unit, so the base alone is unambiguous. Revokes every
 // sharer's view, restores all views to pristine, flushes every view in

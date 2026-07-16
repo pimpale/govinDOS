@@ -10,12 +10,14 @@ on x86_64;
 the architecture-neutral core is deliberately shaped for AMD-Vi and Arm
 SMMUv3 backends later.
 
-Implementation progress (2026-07-12): steps 1-10 and the QEMU portion of step
+Implementation progress (updated 2026-07-16): steps 1-10 and the QEMU portion of step
 11 are implemented. `nvmed` maps its admin queue, I/O queue pair, PRP-list
 page, Identify pages, and eight-page bounce pool as one driver-owned IOMMU
 block. Client channel pages are copied to/from that pool and are never DMA
 mapped. QEMU verifies mapped DMA, normalized malicious-PRP faults,
 death/restart cleanup, and a block-protocol read on the replacement driver.
+`KIOMMU_DEVICE_ATTACH` now verifies a per-requester capability token issued
+by `pcid`; detach remains authorized by the existing ring/domain attachment.
 Broader malicious-I/O tests and real-hardware scope/RMRR support remain.
 
 The IOMMU is the DMA-side counterpart of the CPU page tables. CPU page
@@ -56,12 +58,10 @@ pinning, or device-assignment model below.
   IOMMU control ring, creates domains owned implicitly by itself, maps and
   unmaps only its own ublocks, attaches unclaimed requester IDs, and receives
   its own fault events. There is no `pcid` proxy on the DMA data path.
-- **Device-claim policy is deferred behind one explicit hook.** V1's
-  `DEVICE_ATTACH` is first-claim-wins for a bare requester ID. This can steal
-  or deny a device but cannot map foreign memory. The attach lookup is the
-  future capability check: a later `CAP_IOMMU_SPACE` replaces the numeric ID
-  as authority without changing domains, maps, or the driver fast path. No
-  capability subsystem blocks v1.
+- **Device attachment is capability-gated.** `DEVICE_ATTACH` consumes a
+  live per-requester token from the ring block, then preserves the existing
+  exclusive-attachment check. `DEVICE_DETACH` is ring/domain scoped so
+  prospective token revocation cannot prevent cleanup.
 - **`pcid` owns assignment and device lifecycle.** It exclusively owns
   ECAM/configuration, identifies devices, grants BAR access by sharing
   device-backed ublocks, programs MSI/MSI-X, enables bus mastering only
@@ -343,7 +343,8 @@ the ring, so no command needs to return a newly allocated handle.
 // a = domain cookie; requires no devices and no mappings
 
 #define KIOMMU_DEVICE_ATTACH  3
-// a = domain cookie, b = IOMMU_PCI_ID(...), c = fault-event cookie
+// a = offset of {domain cookie, token offset/length, fault-event cookie}
+//     within this ring block
 
 #define KIOMMU_DEVICE_DETACH  4
 // a = domain cookie, b = IOMMU_PCI_ID(...)
@@ -605,16 +606,13 @@ remains valid when the platform physical-address geometry permits it.
 
 - **PCI config:** `pcid` alone owns ECAM and the PCI command register. No
   driver receives config-space frames or CF8/CFC port access. V1 uses the
-  temporary physical-device-memory mechanism described by the PCI
-  design; a future ECAM capability drops into the same boundary.
+  devmem grants described by the PCI and capability designs.
 - **BARs:** BAR ranges arrive as device-backed ublocks created by
   `SYS_VM_MAP_DEVICE` and shared in by `pcid`. They are flagged
-  never-DMA-mappable, so `KIOMMU_MAP_BLOCK` rejects them. A future
-  BAR-range capability replaces the temporary `pcid` share without
-  changing the mapping shape.
-- **MSI/MSI-X:** `pcid` obtains an opaque kernel-selected pair and programs
-  it; the IRQ scheme delivers events to the driver. A future IRQ capability
-  replaces the temporary claim/grant. VT-d interrupt remapping later changes
+  never-DMA-mappable, so `KIOMMU_MAP_BLOCK` rejects them.
+- **MSI/MSI-X:** `pcid` obtains an opaque kernel-selected pair plus a route
+  token and programs the device; the IRQ scheme verifies the token when the
+  driver binds. VT-d interrupt remapping later changes
   only how the opaque pair is composed.
 - **NVMe queues:** submission queues, completion queues, PRP-list pages, and
   bounce buffers are ordinary driver-owned ublocks mapped RW into the NVMe

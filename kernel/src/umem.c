@@ -212,8 +212,8 @@ uint64_t umem_size(struct process *p, uint64_t base) {
   return bytes;
 }
 
-uint64_t umem_map_device(struct process *p, uint64_t base, uint64_t len,
-                         uint32_t flags) {
+uint64_t umem_map_device_locked(struct process *p, uint64_t base, uint64_t len,
+                                uint32_t flags) {
   paging_flags_t kernel_flags;
   bool delegatable;
   if (!platform_mem_validate_device(base, len, flags, &kernel_flags,
@@ -226,8 +226,6 @@ uint64_t umem_map_device(struct process *p, uint64_t base, uint64_t len,
   if (!(flags & VM_DEVICE_FIRMWARE))
     device_flags |= PAGE_UC;
 
-  // TODO(capability): v1 deliberately applies no caller policy here.
-  umem_lock();
   llrb_pid_process_iter iter;
   llrb_pid_process_iter_begin(g_procs, &iter);
   struct process *q;
@@ -239,7 +237,6 @@ uint64_t umem_map_device(struct process *p, uint64_t base, uint64_t len,
       if (other->backing == UBLOCK_DEVICE && base < other->base + other->bytes &&
           other->base < end) {
         umem_proc_unlock(q);
-        umem_unlock();
         return SYSERR_EXIST;
       }
     }
@@ -259,7 +256,6 @@ uint64_t umem_map_device(struct process *p, uint64_t base, uint64_t len,
 
   ublock *b = calloc(1, sizeof(*b));
   if (b == nullptr) {
-    umem_unlock();
     return SYSERR_NOMEM;
   }
   b->base = base;
@@ -275,8 +271,15 @@ uint64_t umem_map_device(struct process *p, uint64_t base, uint64_t len,
   umem_proc_lock(p);
   vec_ublock_ptr_push(p->blocks, &b);
   umem_proc_unlock(p);
-  umem_unlock();
   return 0;
+}
+
+uint64_t umem_map_device(struct process *p, uint64_t base, uint64_t len,
+                         uint32_t flags) {
+  umem_lock();
+  uint64_t rc = umem_map_device_locked(p, base, len, flags);
+  umem_unlock();
+  return rc;
 }
 
 // Phase one of freeing a block: everything that needs g_umem. Caller

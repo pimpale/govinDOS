@@ -3,12 +3,14 @@
 #include <stdint.h>
 
 #include "channel_internal.h"
+#include "capability.h"
 #include "debug.h"
 #include "iommu_internal.h"
 #include "process.h"
 #include "spinlock.h"
 #include "stdlib/stdio.h"
 #include "stdlib/stdlib.h"
+#include "stdlib/string.h"
 #include "syscall.h"
 
 #include <gdosabi/kring_iommu.h>
@@ -131,7 +133,8 @@ static uint64_t device_attach(struct iommu_domain *d, uint64_t encoded,
   struct iommu_device_id id;
   if (!decode_id(encoded, &id))
     return SYSERR_INVAL;
-  // TODO(capability): replace the bare first-claim authorization here.
+  // The caller reached this only after KIOMMU_DEVICE_ATTACH verified the
+  // requester capability; this check preserves exclusive attachment.
   if (find_device(encoded, nullptr) != nullptr)
     return SYSERR_EXIST;
   if (g_ndevices == IOMMU_MAX_DEVICES)
@@ -303,8 +306,18 @@ uint64_t iommu_exec(struct thread *curr, struct ring *ring,
   case KIOMMU_DOMAIN_DESTROY:
     return domain_destroy(ring, sqe->a);
   case KIOMMU_DEVICE_ATTACH:
-    d = find_domain(ring, sqe->a);
-    return d != nullptr ? device_attach(d, sqe->b, sqe->c) : SYSERR_INVAL;
+    if (sqe->a > ring->block->bytes ||
+        sizeof(struct kiommu_attach_req) > ring->block->bytes - sqe->a)
+      return SYSERR_INVAL;
+    struct kiommu_attach_req req;
+    memcpy(&req, (const void *)(ring->block->base + sqe->a), sizeof(req));
+    d = find_domain(ring, req.domain);
+    if (d == nullptr) return SYSERR_INVAL;
+    grant *g;
+    uint64_t rc = cap_verify_ring_locked(ring, req.token_off, req.token_len,
+                                         KCAP_GRANT_IOMMU_DEV, &g);
+    return rc == 0 ? device_attach(d, cap_iommu_requester(g), req.fault_cookie)
+                   : rc;
   case KIOMMU_DEVICE_DETACH:
     d = find_domain(ring, sqe->a);
     return d != nullptr ? device_detach(d, sqe->b) : SYSERR_INVAL;

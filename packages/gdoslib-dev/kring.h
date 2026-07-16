@@ -26,7 +26,9 @@
 #include <stdint.h>
 
 #include <gdosabi/kring.h>
+#include <gdosabi/kring_cap.h>
 #include <gdosabi/kring_irq.h>
+#include <gdosabi/kring_iommu.h>
 
 struct kring {
   uint64_t base; // block base — the channel's name to the syscalls
@@ -42,6 +44,11 @@ struct kring {
 // kernel channel of `scheme` (KSCHEME_*). Returns 0 and fills *r, or a
 // SYSERR_* with nothing allocated.
 uint64_t kring_create(struct kring *r, int64_t scheme, uint64_t len);
+
+// Capability-channel convention: attach to an inherited userspace/kernel
+// endpoint when nonzero, otherwise create the default kernel cap scheme.
+uint64_t kring_cap_open(struct kring *r, uint64_t inherited_base,
+                        uint64_t len);
 
 // Adopt an existing kernel channel at `base` (the header is live: the
 // kernel wrote nslots at creation, and the user-owned indices are
@@ -79,12 +86,25 @@ uint64_t kring_wait_cqe(struct kring *r, struct kcqe *cqe);
 // replays pending level-state events into the freed slots.
 uint64_t kring_ack(struct kring *r);
 
+uint64_t kring_cap_subgrant(struct kring *r, const struct cap_token *parent,
+                            uint64_t p0, uint64_t p1, uint64_t p2,
+                            uint32_t present, struct cap_token *out);
+uint64_t kring_cap_revoke(struct kring *r, const struct cap_token *token);
+
 // IRQ command submission helpers. These return the doorbell result; the
 // command's result is the ordinary completion CQE (events may precede it).
-uint64_t kring_irq_claim(struct kring *r, uint64_t gsi, uint64_t cookie);
+uint64_t kring_irq_claim(struct kring *r, const struct cap_token *token,
+                         uint64_t cookie);
 uint64_t kring_irq_release(struct kring *r, uint64_t gsi);
 uint64_t kring_irq_ack(struct kring *r, uint64_t gsi, uint64_t seq);
-uint64_t kring_irq_msi(struct kring *r, uint64_t child_pid);
-uint64_t kring_irq_bind(struct kring *r, uint64_t route_id, uint64_t cookie);
+uint64_t kring_irq_msi(struct kring *r, const struct cap_token *parent,
+                       struct cap_token *out, uint64_t *address,
+                       uint32_t *data);
+uint64_t kring_irq_bind(struct kring *r, const struct cap_token *token,
+                        uint64_t cookie, uint32_t *route_id);
+
+uint64_t kring_iommu_attach(struct kring *r, uint64_t domain,
+                            const struct cap_token *token,
+                            uint64_t fault_cookie);
 
 #endif // kring_h_INCLUDED

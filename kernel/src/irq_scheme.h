@@ -23,6 +23,11 @@ void irq_deliver(uint8_t vector);
 // Reap one unbound MSI grant targeting p. Called under g_umem before block
 // teardown so a dead child cannot leave vector authority behind.
 struct process;
+struct irq_route;
 bool irq_reap_one_locked(struct process *p);
+
+// Capability parameter/liveness helpers. g_umem held by callers.
+struct irq_route *irq_route_for_gsi_locked(uint64_t gsi);
+uint32_t irq_route_id_locked(const struct irq_route *route);
 
 #endif // irq_scheme_h_INCLUDED

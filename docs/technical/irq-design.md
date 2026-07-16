@@ -1,6 +1,7 @@
 # IRQ design: userspace drivers, the irq scheme
 
-Status: **pin IRQs implemented 2026-07-11; MSI remains phase 2.** Companion to
+Status: **pin IRQs implemented 2026-07-11; MSI and capability authorization
+implemented 2026-07-16.** Companion to
 [ipc-process-design.md](ipc-process-design.md); this is the first of the
 "device schemes, where the IRQ handler posts the completion CQE" its §2
 promised, and it must obey that document's design law: bounded
@@ -57,11 +58,10 @@ dispatch branch), `packages/gdoslib-dev/kring.c` (driver-side wrappers).
   grants route binding to its driver child. The kernel still grows no PCI
   layer. This supersedes the earlier Redox-style driver-programs-device split
   now that [pci-design.md](pci-design.md) keeps ECAM out of drivers (§5).
-- **Claim policy is deferred behind explicit hooks.** Pin IRQ rings remain
-  temporarily unrestricted. MSI route binding uses a temporary direct-child
-  grant from `pcid`, and MSI allocation temporarily requires ownership of the
-  singleton devmem endpoint. Future `CAP_IRQ`/IRQ-control possession replaces
-  both checks; it is not a prerequisite for the MSI milestone.
+- **Claims and MSI binding are capability-gated.** `KIRQ_CLAIM` and
+  `KIRQ_BIND` verify concrete route tokens; `KIRQ_MSI` verifies a wildcard
+  parent token and returns a newly allocated route token. Release and ack are
+  scoped to an already-bound route on the ring.
 - **Affinity is deferred: everything routes to the BSP.** Also makes
   handler-side lock contention structurally nil in v1. A claim-time
   affinity argument slots in later without ABI change (the CQE and
@@ -119,11 +119,11 @@ ring — the `cookie` tells events apart). Ring creation is the ordinary
 
 | SQE | fields | effect |
 |---|---|---|
-| `KIRQ_CLAIM` | a = gsi, b = cookie | exclusive claim of a GSI for this ring. `SYSERR_EXIST` (claimed anywhere), `SYSERR_INVAL` (no such GSI), `SYSERR_PERM`, `SYSERR_NOMEM` (claim-count bound, below). On success the line is programmed (trigger/polarity from ACPI) and unmasked |
+| `KIRQ_CLAIM` | a = token offset, b = token length, c = cookie | verify a concrete pin-route token, claim it exclusively for this ring, program it, and unmask it |
 | `KIRQ_RELEASE` | a = gsi | unclaim: masks the line, frees the route. `SYSERR_INVAL` if not this ring's claim |
 | `KIRQ_ACK` | a = gsi, b = seq | "the device is serviced through `seq`": sets `acked = seq`, unmasks a level line, re-fires the event if raises slipped past `seq` (§3) |
-| `KIRQ_MSI` | a = driver child PID | (phase 2, `pcid`): allocate an MSI vector intended for that child; completion carries the opaque address and packed route-id/data result (§5) |
-| `KIRQ_BIND` | a = route id, b = cookie | (phase 2, driver): bind a route granted to this process to this ring; the future authorization hook checks `CAP_IRQ` instead |
+| `KIRQ_MSI` | a = parent-token offset, b = length, c = output offset | allocate an MSI route under the presented grant, write its token, and complete with opaque address plus packed route-id/data (§5) |
+| `KIRQ_BIND` | a = token offset, b = token length, c = cookie | verify and bind a concrete MSI route token; completion `a` carries the ring-scoped route id used by ACK/RELEASE |
 
 | CQE | fields | when |
 |---|---|---|
@@ -293,9 +293,9 @@ BARs (plain MMIO), vs MSI's single pair in PCI config space.
 
 Division of labor (userspace PCI management, still no kernel PCI layer):
 
-- **Kernel (`KIRQ_MSI`):** allocate a free device vector, bind it to
-  a route with no RTE, mark the route grant for `pcid`'s named direct child,
-  and return a route ID plus `(address, data)` programming pair. The pair is
+- **Kernel (`KIRQ_MSI`):** verify `pcid`'s parent token, allocate a free
+  device vector and route with no RTE, create a concrete child grant, and
+  return its token plus the `(address, data)` programming pair. The pair is
   **opaque to userspace** — the kernel composes it (destination, delivery mode,
   vector; someday the IOMMU-remapping format), which keeps affinity
   and hardening kernel-owned without ABI change. Vector choice is the
@@ -303,17 +303,13 @@ Division of labor (userspace PCI management, still no kernel PCI layer):
 - **`pcid`:** writes that pair into the MSI capability in ECAM or the MSI-X
   table in a temporarily mapped BAR, and controls masking/enabling. It does
   not receive interrupt events on the normal path.
-- **Driver (`KIRQ_BIND`):** binds the granted route ID to its IRQ ring and
+- **Driver (`KIRQ_BIND`):** binds the granted route token to its IRQ ring and
   cookie, then receives `KEV_IRQ` with the ordinary edge/count semantics. It
   never sees ECAM and need not know the programming pair.
 
-The exact packing of route ID and MSI data into the fixed 32-byte CQE is an
-ABI detail for phase 2; both are at most 32 bits on x86 and fit in `b`. The
-kernel records `{grantor pcid endpoint, target child PID, route generation}`
-so guessing a route ID fails. Later that record is a `CAP_IRQ`; the bind and
-delivery paths are otherwise unchanged. Interrupt remapping remains future
-kernel work behind the same opaque pair. None of this blocks the implemented
-pin-IRQ scheme.
+The route ID and MSI data remain packed into CQE `b`; the token, rather than
+the guessability of that ID or a target PID, authorizes binding. Interrupt
+remapping remains future kernel work behind the same opaque pair.
 
 ## 6. Hardware prerequisites (kernel-side, all bounded)
 

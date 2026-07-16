@@ -59,10 +59,9 @@
 #define SYS_PROC_KILL    15 // (pid)                     -> 0 (own descendant; subtree dies)
 #define SYS_PROC_REAP    16 // (pid)                     -> REAP_* | SYSERR_AGAIN (own dead child)
 
-// Map an existing, kernel-validated physical device range as a device-backed
-// ublock at its identity address. The base/length are page aligned; flags are
-// VM_DEVICE_* below. Success returns 0 (the block's name is `base`).
-#define SYS_VM_MAP_DEVICE 17 // (base, len, flags)        -> 0
+// Map the exact range named by a live GRANT_DEVMEM token as a device-backed
+// ublock. flags must be a subset of the grant flags. Success returns 0.
+#define SYS_VM_MAP_DEVICE 17 // (token_ptr, token_len, flags) -> 0
 #define SYS_VM_SIZE       18 // (base)                    -> block bytes
 
 #define SYS_MAX          19
@@ -94,6 +93,6 @@
 #define SYSERR_EXIST ((uint64_t) - 5)
 #define SYSERR_PERM  ((uint64_t) - 6)
 #define SYSERR_DEAD  ((uint64_t) - 7) // channel peer revoked/died (wakes a parked waiter)
-#define SYSERR_AGAIN ((uint64_t) - 8) // bounded step made no progress; retry
+#define SYSERR_AGAIN ((uint64_t) - 8) // operation incomplete or no slot; retry
 
 #endif // gdos_syscall_h_INCLUDED

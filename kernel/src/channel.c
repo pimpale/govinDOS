@@ -1,4 +1,5 @@
 #include "channel_internal.h"
+#include "capability.h"
 
 #include <stdatomic.h>
 #include <stdint.h>
@@ -140,6 +141,7 @@ static struct ring **tree_anchor(struct process *p) { return &p->tree_ch; }
 static struct ring **iommu_anchor(struct process *p) { return &p->iommu_ch; }
 
 static const struct scheme_ops g_schemes[] = {
+    {.id = KSCHEME_CAP, .exec = cap_exec},
     {.id = KSCHEME_SHARES,
      .replay = shares_replay,
      .anchor = shares_anchor},

@@ -12,12 +12,14 @@
 #define KSCHEME_IRQ ((int64_t)-4)
 
 // SQE ops.
-#define KIRQ_CLAIM   1 // a = GSI, b = event cookie
+#define KIRQ_CLAIM   1 // a = token offset, b = token length, c = event cookie
 #define KIRQ_RELEASE 2 // a = GSI (or MSI pseudo-gsi)
 #define KIRQ_ACK     3 // a = GSI (or MSI pseudo-gsi), b = serviced sequence
-#define KIRQ_MSI     4 // a = direct-child pid; completion a = MSI address,
-                       // b = packed route-id/data
-#define KIRQ_BIND    5 // a = granted route id, b = event cookie
+#define KIRQ_MSI     4 // a = parent token offset, b = parent token length,
+                       // c = child-token output offset; completion a = MSI
+                       // address, b = packed route-id/data
+#define KIRQ_BIND    5 // a = token offset, b = token length, c = event cookie;
+                       // completion a = route id
 
 #define KIRQ_MSI_PACK(route, data)                                           \
   (((uint64_t)(uint32_t)(route) << 32) | (uint32_t)(data))

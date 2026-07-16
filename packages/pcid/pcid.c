@@ -1,6 +1,6 @@
-// Trusted PCI configuration/lifecycle manager. V1 deliberately has no
-// capability policy yet; the separation is structural: only this process
-// maps ECAM in the supported boot graph, and drivers receive BAR blocks.
+// PCI configuration/lifecycle manager. Init delegates the hardware roots;
+// pcid narrows them to the firmware, ECAM, BAR, requester, and IRQ authority
+// needed by each operation or driver.
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -92,6 +92,7 @@ static uint32_t g_nfunctions;
 static const struct pcid_bootstrap *g_bootstrap;
 static struct kring g_tree;
 static struct kring g_irq_control;
+static struct kring g_cap_control;
 
 struct managed_driver {
   struct pci_function *function;
@@ -110,6 +111,14 @@ static uint64_t g_driver_generation;
 static uint64_t page_floor(uint64_t v) { return v & ~(PAGE_SIZE - 1); }
 static uint64_t page_ceil(uint64_t v) {
   return (v + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+}
+
+static uint64_t map_device(uint64_t base, uint64_t length, uint32_t flags) {
+  struct cap_token token;
+  uint64_t rc = kring_cap_subgrant(&g_cap_control, &g_bootstrap->cap_devmem,
+      base, length, flags, KCAP_PARAM_P0 | KCAP_PARAM_P1 | KCAP_PARAM_P2,
+      &token);
+  return rc == 0 ? sys_vm_map_device(&token, flags) : rc;
 }
 
 static bool checksum_zero(const void *ptr, uint64_t len) {
@@ -142,8 +151,8 @@ static bool map_firmware(uint64_t base, uint64_t length) {
     if (firmware_page_mapped(page))
       continue;
     if (g_nfw_pages == MAX_FW_PAGES ||
-        sys_vm_map_device(page, PAGE_SIZE,
-                          VM_DEVICE_READ | VM_DEVICE_FIRMWARE) != 0)
+        map_device(page, PAGE_SIZE,
+                   VM_DEVICE_READ | VM_DEVICE_FIRMWARE) != 0)
       return false;
     g_fw_pages[g_nfw_pages++] = page;
   }
@@ -387,8 +396,8 @@ static bool parse_mcfg(const struct acpi_mcfg *mcfg) {
       return false;
     uint64_t length = ((uint64_t)in[i].end_bus - in[i].start_bus + 1) << 20;
     if (in[i].base + length < in[i].base ||
-        sys_vm_map_device(in[i].base, length,
-                          VM_DEVICE_READ | VM_DEVICE_WRITE) != 0)
+        map_device(in[i].base, length,
+                   VM_DEVICE_READ | VM_DEVICE_WRITE) != 0)
       return false;
     g_allocs[g_nallocs++] = in[i];
   }
@@ -402,24 +411,10 @@ static struct pci_bar *bar_by_index(struct pci_function *f, uint8_t index) {
   return nullptr;
 }
 
-static bool allocate_msi(uint64_t child, uint64_t *address, uint32_t *data,
-                         uint32_t *route) {
-  if (kring_irq_msi(&g_irq_control, child) != 0)
-    return false;
-  for (;;) {
-    struct kcqe cqe;
-    if (kring_wait_cqe(&g_irq_control, &cqe) != 0)
-      return false;
-    kring_ack(&g_irq_control);
-    if (cqe.type != KIRQ_MSI)
-      continue;
-    if (cqe.status != 0)
-      return false;
-    *address = cqe.a;
-    *data = KIRQ_MSI_DATA(cqe.b);
-    *route = KIRQ_MSI_ROUTE(cqe.b);
-    return true;
-  }
+static bool allocate_msi(uint64_t *address, uint32_t *data,
+                         struct cap_token *route) {
+  return kring_irq_msi(&g_irq_control, &g_bootstrap->cap_irq, route,
+                       address, data) == 0;
 }
 
 static bool program_interrupt_masked(struct managed_driver *m,
@@ -460,8 +455,8 @@ static bool program_interrupt_masked(struct managed_driver *m,
   if (page >= m->bar_block &&
       page < m->bar_block + m->setup->bars[0].length)
     return false;
-  if (sys_vm_map_device(page, PAGE_SIZE,
-                        VM_DEVICE_READ | VM_DEVICE_WRITE) != 0)
+  if (map_device(page, PAGE_SIZE,
+                 VM_DEVICE_READ | VM_DEVICE_WRITE) != 0)
     return false;
   m->table_block = page;
   m->msix_entry = (volatile uint32_t *)entry_address;
@@ -584,8 +579,8 @@ static void prepare_nvme(struct pci_function *f) {
     print_hex(start);
     print("pcid: NVMe BAR0 length=");
     print_hex(length);
-    uint64_t rc = sys_vm_map_device(start, length,
-                                    VM_DEVICE_READ | VM_DEVICE_WRITE);
+    uint64_t rc = map_device(start, length,
+                             VM_DEVICE_READ | VM_DEVICE_WRITE);
     print("pcid: mapped NVMe BAR0 rc=");
     print_hex(rc);
     if (rc != 0 || g_bootstrap->driver_image == 0)
@@ -617,6 +612,12 @@ static void prepare_nvme(struct pci_function *f) {
         .bar_index = bar->index,
         .flags = VM_DEVICE_READ | VM_DEVICE_WRITE,
     };
+    if (kring_cap_subgrant(&g_cap_control, &g_bootstrap->cap_iommu,
+          f->requester_id, 0, 0, KCAP_PARAM_P0, &setup->iommu_token) != 0) {
+      sys_vm_free((uint64_t)service);
+      sys_vm_free((uint64_t)setup);
+      return;
+    }
 
     // Memory decoding is required for the child to initialize its disabled
     // register image. Bus mastering remains clear until IOMMU+IRQ readiness.
@@ -643,8 +644,8 @@ static void prepare_nvme(struct pci_function *f) {
     if (!wait_state(setup, PCI_DRIVER_IOMMU_READY))
       return;
     uint64_t msi_address;
-    uint32_t msi_data, route;
-    if (!allocate_msi(child, &msi_address, &msi_data, &route)) {
+    uint32_t msi_data;
+    if (!allocate_msi(&msi_address, &msi_data, &setup->irq_token)) {
       print("pcid: MSI allocation failed\n");
       sys_proc_kill(child);
       return;
@@ -654,7 +655,6 @@ static void prepare_nvme(struct pci_function *f) {
       sys_proc_kill(child);
       return;
     }
-    setup->irq_route = route;
     signal_state(setup, PCI_DRIVER_IRQ_GRANTED);
     if (!wait_state(setup, PCI_DRIVER_IRQ_READY))
       return;
@@ -715,6 +715,8 @@ void _start(uint64_t bootstrap_address) {
   if (g_bootstrap == nullptr || g_bootstrap->acpi_rsdp == 0)
     sys_exit();
   uint64_t rsdp_address = g_bootstrap->acpi_rsdp;
+  if (kring_cap_open(&g_cap_control, g_bootstrap->cap_channel, PAGE_SIZE) != 0)
+    sys_exit();
   print("pcid: starting, RSDP=");
   print_hex(rsdp_address);
   if (!map_firmware(rsdp_address, sizeof(struct acpi_rsdp))) {
