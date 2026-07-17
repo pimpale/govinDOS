@@ -3,19 +3,56 @@
 
 #include <stdint.h>
 
-struct kernel_timer;
-typedef struct kernel_timer *kernel_timer_ptr;
+// Timer values have exactly one owner: an endpoint's deadline tree. Once an
+// expiration cannot enter the CQ, it is transformed into a timer_event owned
+// by the endpoint's pending-event tree instead.
+typedef struct timer {
+  uint64_t id;
+  uint64_t deadline_ns;
+  uint64_t cookie;
+} timer;
 
-// The sequence makes simultaneous deadlines distinct and gives them stable
-// insertion order. It is assigned while holding the global timer lock.
-struct timer_deadline_key {
+typedef struct timer_event {
+  uint64_t id;
+  uint64_t cookie;
+} timer_event;
+
+struct timer_key {
   uint64_t deadline_ns;
   uint64_t sequence;
 };
 
-#define LLRB_NAME timer_deadline
-#define LLRB_KEY struct timer_deadline_key
-#define LLRB_VALUE kernel_timer_ptr
+struct ring;
+typedef struct ring *ring_ptr;
+
+// One owning timer tree per timer endpoint.
+#define LLRB_NAME timer
+#define LLRB_KEY struct timer_key
+#define LLRB_VALUE timer
+#include <llrb/llrb.h>
+#undef LLRB_VALUE
+#undef LLRB_KEY
+#undef LLRB_NAME
+
+// CQ-blocked expirations, ordered by their original deadline and arm order.
+#define LLRB_NAME timer_event
+#define LLRB_KEY struct timer_key
+#define LLRB_VALUE timer_event
+#include <llrb/llrb.h>
+#undef LLRB_VALUE
+#undef LLRB_KEY
+#undef LLRB_NAME
+
+// One borrowed ring entry per nonempty timer endpoint on a CPU. ring_id makes
+// identical endpoint deadlines distinct without ordering unrelated pointers.
+struct ring_deadline_key {
+  uint64_t deadline_ns;
+  uint64_t ring_id;
+};
+
+#define LLRB_NAME ring_deadline
+#define LLRB_KEY struct ring_deadline_key
+#define LLRB_VALUE ring_ptr
 #include <llrb/llrb.h>
 #undef LLRB_VALUE
 #undef LLRB_KEY

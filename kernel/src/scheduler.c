@@ -22,9 +22,10 @@ void scheduler_init(void) {
   for (size_t i = 0; i < g_cpu_state_table_len; i++) {
     struct scheduler *s = &g_cpu_state_table[i].scheduler;
     list_thread_ptr_new(&s->queue);
-    asserts(llrb_timer_deadline_new(&s->timers_armed),
-            "scheduler: timer deadline tree alloc failed");
+    asserts(llrb_ring_deadline_new(&s->timer_rings),
+            "scheduler: timer ring tree alloc failed");
     spinlock_init(&s->lock);
+    spinlock_init(&s->timer_lock);
     s->sched_rsp = 0;
     atomic_store_explicit(&s->idle, false, memory_order_relaxed);
   }

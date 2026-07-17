@@ -1,17 +1,17 @@
 #include "timer_queue.h"
 
-static int timer_deadline_compare(const struct timer_deadline_key *a,
-                                  const struct timer_deadline_key *b) {
+static int timer_compare(const struct timer_key *a,
+                         const struct timer_key *b) {
   if (a->deadline_ns != b->deadline_ns)
     return (a->deadline_ns > b->deadline_ns) -
            (a->deadline_ns < b->deadline_ns);
   return (a->sequence > b->sequence) - (a->sequence < b->sequence);
 }
 
-#define LLRB_NAME timer_deadline
-#define LLRB_KEY struct timer_deadline_key
-#define LLRB_VALUE kernel_timer_ptr
-#define LLRB_COMPARE(a, b) timer_deadline_compare((a), (b))
+#define LLRB_NAME timer
+#define LLRB_KEY struct timer_key
+#define LLRB_VALUE timer
+#define LLRB_COMPARE(a, b) timer_compare((a), (b))
 #include <llrb/llrb_impl.h>
 #undef LLRB_COMPARE
 #undef LLRB_VALUE

@@ -153,6 +153,7 @@ static const struct scheme_ops g_schemes[] = {
      .replay = irq_replay,
      .destroy = irq_endpoint_destroy},
     {.id = KSCHEME_TIMER,
+     .init = timer_endpoint_init,
      .exec = timer_exec,
      .replay = timer_replay,
      .destroy = timer_endpoint_destroy},
@@ -288,6 +289,15 @@ uint64_t channel_scheme_create(struct process *p, uint64_t base,
   ring->ops = ops;
   ring->block = b;
   ring->nslots = KRING_NSLOTS(b->order);
+  if (ops->init != nullptr) {
+    uint64_t init_status = ops->init(ring);
+    if (init_status != 0) {
+      free(ring);
+      umem_proc_unlock(p);
+      umem_unlock();
+      return init_status;
+    }
+  }
   // The kernel is the trusted producer: it owns the header from here on.
   // First tear a possible private-block waiter. p's list lock prevents a
   // new local waiter until b->ring is published below.

@@ -23,6 +23,10 @@
 // IRQs-off, so delivery normally lands in ring 3 or the scheduler idle path.
 #define VECTOR_TIMER 0xFB
 
+// Cross-CPU request to recompute a CPU's LAPIC shot after a remote operation
+// inserted a new earliest ring deadline.
+#define VECTOR_TIMER_REPROGRAM 0xF9
+
 // Length of one dispatch quantum. A thread that neither parks nor blocks
 // for this long is preempted as if it had called SYS_YIELD.
 #define SCHED_QUANTUM_US 10000
@@ -49,10 +53,11 @@ struct scheduler {
   _Atomic bool idle;
 
   // One local-APIC timer is multiplexed between this CPU's scheduling
-  // quantum and the absolute timers armed on it. The global timer lock is
-  // never held while scheduler.lock is held.
-  llrb_timer_deadline *timers_armed; // keyed by (deadline, sequence)
-  uint64_t quantum_deadline_ns;      // zero outside a dispatched quantum
+  // quantum and one earliest-deadline entry per assigned timer ring.
+  // timer_lock is never held while scheduler.lock is held.
+  struct spinlock timer_lock;
+  llrb_ring_deadline *timer_rings;
+  uint64_t quantum_deadline_ns; // zero outside a dispatched quantum
 };
 
 // One-time global init. Allocates each CPU's queue and initializes its

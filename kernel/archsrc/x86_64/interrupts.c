@@ -116,6 +116,12 @@ uint64_t interrupt_handler(struct trap_frame *tf, uint64_t vector,
     cull_if_killed(tf);
     irq_exit();
     return 0;
+  case VECTOR_TIMER_REPROGRAM:
+    x86_lapic_eoi();
+    timer_cpu_reprogram();
+    cull_if_killed(tf);
+    irq_exit();
+    return 0;
   case VECTOR_TIMER: {
     // One LAPIC shot multiplexes userspace absolute timers and the current
     // scheduling quantum. A timer-only expiry returns to the interrupted

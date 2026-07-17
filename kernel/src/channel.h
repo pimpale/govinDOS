@@ -34,6 +34,8 @@
 #include <gdosabi/kring_timer.h>
 #include <gdosabi/kring_tree.h>
 
+#include "timer_queue.h"
+
 // Kernel-channel endpoint. Lives on the ublock (b->ring); owner-only.
 // CQ publication (cq_count, CQ slots, the full-check) happens under
 // stripe(block->base). sq_head is g_umem-only: drains are its sole touchers.
@@ -41,6 +43,7 @@
 // their posts must stay atomic with level-state flips
 // (notified/death_notified) that live under g_umem.
 struct scheme_ops;
+struct cpu_state;
 
 struct ring {
   const struct scheme_ops *ops;
@@ -52,10 +55,16 @@ struct ring {
   // count are g_umem-only; each route's delivery state has its own lock.
   struct irq_route *irq_claims;
   uint32_t nclaims;
-  // Scheme -5 only. Both fields are protected by timer.c's global timer lock;
-  // the endpoint list bounds ID lookup and teardown by this ring's nslots.
-  struct kernel_timer *timers;
-  uint32_t timer_count;
+  // Scheme -5 only. The assigned CPU's timer lock protects these fields.
+  // Timers and pending expirations are values owned by their respective
+  // endpoint trees; the CPU tree contains only one borrowed ring pointer.
+  llrb_timer *timers;
+  llrb_timer_event *timer_pending;
+  struct cpu_state *timer_cpu;
+  struct ring_deadline_key timer_cpu_key;
+  uint64_t timer_sequence;
+  uint64_t timer_ring_id;
+  bool timer_indexed;
 };
 
 // ---------------------------------------------------------------------------

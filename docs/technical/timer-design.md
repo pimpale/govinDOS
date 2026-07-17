@@ -26,14 +26,23 @@ then apply a global atomic monotonic clamp to tolerate small cross-CPU skew.
 There is deliberately no userspace conversion page: `KTIMER_NOW` is the sole
 public read interface.
 
-Timers are assigned to the CPU executing `KTIMER_ARM_ABS` and kept in a per-CPU
-left-leaning red-black tree keyed by `(absolute deadline, insertion sequence)`.
-Arm, cancellation, and expiry removal are `O(log n)`, minimum lookup is
-allocation-free, and equal deadlines retain FIFO order. A global timer spinlock
-also protects a deadline-sorted, per-endpoint list capped at
-`min(ring slots, 1024)`. ID lookup, cancellation, and teardown are therefore
-fixed-bounded rather than proportional to total system timer count. Each CPU's
-one-shot LAPIC deadline is:
+Each timer endpoint owns a left-leaning red-black tree of timer values keyed by
+`(absolute deadline, per-ring insertion sequence)`. Equal deadlines therefore
+retain FIFO order within an endpoint. ID lookup and cancellation deliberately
+scan this tree linearly; an endpoint is capped at `min(ring slots, 1024)`, so
+the scan is bounded without maintaining a second owning index.
+
+Each endpoint is assigned to its creation CPU. That CPU owns a second LLRB
+containing one borrowed pointer per nonempty timer ring, keyed by
+`(the ring's earliest deadline, stable ring ID)`. Arming, cancelling, or
+expiring a timer updates the CPU entry only when that ring's minimum changes.
+Thus the CPU finds its globally earliest timer without duplicating timer
+ownership, and removing or eventually migrating a ring requires moving only
+one CPU-index entry. Waiter-following migration is not implemented yet.
+
+One timer spinlock per CPU protects the CPU ring index, the timer and pending
+trees of every endpoint assigned to that CPU, and the current quantum
+deadline. There is no global timer lock. Each CPU's one-shot LAPIC deadline is:
 
 ```
 min(current absolute quantum deadline, earliest armed timer deadline)
@@ -46,13 +55,18 @@ ring to wake without polling. Distant deadlines are handled by harmless early
 checkpoints when the 32-bit LAPIC count saturates.
 
 An interrupt processes at most 64 expirations. If more are simultaneously due,
-the still-due queue head schedules another near-immediate shot. This keeps IRQ
-work bounded independently of the number of timer endpoints in the system.
+the still-due ring minimum schedules another near-immediate shot. This keeps
+IRQ work bounded independently of the number of timer endpoints in the system.
+If the CQ is full, an expired timer value is transformed into a completion
+value owned by that endpoint's pending LLRB, ordered by the timer's original
+deadline and sequence. It no longer participates in hardware deadline
+selection.
 
-Cancellation from the timer's owning CPU reprograms immediately. Cross-CPU
-cancellation may leave the old earlier one-shot in place; its eventual
-interrupt observes the updated queue and is harmless. This avoids an IPI-based
-remote timer-reprogram protocol.
+Local changes reprogram the LAPIC immediately. If a remote arm creates a new
+earliest deadline, it sends a timer-reprogram IPI to the endpoint's assigned
+CPU so a sleeping CPU cannot miss it. Remote cancellation or destruction may
+leave an obsolete earlier one-shot in place; its eventual interrupt observes
+the updated hierarchy and is harmless.
 
 Userspace implements `clock_gettime(CLOCK_MONOTONIC)`, sleeps, and waitset
 helper threads over this scheme. Civil/realtime clock policy remains a future

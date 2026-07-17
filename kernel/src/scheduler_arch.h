@@ -14,4 +14,7 @@ void scheduler_arch_idle(void);
 // EOI — the iretq alone is what bounces the target out of hlt/wfi.
 void scheduler_arch_wake_cpu(uint64_t hw_id);
 
+// Ask a remote CPU to recompute its LAPIC timer from its local deadline tree.
+void scheduler_arch_reprogram_timer(uint64_t hw_id);
+
 #endif // scheduler_arch_h_INCLUDED

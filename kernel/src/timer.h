@@ -17,8 +17,10 @@ uint64_t timer_now_ns(void);
 void timer_cpu_dispatch(uint64_t quantum_ns);
 void timer_cpu_idle(void);
 bool timer_cpu_interrupt(void);
+void timer_cpu_reprogram(void);
 
 // Scheme -5 lifecycle (called by channel.c).
+uint64_t timer_endpoint_init(struct ring *ring);
 uint64_t timer_exec(struct thread *curr, struct ring *ring,
                     struct ksqe *sqe);
 void timer_replay(struct ring *ring);

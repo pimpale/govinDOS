@@ -18,6 +18,7 @@
 // non-null for the one-per-process schemes and returns their owner slot.
 struct scheme_ops {
   int64_t id;
+  uint64_t (*init)(struct ring *ring);
   uint64_t (*exec)(struct thread *curr, struct ring *ring,
                    struct ksqe *sqe);
   void (*replay)(struct ring *ring);
@@ -72,7 +73,8 @@ bool channel_post(struct ring *ring, uint64_t type, uint64_t a, uint64_t b,
                   uint64_t status);
 
 // IRQ/data-plane post: no g_umem and no stripe held. The caller supplies
-// lifetime pinning (an IRQ route lock); this takes the ring stripe.
+// lifetime pinning (an IRQ route lock or the timer endpoint's CPU lock); this
+// takes the ring stripe.
 bool channel_post_data(struct ring *ring, uint64_t type, uint64_t a,
                        uint64_t b, uint64_t status, uint32_t *index_out);
 
@@ -105,6 +107,7 @@ void irq_endpoint_destroy(struct ring *ring);
 // schemes/timer.c — scheme -5
 // ---------------------------------------------------------------------------
 
+uint64_t timer_endpoint_init(struct ring *ring);
 uint64_t timer_exec(struct thread *curr, struct ring *ring,
                     struct ksqe *sqe);
 void timer_replay(struct ring *ring);
