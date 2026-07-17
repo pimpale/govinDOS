@@ -7,6 +7,7 @@ metadata is the source of truth for build and runtime dependency order.
 ```text
 govindos/
 ├── .abuild                     # repository-local cross-toolchain policy
+├── abuild.env                  # shared interactive/Make abuild environment
 ├── apk.mk                      # APK repositories and root installation
 ├── Makefile                    # kernel, packaged userspace, EFI staging, QEMU
 ├── abi/gdosabi/                # shared kernel/userspace binary contract

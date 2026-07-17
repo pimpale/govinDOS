@@ -6,7 +6,6 @@ endif
 
 GDOS_ROOT := $(abspath $(GDOS_ROOT))
 GDOS_PACKAGE_ARCH := x86_64-govindos
-GDOS_TARGET_TRIPLET := x86_64-pc-windows-msvc
 
 APK ?= apk
 BUILDREPO ?= buildrepo
@@ -19,24 +18,11 @@ APK_KEYS_DIR ?= $(HOME)/.abuild
 BUILD_ROOT ?= $(GDOS_ROOT)/out/buildroot
 HOST_BUILD_ROOT ?= $(GDOS_ROOT)/out/host-buildroot
 SYSROOT ?= $(GDOS_ROOT)/out/sysroot
-APK_ROOT_ADAPTER := sh $(GDOS_ROOT)/tools/apk-root.sh
 
-# Abuild installs makedepends_host into CBUILDROOT. The root .abuild file puts
-# the prefixed clang/lld tools on PATH. BOOTSTRAP=no suppresses Alpine's
-# build-base target dependency because GovinDOS supplies its own SDK packages.
-ABUILD_FAKEROOT ?= fakeroot bash
-GDOS_ABUILD_ENV = \
-	CARCH=$(GDOS_PACKAGE_ARCH) \
-	CHOST=$(GDOS_TARGET_TRIPLET) \
-	CTARGET=$(GDOS_TARGET_TRIPLET) \
-	CLIBC=none CTARGET_LIBC=none \
-	CBUILDROOT=$(BUILD_ROOT) \
-	GDOS_HOST_BUILD_ROOT=$(HOST_BUILD_ROOT) \
-	GDOS_APK_KEYS_DIR=$(APK_KEYS_DIR) \
-	BOOTSTRAP=no \
-	FAKEROOT='$(ABUILD_FAKEROOT)' \
-	APK='$(APK_ROOT_ADAPTER)' \
-	SUDO_APK='$(APK_ROOT_ADAPTER)'
+# Run a command from the repository root in the same abuild environment used
+# interactively by bash, zsh, and fish users. The trailing && lets callers append
+# the command and arguments in their recipe.
+WITH_ABUILD_ENV = cd "$(GDOS_ROOT)" && . ./abuild.env &&
 
 APK_REPOSITORY_ARGS = --repository $(NATIVE_REPOSITORY) \
 	$(if $(wildcard $(PORTS_INDEX)),--repository $(PORTS_REPOSITORY))

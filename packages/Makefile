@@ -9,7 +9,8 @@ REPOSITORY_STAMP := $(STAMPS)/repository-packages
 # Buildrepo considers an existing versioned APK current. First-party recipes
 # build live monorepo source, so any source or toolchain change invalidates the
 # small native repository as a unit.
-PACKAGE_INPUTS := Makefile $(GDOS_ROOT)/.abuild $(GDOS_ROOT)/apk.mk \
+PACKAGE_INPUTS := Makefile $(GDOS_ROOT)/.abuild $(GDOS_ROOT)/abuild.env \
+	$(GDOS_ROOT)/apk.mk \
 	$(GDOS_ROOT)/tools/apk-root.sh \
 	$(shell find $(GDOS_ROOT)/toolchain -type f) \
 	$(shell find . -mindepth 2 -type f \
@@ -26,7 +27,7 @@ $(REPOSITORY_STAMP): $(PACKAGE_INPUTS)
 	mkdir -p $(STAMPS)
 	$(call apk_initialize_root,$(HOST_BUILD_ROOT),x86_64)
 	$(call apk_initialize_root,$(BUILD_ROOT),$(GDOS_PACKAGE_ARCH))
-	$(GDOS_ABUILD_ENV) $(BUILDREPO) \
+	$(WITH_ABUILD_ENV) $(BUILDREPO) \
 		-a $(GDOS_ROOT) -d $(ABUILD_REPODEST) -p packages
 	touch $@
 

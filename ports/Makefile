@@ -6,7 +6,8 @@ include $(GDOS_ROOT)/apk.mk
 STAMPS := $(GDOS_ROOT)/out/stamps
 REPOSITORY_STAMP := $(STAMPS)/repository-ports
 PORT_RECIPES := $(wildcard */APKBUILD)
-PORT_INPUTS := Makefile $(GDOS_ROOT)/.abuild $(GDOS_ROOT)/apk.mk \
+PORT_INPUTS := Makefile $(GDOS_ROOT)/.abuild $(GDOS_ROOT)/abuild.env \
+	$(GDOS_ROOT)/apk.mk \
 	$(GDOS_ROOT)/tools/apk-root.sh \
 	$(shell find $(GDOS_ROOT)/toolchain -type f) \
 	$(shell find . -mindepth 2 -type f \
@@ -25,7 +26,7 @@ $(REPOSITORY_STAMP): $(PORT_INPUTS)
 	mkdir -p $(STAMPS)
 	$(call apk_initialize_root,$(HOST_BUILD_ROOT),x86_64)
 	$(call apk_initialize_root,$(BUILD_ROOT),$(GDOS_PACKAGE_ARCH))
-	$(GDOS_ABUILD_ENV) $(BUILDREPO) \
+	$(WITH_ABUILD_ENV) $(BUILDREPO) \
 		-a $(GDOS_ROOT) -d $(ABUILD_REPODEST) -p ports
 	touch $@
 endif

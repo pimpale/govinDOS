@@ -156,6 +156,11 @@ in the build environment. Abuild selects those tools through its normal
 `x86_64-pc-windows-msvc` backend to emit PE/COFF; `x86_64-govindos` remains the
 APK package architecture.
 
+`abuild.env` supplies the Arch-host APK adapter and then loads `.abuild`. It uses
+the `export NAME=value` and `.` forms shared by bash, zsh, fish, and POSIX
+shells. `apk.mk` loads this same file in the recipe shell before invoking
+buildrepo, so interactive and Make-driven builds have one environment definition.
+
 Package Makefiles use standard build variables rather than knowing the Clang
 target or linker command line. Each Makefile contains its own ordinary object,
 link, dependency-file, clean, and `DESTDIR` installation rules.
@@ -202,10 +207,10 @@ make compdb                  # regenerate compile_commands.json
 make cleanall
 ```
 
-For a direct recipe build against the installed SDK, provide the aports root so
-abuild loads `.abuild`:
+For a direct dependency-aware recipe build, load the same repository environment
+used by Make and invoke abuild. The `.` spelling works in bash, zsh, and fish:
 
 ```sh
-APORTSDIR="$PWD" CBUILDROOT="$PWD/out/sysroot" \
-    abuild -C packages/tests build
+. ./abuild.env
+abuild -C packages/tests -P "$PWD/out/repository" -f -r
 ```
