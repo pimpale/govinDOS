@@ -1,6 +1,4 @@
-U := ../../userspace
-SYSROOT_STAGE := sdk
-include $(U)/build.mk
+.DEFAULT_GOAL := all
 
 CFLAGS += \
 	-I./source \
@@ -22,20 +20,25 @@ C_SOURCES := \
 	vendor/printf/printf.c
 C_OBJECTS := $(patsubst %.c,out/%.c.o,$(C_SOURCES))
 
-.PHONY: all install
-all: out/c.a
+.PHONY: all install clean
+all: out/c.lib
 
-out/c.a: $(C_OBJECTS)
-	$(AR) rcs $@ $^
+out/%.c.o: %.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -MF $@.d -c -o $@ $<
 
-install: out/c.a
+out/c.lib: $(C_OBJECTS)
+	$(AR) $(ARFLAGS) $@ $^
+
+install: out/c.lib
 	install -d $(DESTDIR)/usr/include $(DESTDIR)/usr/include/printf \
 		$(DESTDIR)/usr/lib
 	install -m644 $(filter source/%.h,$(C_PUBLIC_HEADERS)) \
 		$(DESTDIR)/usr/include/
 	install -m644 vendor/printf/printf.h $(DESTDIR)/usr/include/printf/
-	install -m644 out/c.a $(DESTDIR)/usr/lib/c.a
+	install -m644 out/c.lib $(DESTDIR)/usr/lib/c.lib
 
-PKG_NAME := gdos-libc-dev
-PKG_INPUTS := out/c.a $(C_PUBLIC_HEADERS)
-include $(GDOS_ROOT)/mk/package.mk
+clean:
+	rm -rf out
+
+-include $(C_OBJECTS:%=%.d)

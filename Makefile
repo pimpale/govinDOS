@@ -1,18 +1,30 @@
-# Top-level build: builds the kernel, asks the userspace package graph to
-# assemble out/image-root, stages the EFI tree in out/root, and can boot the
-# result in qemu (`make runkernel`).
+# Top-level build: publishes the native APK repository, installs the development
+# and runtime worlds, stages the EFI tree, and can boot it with `make runkernel`.
 
-.PHONY: all kernel userspace clean cleanall runkernel compdb
+.PHONY: all kernel clean cleanall runkernel compdb
 
+GDOS_ROOT := $(CURDIR)
+include apk.mk
+
+OUT := $(GDOS_ROOT)/out
 COMPDB ?= compile_commands.json
+IMAGE ?= development
+IMAGE_PROFILE := $(GDOS_ROOT)/images/$(IMAGE).packages
+IMAGE_PACKAGES = $(shell sed -e 's/#.*//' -e '/^[[:space:]]*$$/d' $(IMAGE_PROFILE))
 
-all: kernel userspace
-	rm -rf out/root
-	mkdir -p out out/root
-	cp -rT efi out/efi
-	cp -a out/image-root/. out/root/
-	mkdir -p out/root/EFI/BOOT out/root/boot
-	cp kernel/out/kernel.efi out/root/EFI/BOOT/BOOTX64.efi
+all: kernel
+	$(MAKE) -C packages
+	$(call apk_install_root,$(SYSROOT),gdoslib-dev)
+	$(call apk_install_root,$(OUT)/image-root,$(IMAGE_PACKAGES))
+	$(APK) --root $(OUT)/image-root --arch $(GDOS_PACKAGE_ARCH) \
+		query --format yaml --installed --fields name,version '*' \
+		> $(OUT)/image-root.packages
+	rm -rf $(OUT)/root
+	mkdir -p $(OUT) $(OUT)/root
+	cp -rT efi $(OUT)/efi
+	cp -a $(OUT)/image-root/. $(OUT)/root/
+	mkdir -p $(OUT)/root/EFI/BOOT $(OUT)/root/boot
+	cp kernel/out/kernel.efi $(OUT)/root/EFI/BOOT/BOOTX64.efi
 	# The package-selected filesystem is merged onto the ESP for now. It moves
 	# to its own partition once the filesystem service is persistent.
 
@@ -20,17 +32,12 @@ all: kernel userspace
 kernel:
 	$(MAKE) -C kernel
 
-userspace:
-	$(MAKE) -C userspace
-
 # Optional clangd database refresh. Bear observes the real compiler commands,
-# including the generated sysroot path and target ABI flags. Clean only the
-# compile-producing subprojects so recursive make does not inherit `-B` and
-# rebuild every sysroot stage once per component.
+# including the target ABI flags supplied by the repository-local .abuild.
 compdb:
 	$(MAKE) -C kernel clean
-	$(MAKE) -C userspace clean
-	bear --output $(COMPDB) -- $(MAKE) kernel userspace
+	$(MAKE) -C packages clean
+	bear --output $(COMPDB) -- $(MAKE)
 
 # Add -d int to the qemu invocation to trace interrupts.
 runkernel: all out/nvme.img
@@ -58,4 +65,5 @@ clean:
 
 cleanall: clean
 	$(MAKE) -C kernel clean
-	$(MAKE) -C userspace clean
+	$(MAKE) -C packages clean
+	$(MAKE) -C ports clean

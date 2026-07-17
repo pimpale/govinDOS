@@ -7,6 +7,7 @@ url="https://github.com/pimpale/govindos"
 arch="noarch"
 license="LicenseRef-GovindOS"
 depends="gdos-abi"
+makedepends_host="gdos-abi"
 options="!check !strip !tracedeps"
 source=""
 

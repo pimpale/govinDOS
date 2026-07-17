@@ -6,6 +6,7 @@ pkgdesc="GovindOS NVMe driver service"
 url="https://github.com/pimpale/govindos"
 arch="x86_64-govindos"
 license="LicenseRef-GovindOS"
+makedepends_host="gdoslib-dev"
 options="!check !strip !tracedeps !archcheck !usrmerge"
 source=""
 

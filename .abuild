@@ -1,0 +1,26 @@
+# Repository-local abuild target configuration. buildrepo exports APORTSDIR, so
+# abuild sources this file after its system and user configuration.
+
+: "${CBUILDROOT:=$APORTSDIR/out/buildroot}"
+
+export CARCH=x86_64-govindos
+export CHOST=x86_64-pc-windows-msvc
+export CTARGET=x86_64-pc-windows-msvc
+export CLIBC=none
+export CTARGET_LIBC=none
+
+gdos_toolchain_bin="$APORTSDIR/toolchain/bin"
+export PATH="$gdos_toolchain_bin:$PATH"
+export AR="$gdos_toolchain_bin/x86_64-pc-windows-msvc-ar"
+export RANLIB="$gdos_toolchain_bin/x86_64-pc-windows-msvc-ranlib"
+export AS=nasm
+
+export SYSROOT="$CBUILDROOT"
+export CPPFLAGS="-I$SYSROOT/usr/include"
+export CFLAGS="-std=c23 -ffreestanding -fno-builtin -mno-red-zone -mgeneral-regs-only -fno-stack-protector -O1"
+export CXXFLAGS="-ffreestanding -fno-builtin -mno-red-zone -mgeneral-regs-only -fno-stack-protector -O1"
+export LDFLAGS="-nostdlib -L$SYSROOT/usr/lib -Wl,/subsystem:native,/entry:_start,/nodefaultlib,/fixed:no,/dynamicbase,/debug:none"
+export ARFLAGS=rcs
+export ASFLAGS="-f win64"
+
+unset gdos_toolchain_bin

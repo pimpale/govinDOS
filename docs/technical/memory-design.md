@@ -365,7 +365,7 @@ per-AS lock, `as_table_count`), umem.c/h (ublocks and the process registry),
 reaper.c/h (thread/process teardown, AS drain), ring.c
 (`ring_destroy`), stacks.c (`stacks_free_kernel`), interrupts.c (ring-3
 faults kill the process). Boot self-tests in init.c cover split→merge
-shape restoration and two-process share/protect/revoke; userspace/hello.c
+shape restoration and two-process share/protect/revoke; packages/tests/tests.c
 covers the syscall surface (`SYS_VM_PROTECT`/`SHARE`/`UNSHARE` are 11–13).
 
 The order the work landed in, each step keeping the userspace test green:

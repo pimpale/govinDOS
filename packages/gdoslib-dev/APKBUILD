@@ -7,6 +7,7 @@ url="https://github.com/pimpale/govindos"
 arch="x86_64-govindos"
 license="LicenseRef-GovindOS"
 depends="gdos-libc-dev"
+makedepends_host="gdos-libc-dev"
 options="!check !strip !tracedeps !archcheck"
 source=""
 

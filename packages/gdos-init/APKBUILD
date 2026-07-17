@@ -7,6 +7,7 @@ url="https://github.com/pimpale/govindos"
 arch="x86_64-govindos"
 license="LicenseRef-GovindOS"
 depends="nvmed pcid tests"
+makedepends_host="gdoslib-dev nvmed pcid tests"
 options="!check !strip !tracedeps !archcheck"
 source=""
 

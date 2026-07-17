@@ -160,8 +160,8 @@ directly.
 
 1. **Move init to the ESP.** Stub reads `\boot\init.exe`; delete
    `user_pe_blob.asm` and `build_userspace` from the kernel build.
-   Userspace becomes a sibling build (own Makefile under `userspace/`)
-   staged into `bin/root/boot/` by the top-level Makefile. Iterating on
+   Userspace becomes a sibling package build (now under `packages/`)
+   staged into the image by the top-level Makefile. Iterating on
    init no longer relinks the kernel.
 2. **Bootinfo block + entry ABI** (§3). RSDP capture unblocks future
    userspace ACPI work; do it in the same pass as the file read since
