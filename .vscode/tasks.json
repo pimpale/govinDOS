@@ -1,0 +1,33 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "GovinDOS: Build",
+            "type": "process",
+            "command": "make",
+            "problemMatcher": "$gcc",
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            }
+        },
+        {
+            "label": "GovinDOS: Refresh compilation database",
+            "type": "process",
+            "command": "make",
+            "args": [
+                "compdb"
+            ],
+            "problemMatcher": "$gcc"
+        },
+        {
+            "label": "GovinDOS: Run in QEMU",
+            "type": "process",
+            "command": "make",
+            "args": [
+                "runkernel"
+            ],
+            "problemMatcher": "$gcc"
+        }
+    ]
+}

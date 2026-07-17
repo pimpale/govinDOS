@@ -22,7 +22,7 @@ govindos/
 │   ├── gdoslib-dev/
 │   ├── nvmed/  pcid/  tests/
 │   ├── gdos-init/
-│   └── base-files/  gdos-base/
+│   └── base-files/  gdos-base/  all/
 ├── toolchain/bin/              # CHOST-prefixed LLVM wrappers
 ├── tools/apk-root.sh           # Arch-host APK database adapter
 └── ports/

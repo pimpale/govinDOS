@@ -1,12 +1,29 @@
 {
     "configurations": [
         {
-            "name": "Linux",
-            "compilerPath": "/usr/bin/clang-22",
+            "name": "GovinDOS",
+            "compilerPath": "${workspaceFolder}/toolchain/bin/x86_64-pc-windows-msvc-cc",
+            "compilerArgs": [
+                "--sysroot=${workspaceFolder}/out/sysroot"
+            ],
             "cStandard": "c23",
             "cppStandard": "c++17",
             "intelliSenseMode": "windows-clang-x64",
-            "compileCommands": "${workspaceFolder}/compile_commands.json"
+            "compileCommands": "${workspaceFolder}/compile_commands.json",
+            "includePath": [
+                "${workspaceFolder}/kernel/src",
+                "${workspaceFolder}/kernel/archsrc/x86_64",
+                "${workspaceFolder}/kernel/vendor",
+                "${workspaceFolder}/abi",
+                "${workspaceFolder}/out/sysroot/usr/include"
+            ],
+            "browse": {
+                "path": [
+                    "${workspaceFolder}",
+                    "${workspaceFolder}/out/sysroot/usr/include"
+                ],
+                "limitSymbolsToIncludedHeaders": true
+            }
         }
     ],
     "version": 4

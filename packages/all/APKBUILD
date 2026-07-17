@@ -1,0 +1,16 @@
+# Maintainer: gpi <gpimpale29@gmail.com>
+pkgname=all
+pkgver=0.1.0
+pkgrel=0
+pkgdesc="GovindOS complete first-party package set"
+url="https://github.com/pimpale/govindos"
+arch="noarch"
+license="LicenseRef-GovindOS"
+depends="gdos-base gdoslib-dev"
+makedepends_host="$depends"
+options="!check !strip !tracedeps"
+source=""
+
+package() {
+	make -C "$startdir" install DESTDIR="$pkgdir"
+}

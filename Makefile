@@ -14,7 +14,7 @@ IMAGE_PACKAGES = $(shell sed -e 's/#.*//' -e '/^[[:space:]]*$$/d' $(IMAGE_PROFIL
 
 all: kernel
 	$(MAKE) -C packages
-	$(call apk_install_root,$(SYSROOT),gdoslib-dev)
+	$(call apk_install_root,$(SYSROOT),all)
 	$(call apk_install_root,$(OUT)/image-root,$(IMAGE_PACKAGES))
 	$(APK) --root $(OUT)/image-root --arch $(GDOS_PACKAGE_ARCH) \
 		query --format yaml --installed --fields name,version '*' \
@@ -38,6 +38,10 @@ compdb:
 	$(MAKE) -C kernel clean
 	$(MAKE) -C packages clean
 	bear --output $(COMPDB) -- $(MAKE)
+	# Package compilation happens against abuild's transient build root. The
+	# completed build installs the same full first-party closure into the stable
+	# SDK root, which must remain available to editors after abuild runs undeps.
+	sed -i 's|$(BUILD_ROOT)|$(SYSROOT)|g' $(COMPDB)
 
 # Add -d int to the qemu invocation to trace interrupts.
 runkernel: all out/nvme.img

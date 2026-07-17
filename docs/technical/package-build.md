@@ -54,7 +54,9 @@ For example, `nvmed` has `makedepends_host="gdoslib-dev"` but no runtime
 library dependency because it is statically linked. `gdos-init` lists `nvmed`,
 `pcid`, and `tests` as both runtime dependencies and target build inputs because
 it embeds their APK-installed executables. `gdos-base` is an empty metapackage
-whose dependency closure defines the runtime world.
+whose dependency closure defines the runtime world. `all` is an empty
+metapackage combining `gdos-base` and `gdoslib-dev`; installing it selects every
+first-party package without selecting the ports repository.
 
 In cross mode, abuild also analyzes a recipe's `depends` while constructing its
 build environment. Target-only dependencies of `noarch` packages are therefore
@@ -69,6 +71,7 @@ gdos-abi -> gdos-syscalls -> gdos-libc-dev -> gdoslib-dev
                                                     ├──> pcid ───┼──> gdos-init
                                                     └──> tests ──┘         │
 base-files ────────────────────────────────────────────────────────> gdos-base
+gdos-base + gdoslib-dev ──────────────────────────────────────────> all
 ```
 
 ## Package contract
