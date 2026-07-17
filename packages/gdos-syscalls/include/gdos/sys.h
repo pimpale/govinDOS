@@ -4,6 +4,7 @@
 
 #include <gdosabi/syscall.h>
 #include <gdosabi/kring_cap.h>
+#include <gdosabi/thread.h>
 
 // SYSCALL ABI (gdos/syscall.h): rax = nr, args in r10/rdx/r8/r9, result
 // in rax. rcx and r11 are clobbered by the instruction itself; the
@@ -48,13 +49,19 @@ static inline uint64_t sys_debug_write(const void *buf, uint64_t len) {
   return sys2(SYS_DEBUG_WRITE, (uint64_t)buf, len);
 }
 
-[[noreturn]] static inline void sys_exit(void) {
-  sys0(SYS_EXIT);
+[[noreturn]] static inline void sys_thread_exit(void) {
+  sys0(SYS_THREAD_EXIT);
+  __builtin_unreachable();
+}
+
+[[noreturn]] static inline void sys_proc_exit(uint64_t status) {
+  sys1(SYS_PROC_EXIT, status);
   __builtin_unreachable();
 }
 
 static inline void sys_yield(void) { sys0(SYS_YIELD); }
 static inline uint64_t sys_getpid(void) { return sys0(SYS_GETPID); }
+static inline uint64_t sys_gettid(void) { return sys0(SYS_GETTID); }
 
 // Blocks are the allocation unit (power-of-two pages); returns the base.
 static inline uint64_t sys_vm_alloc(uint64_t len, uint64_t prot) {
@@ -107,9 +114,13 @@ static inline uint64_t sys_block_wait(const volatile void *addr,
 }
 
 static inline uint64_t sys_proc_create(void) { return sys0(SYS_PROC_CREATE); }
-static inline uint64_t sys_thread_spawn(uint64_t pid, uint64_t entry,
-                                        uint64_t stack_top, uint64_t arg) {
-  return sys4(SYS_THREAD_SPAWN, pid, entry, stack_top, arg);
+static inline uint64_t
+sys_thread_spawn(uint64_t pid, const struct gdos_thread_start *start) {
+  return sys3(SYS_THREAD_SPAWN, pid, (uint64_t)start, sizeof(*start));
+}
+static inline uint64_t sys_thread_bases_set(uint64_t fs_base,
+                                            uint64_t gs_base) {
+  return sys2(SYS_THREAD_BASES_SET, fs_base, gs_base);
 }
 static inline uint64_t sys_proc_kill(uint64_t pid) {
   return sys1(SYS_PROC_KILL, pid);

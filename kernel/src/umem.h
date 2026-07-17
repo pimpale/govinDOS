@@ -93,6 +93,9 @@ struct ublock {
   // like owner/sharers; ring *internals* are control-plane state (g_umem).
   struct ring *ring;
   uint32_t dma_pins; // g_umem: IOMMU leaves retaining this allocation
+  // A live thread-completion registration pins a private event block's
+  // identity and writable mapping until the scheduler publishes completion.
+  _Atomic uint32_t thread_pins;
 };
 
 // One-time init (lock + registry). Call before the first user process.

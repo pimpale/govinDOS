@@ -20,7 +20,7 @@
 // parent's reap loop (§4).
 
 #define SYS_DEBUG_WRITE 0 // (ptr, len)             -> bytes written
-#define SYS_EXIT        1 // ()                     -> never returns
+#define SYS_THREAD_EXIT 1 // ()                     -> never returns (current thread)
 #define SYS_YIELD       2 // ()                     -> 0
 #define SYS_RESERVED_3  3 // retired GETUID slot; kept reserved for ABI stability
 #define SYS_GETPID      4 // ()                     -> pid
@@ -55,7 +55,7 @@
 // kill, and the parent-driven reap loop that replaces all deferred
 // kernel teardown.
 #define SYS_PROC_CREATE  13 // ()                        -> pid (embryo)
-#define SYS_THREAD_SPAWN 14 // (pid, entry, stack, arg)  -> tid (pid: self or own embryo)
+#define SYS_THREAD_SPAWN 14 // (pid, start_ptr, start_size) -> tid
 #define SYS_PROC_KILL    15 // (pid)                     -> 0 (own descendant; subtree dies)
 #define SYS_PROC_REAP    16 // (pid)                     -> REAP_* | SYSERR_AGAIN (own dead child)
 
@@ -63,8 +63,11 @@
 // ublock. flags must be a subset of the grant flags. Success returns 0.
 #define SYS_VM_MAP_DEVICE 17 // (token_ptr, token_len, flags) -> 0
 #define SYS_VM_SIZE       18 // (base)                    -> block bytes
+#define SYS_THREAD_BASES_SET 19 // (fsbase, gsbase)         -> 0
+#define SYS_GETTID        20 // ()                          -> current tid
+#define SYS_PROC_EXIT     21 // (status)                    -> never returns
 
-#define SYS_MAX          19
+#define SYS_MAX          22
 
 // SYS_PROC_REAP results: one more bounded step done / the subtree is
 // fully gone. SYSERR_AGAIN means culling/drain hasn't caught up — call

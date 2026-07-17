@@ -25,6 +25,12 @@ struct pe_resource {
   uint64_t prot;
 };
 
+// Allocate and initialize the current process's one-module PE TLS runtime
+// (minimal TEB prefix, TLS vector slot zero, and a copy of the image's static
+// TLS template). `image_base` names an already relocated in-memory PE image.
+// Returns the GSBASE to place in gdos_thread_start, or zero on failure.
+uint64_t pe_tls_create(uint64_t image_base);
+
 // As pe_spawn, but establishes read/write views of parent-owned blocks in the
 // embryo before its first thread can run.
 uint64_t pe_spawn_resources(const uint8_t *image, uint64_t len, uint64_t arg,

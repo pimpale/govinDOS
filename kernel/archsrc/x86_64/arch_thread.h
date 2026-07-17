@@ -17,16 +17,16 @@ struct arch_thread {
   // resume_stack below.
   uint64_t kernel_rsp;
 
-  // x87/SSE state (FXSAVE64 layout, fixed 512 bytes, 16-byte aligned —
-  // the TCB is page-granular from the buddy allocator, so the member
-  // alignment is honored). Saved eagerly by arch_uthread_save_frame and
-  // restored by uthread_resume_prepare: the kernel itself is built
-  // -mgeneral-regs-only and cannot dirty FPU state, so the park/resume
-  // boundary is the only place user FPU state can change hands. With
-  // preemption landing at arbitrary user instructions, every register in
-  // here is live — no ABI carve-out applies. AVX (XSAVE) is a future
-  // upgrade; until then userspace must not use YMM+ state.
-  alignas(16) uint8_t fxsave_area[512];
+  // Eager standard-format XSAVE state. The allocation is dynamically sized
+  // from CPUID.0D and the usable address is 64-byte aligned as XSAVE requires.
+  // The kernel is -mgeneral-regs-only, so only user execution can dirty it.
+  void *xsave_allocation;
+  void *xsave_area;
+
+  // Both user TLS bases are architectural thread state. ELF/SysV runtimes
+  // conventionally use FS; PE/Win64 runtimes conventionally use GS.
+  uint64_t user_fs_base;
+  uint64_t user_gs_base;
 
   // --- user threads only (kernel threads leave these zeroed) ---
 
@@ -42,5 +42,11 @@ struct arch_thread {
   // holds state across a context switch.
   alignas(16) uint8_t resume_stack[512];
 };
+
+struct thread;
+
+void arch_thread_destroy(struct thread *t);
+uint64_t arch_uthread_set_bases(struct thread *t, uint64_t fs_base,
+                                uint64_t gs_base);
 
 #endif // arch_thread_h_INCLUDED

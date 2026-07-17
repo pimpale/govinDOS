@@ -101,6 +101,15 @@ uint64_t irq_exec(struct thread *curr, struct ring *ring,
 void irq_replay(struct ring *ring);
 void irq_endpoint_destroy(struct ring *ring);
 
+// ---------------------------------------------------------------------------
+// schemes/timer.c — scheme -5
+// ---------------------------------------------------------------------------
+
+uint64_t timer_exec(struct thread *curr, struct ring *ring,
+                    struct ksqe *sqe);
+void timer_replay(struct ring *ring);
+void timer_endpoint_destroy(struct ring *ring);
+
 // iommu.c — scheme -6
 uint64_t iommu_exec(struct thread *curr, struct ring *ring,
                     struct ksqe *sqe);

@@ -13,6 +13,8 @@
 #include "thread.h"
 #include "uaccess.h"
 
+#include <gdosabi/thread.h>
+
 // Core channel plumbing: rings, wakes, the data-plane syscalls, and
 // teardown. Per-scheme logic lives in schemes/{shares,tree,irq}.c; shared
 // internals in channel_internal.h.
@@ -150,6 +152,10 @@ static const struct scheme_ops g_schemes[] = {
      .exec = irq_exec,
      .replay = irq_replay,
      .destroy = irq_endpoint_destroy},
+    {.id = KSCHEME_TIMER,
+     .exec = timer_exec,
+     .replay = timer_replay,
+     .destroy = timer_endpoint_destroy},
     {.id = KSCHEME_IOMMU,
      .exec = iommu_exec,
      .replay = iommu_replay,
@@ -258,6 +264,7 @@ uint64_t channel_scheme_create(struct process *p, uint64_t base,
   umem_proc_lock(p);
   ublock *b = umem_owned_locked(p, base);
   if (b == nullptr || b->backing != UBLOCK_RAM || b->ring != nullptr ||
+      atomic_load(&b->thread_pins) != 0 ||
       vec_share_edge_len(b->sharers) != 0) {
     umem_proc_unlock(p);
     umem_unlock();
@@ -443,4 +450,19 @@ void channel_block_torn(ublock *b, bool destroy_endpoint) {
 bool channel_block_destroyable(ublock *b) {
   return b->ring == nullptr || b->ring->ops->destroyable == nullptr ||
          b->ring->ops->destroyable(b->ring);
+}
+
+void channel_thread_complete_locked(struct process *p, ublock *block,
+                                    uint64_t event) {
+  asserts(block != nullptr && block->owner == p,
+          "thread completion: bad block");
+  asserts(atomic_load(&block->thread_pins) != 0,
+          "thread completion: unpinned block");
+  uint32_t si = umem_stripe(block->base);
+  umem_stripe_lock(si);
+  // Registration kept the block private, writable, and identity-stable.
+  *(volatile _Atomic uint32_t *)event = GDOS_THREAD_COMPLETE;
+  wake_slot(&block->owner_waiter, 0);
+  umem_stripe_unlock(si);
+  atomic_fetch_sub(&block->thread_pins, 1);
 }

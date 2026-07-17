@@ -11,6 +11,7 @@
 #include "paging.h"
 #include "stacks.h"
 #include "stdlib/stdlib.h"
+#include "xstate.h"
 
 static uint64_t rdmsr64(uint32_t msr) {
   uint32_t eax, edx;
@@ -35,24 +36,6 @@ static void enable_nxe(void) {
   // a reserved-bit violation rather than as #PF on instruction fetch.
   // UEFI usually sets this, but we own this MSR from here on.
   wrmsr64(IA32_EFER, rdmsr64(IA32_EFER) | (1u << 11));
-}
-
-static void enable_sse(void) {
-  // FPU/SSE for userspace (the kernel itself is -mgeneral-regs-only and
-  // never executes SIMD; fxsave64/fxrstor64 at thread park/resume are the
-  // only FPU touches). CR0: MP set, EM/TS clear — a real FPU, and no
-  // lazy-switch #NM traps, since the park/resume save is eager. CR4:
-  // OSFXSR enables fxsave/fxrstor and unmasks SSE instructions;
-  // OSXMMEXCPT makes an unmasked SSE exception #XM instead of #UD.
-  // UEFI x64 already runs with SSE on, but we own these registers now.
-  uint64_t cr0, cr4;
-  __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
-  cr0 |= 1u << 1;                       // MP
-  cr0 &= ~((1u << 2) | (1u << 3));      // ~EM, ~TS
-  __asm__ volatile("mov %0, %%cr0" : : "r"(cr0));
-  __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
-  cr4 |= (1u << 9) | (1u << 10);        // OSFXSR, OSXMMEXCPT
-  __asm__ volatile("mov %0, %%cr4" : : "r"(cr4));
 }
 
 // SYSCALL entry point, interrupts.asm.
@@ -107,6 +90,10 @@ static void map_acpi_mmio(struct address_space *as,
 }
 
 void cpu_setup_bsp(const struct acpi_rsdp *rsdp) {
+  // Select one standard-format eager XSAVE policy before any user TCB is
+  // created. AP bring-up later verifies every CPU supports this BSP mask.
+  x86_xstate_global_init();
+
   // get madt
   const struct acpi_madt *madt = acpi_find_madt(rsdp);
   asserts(madt != nullptr, "madt cannot be null");
@@ -165,9 +152,8 @@ void cpu_setup() {
   // 0. enable nxe (we don't use this yet but we will ig)
   enable_nxe();
 
-  // 0.25. FPU/SSE control bits (user threads own the FPU; preemption
-  //       means their SIMD state is live at any instruction boundary).
-  enable_sse();
+  // 0.25. Enable the BSP-selected eager user xstate on this CPU.
+  x86_xstate_cpu_init();
 
   // 0.5. SYSCALL/SYSRET (the only syscall path — there is no int gate).
   enable_syscall(this_cpu_state);

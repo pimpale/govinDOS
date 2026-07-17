@@ -63,4 +63,11 @@ void free(void *ptr) {
   }
 }
 
-[[noreturn]] void abort(void) { sys_exit(); }
+[[noreturn]] void _Exit(int status) { sys_proc_exit((uint32_t)status); }
+
+// There is no atexit registry yet, so exit and _Exit currently have the same
+// process-wide semantics. Keeping the standard entry points distinct lets the
+// CRT add flushing and handlers later without changing the kernel ABI.
+[[noreturn]] void exit(int status) { _Exit(status); }
+
+[[noreturn]] void abort(void) { _Exit(127); }

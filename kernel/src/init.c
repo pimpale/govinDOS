@@ -356,11 +356,18 @@ static void init_setup(const uint8_t *image, size_t image_len) {
                        &g_bootinfo.cap_iommu);
   capability_selftest(p, &g_bootinfo.cap_devmem);
   uint64_t entry = 0;
-  int rc = pe_load(p, image, image_len, &entry);
+  uint64_t gs_base = 0;
+  int rc = pe_load(p, image, image_len, &entry, &gs_base);
   asserts(rc == 0, "init: PE load failed");
 
-  void *stack = umem_alloc(p, 4 * PAGE_SIZE, PAGE_R | PAGE_W);
+  void *stack = umem_alloc(p, 5 * PAGE_SIZE, PAGE_R | PAGE_W);
   asserts(stack != nullptr, "init: stack alloc failed");
+  uint64_t stack_bytes = umem_size(p, (uint64_t)stack);
+  *(uint64_t *)(gs_base + 0x08) = (uint64_t)stack + stack_bytes;
+  // Bootstrap is the sole process with no userspace parent loader. Publish
+  // the allocation's lower bound in NT_TIB.StackLimit; init's own startup
+  // code chooses and installs its guard before doing real work.
+  *(uint64_t *)(gs_base + 0x10) = (uint64_t)stack;
 
   // The bootinfo block: written through the kernel's own view, then the
   // one user view drops to read-only. Its base is init's entire entry
@@ -373,7 +380,15 @@ static void init_setup(const uint8_t *image, size_t image_len) {
 
   printf("init: pid=%llu entry=%016llX bootinfo=%016llX\n", p->pid, entry,
          (uint64_t)bi);
-  process_spawn_thread(p, entry, (uint64_t)stack + 4 * PAGE_SIZE, (uint64_t)bi);
+  struct gdos_thread_start start = {
+      .version = GDOS_THREAD_START_VERSION,
+      .size = sizeof(start),
+      .entry = entry,
+      .argument = (uint64_t)bi,
+      .stack_pointer = (uint64_t)stack + stack_bytes,
+      .gs_base = gs_base,
+  };
+  process_spawn_thread(p, &start);
 }
 
 [[noreturn]] static void ap_main() {

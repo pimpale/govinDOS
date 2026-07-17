@@ -69,6 +69,7 @@ struct [[gnu::packed]] section_header {
 
 #define PE_DIR_IMPORT 1
 #define PE_DIR_BASERELOC 5
+#define PE_DIR_TLS 9
 
 #define SEC_EXEC 0x20000000u
 #define SEC_READ 0x40000000u
@@ -77,12 +78,98 @@ struct [[gnu::packed]] section_header {
 #define RELOC_ABSOLUTE 0
 #define RELOC_DIR64 10
 
+#define PE_TLS_DIRECTORY_BYTES 40u
+#define PE_TEB_TLS_VECTOR_OFFSET 0x58u
+#define PE_TEB_SELF_OFFSET 0x30u
+#define PE_TLS_VECTOR_OFFSET 0x80u
+#define PE_TLS_DATA_MIN_OFFSET 0x100u
+
+struct [[gnu::packed]] image_tls_directory64 {
+  uint64_t start_address_of_raw_data;
+  uint64_t end_address_of_raw_data;
+  uint64_t address_of_index;
+  uint64_t address_of_callbacks;
+  uint32_t size_of_zero_fill;
+  uint32_t characteristics;
+};
+
 static uint64_t page_ceil(uint64_t v) {
   return (v + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
 }
 
+static bool range_inside(uint64_t base, uint64_t bytes, uint64_t address,
+                         uint64_t length) {
+  uint64_t image_end;
+  uint64_t end;
+  return !__builtin_add_overflow(base, bytes, &image_end) &&
+         !__builtin_add_overflow(address, length, &end) && address >= base &&
+         end <= image_end;
+}
+
+static uint64_t align_up(uint64_t value, uint64_t alignment) {
+  return (value + alignment - 1) & ~(alignment - 1);
+}
+
+static uint64_t pe_tls_create(struct process *p, uint64_t image_base,
+                              const struct optional_header64 *opt) {
+  uint64_t image_bytes = page_ceil(opt->size_of_image);
+  if (opt->n_data_dirs <= PE_DIR_TLS ||
+      opt->dirs[PE_DIR_TLS].size < PE_TLS_DIRECTORY_BYTES ||
+      !range_inside(image_base, image_bytes,
+                    image_base + opt->dirs[PE_DIR_TLS].va,
+                    PE_TLS_DIRECTORY_BYTES)) {
+    printf("pe: missing TLS directory\n");
+    return 0;
+  }
+  struct image_tls_directory64 *tls =
+      (void *)(image_base + opt->dirs[PE_DIR_TLS].va);
+  uint64_t raw_bytes = tls->end_address_of_raw_data -
+                       tls->start_address_of_raw_data;
+  if (tls->start_address_of_raw_data > tls->end_address_of_raw_data ||
+      tls->address_of_callbacks != 0 ||
+      !range_inside(image_base, image_bytes, tls->start_address_of_raw_data,
+                    raw_bytes) ||
+      !range_inside(image_base, image_bytes, tls->address_of_index,
+                    sizeof(uint32_t))) {
+    printf("pe: unsupported TLS directory\n");
+    return 0;
+  }
+  uint32_t align_code = (tls->characteristics >> 20) & 0xFu;
+  if (align_code == 15) {
+    return 0;
+  }
+  uint64_t alignment = align_code == 0 ? 1 : 1ull << (align_code - 1);
+  if (alignment > PAGE_SIZE) {
+    return 0;
+  }
+  uint64_t tls_bytes;
+  if (__builtin_add_overflow(raw_bytes, (uint64_t)tls->size_of_zero_fill,
+                             &tls_bytes) ||
+      tls_bytes > (1ull << 20)) {
+    return 0;
+  }
+  uint64_t data_offset = align_up(PE_TLS_DATA_MIN_OFFSET, alignment);
+  uint64_t runtime_bytes;
+  if (__builtin_add_overflow(data_offset, tls_bytes, &runtime_bytes)) {
+    return 0;
+  }
+  uint8_t *runtime = umem_alloc(p, runtime_bytes, PAGE_R | PAGE_W);
+  if (runtime == nullptr) {
+    return 0;
+  }
+  uint64_t vector = (uint64_t)runtime + PE_TLS_VECTOR_OFFSET;
+  uint64_t data = (uint64_t)runtime + data_offset;
+  *(uint64_t *)(runtime + PE_TEB_SELF_OFFSET) = (uint64_t)runtime;
+  *(uint64_t *)(runtime + PE_TEB_TLS_VECTOR_OFFSET) = vector;
+  *(uint64_t *)vector = data;
+  *(uint32_t *)tls->address_of_index = 0;
+  memcpy((void *)data, (const void *)tls->start_address_of_raw_data,
+         raw_bytes);
+  return (uint64_t)runtime;
+}
+
 int pe_load(struct process *p, const uint8_t *image, size_t len,
-            uint64_t *entry_out) {
+            uint64_t *entry_out, uint64_t *gs_base_out) {
   if (len < sizeof(struct dos_header)) {
     return -1;
   }
@@ -168,6 +255,11 @@ int pe_load(struct process *p, const uint8_t *image, size_t len,
     }
   }
 
+  uint64_t gs_base = pe_tls_create(p, (uint64_t)base, opt);
+  if (gs_base == 0) {
+    return -1;
+  }
+
   // Per-section W^X. The header page stays read-only.
   as_flag(p->as, (uint64_t)base, (uint64_t)base + PAGE_SIZE, PAGE_R | PAGE_U);
   for (uint16_t i = 0; i < coff->n_sections; i++) {
@@ -190,5 +282,6 @@ int pe_load(struct process *p, const uint8_t *image, size_t len,
   as_flush(p->as);
 
   *entry_out = (uint64_t)base + opt->entry_point;
+  *gs_base_out = gs_base;
   return 0;
 }

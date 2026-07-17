@@ -62,7 +62,8 @@ static_assert(sizeof(struct trap_frame) == 21 * 8,
 // IF set. Also forges the TCB-resident resume frame so the scheduler's
 // switch_context lands in uthread_resume.
 void arch_thread_init_user(struct thread *t, uint64_t entry,
-                           uint64_t user_stack_top, uint64_t arg);
+                           uint64_t user_stack_pointer, uint64_t arg,
+                           uint64_t fs_base, uint64_t gs_base);
 
 // Copy the live trap frame (on the per-CPU interrupt stack) into the TCB
 // and re-arm the resume frame. Must be called before parking a user

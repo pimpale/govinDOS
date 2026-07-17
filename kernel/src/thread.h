@@ -40,16 +40,18 @@ typedef struct thread {
   uint32_t proc_slot;
   _Atomic enum thread_status status;
 
-  // User TLS base. FSBASE on x86_64, TPIDR_EL0 on aarch64. Saved/restored
-  // by arch code on the user<->kernel boundary (not yet wired).
-  uint64_t user_tls_base;
-
   // True from just before the scheduler switches into this thread until
   // just after it has switched back out and its saved state is complete.
   // Wakers must spin this false before re-enqueueing (thread_unblock does)
   // — otherwise a thread that has set status=BLOCKED but not yet finished
   // saving its context could be dispatched on another CPU.
   _Atomic bool on_cpu;
+
+  // Optional join completion. A live-process exit consumes one pin and
+  // publishes the word after on_cpu becomes false. Process death skips the
+  // notification because no in-process joiner can survive it.
+  struct ublock *completion_block;
+  uint64_t completion_event;
 
   // Arch-private state (saved kernel SP, trap frame, FPU area, ...).
   struct arch_thread arch;
@@ -100,6 +102,10 @@ struct process {
   // exists and has room.
   bool death_notified;
 
+  // Process-wide exit status reported in KEV_CHILD_DEAD.b. Natural last-
+  // thread exit and external kill leave the zero-initialized value.
+  uint64_t exit_status;
+
   // Threads with un-reaped TCBs. Incremented at spawn; decremented by the
   // scheduler's exit/cull path or by bounded reap for detached blocked TCBs.
   // The process struct outlives every TCB.
@@ -131,12 +137,15 @@ struct process {
   struct grant *created_grants;
 };
 
-// Spawn a user thread that starts at `entry` in ring 3 on `user_stack_top`
+// Spawn a user thread that starts at `entry` in ring 3 with `user_stack_pointer`
 // with `arg` in its first argument register (rcx under the Win64-flavored
 // ABI, so `entry` can be a plain `void f(uint64_t)`). Caller must have
 // mapped entry/stack PAGE_U beforehand.
 struct thread *uthread_spawn(struct process *proc, uint64_t entry,
-                             uint64_t user_stack_top, uint64_t arg);
+                             uint64_t user_stack_pointer, uint64_t arg,
+                             uint64_t fs_base, uint64_t gs_base,
+                             struct ublock *completion_block,
+                             uint64_t completion_event);
 
 // Currently running thread on this CPU. Only meaningful from contexts
 // that cannot migrate (IRQs off / interrupt context).

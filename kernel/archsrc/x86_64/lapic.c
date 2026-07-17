@@ -1,5 +1,6 @@
 #include "lapic.h"
 
+#include <stdatomic.h>
 #include <stdint.h>
 
 #include "allocator.h"
@@ -151,6 +152,19 @@ void x86_lapic_eoi(void) { lapic_write(LAPIC_REG_EOI, 0); }
 // clocks off the bus clock, which is shared by every CPU, so a single
 // global measurement serves all of them.
 static uint64_t g_lapic_timer_ticks_per_ms = 0;
+static uint64_t g_tsc_hz = 0;
+static uint64_t g_tsc_base = 0;
+static _Atomic uint64_t g_monotonic_last_ns = 0;
+
+static uint64_t read_tsc(void) {
+  uint32_t lo;
+  uint32_t hi;
+  // LFENCE orders the sample after earlier loads. The kernel never migrates
+  // while IRQs are disabled; modern x86 systems expose a synchronized,
+  // invariant TSC across the CPUs GovindOS brings online.
+  __asm__ volatile("lfence; rdtsc" : "=a"(lo), "=d"(hi) :: "memory");
+  return ((uint64_t)hi << 32) | lo;
+}
 
 // PIT bits, used only during calibration (the PIT is otherwise unused —
 // its IRQ is never routed; everything below is polled).
@@ -176,24 +190,52 @@ void x86_lapic_timer_calibrate(void) {
   // Masked: we poll the count, no interrupt wanted.
   lapic_write(LAPIC_REG_LVT_TIMER, LAPIC_LVT_MASKED);
 
+  uint64_t tsc_start = read_tsc();
   outb(PIT_PORT_NMI_STS, gate | 0x01);           // gate high: PIT counts
   lapic_write(LAPIC_REG_TIMER_ICR, 0xFFFFFFFFu); // LAPIC counts
   while ((inb(PIT_PORT_NMI_STS) & 0x20) == 0) {
     __asm__ volatile("pause");
   }
   uint32_t remaining = lapic_read(LAPIC_REG_TIMER_CCR);
+  uint64_t tsc_end = read_tsc();
   lapic_write(LAPIC_REG_TIMER_ICR, 0); // stop
   outb(PIT_PORT_NMI_STS, gate);        // gate back low
 
   g_lapic_timer_ticks_per_ms = (0xFFFFFFFFu - (uint64_t)remaining) / 10;
+  uint64_t tsc_delta = tsc_end - tsc_start;
+  g_tsc_hz = tsc_delta * PIT_HZ / pit_count;
+  g_tsc_base = tsc_end;
   asserts(g_lapic_timer_ticks_per_ms > 0, "lapic: timer calibration failed");
-  printf("lapic: timer calibrated, %llu ticks/ms\n",
-         g_lapic_timer_ticks_per_ms);
+  asserts(g_tsc_hz > 0, "clock: TSC calibration failed");
+  printf("lapic: timer calibrated, %llu ticks/ms; tsc=%llu Hz\n",
+         g_lapic_timer_ticks_per_ms, g_tsc_hz);
+}
+
+uint64_t x86_monotonic_ns(void) {
+  asserts(g_tsc_hz != 0, "clock: used before calibration");
+  uint64_t cycles = read_tsc() - g_tsc_base;
+  // Split quotient/remainder so a long uptime cannot overflow cycles*1e9.
+  uint64_t ns = (cycles / g_tsc_hz) * 1000000000ull +
+                (cycles % g_tsc_hz) * 1000000000ull / g_tsc_hz;
+
+  // Clamp across CPU migration/TSC skew. This is a monotonic clock, not a
+  // uniqueness counter, so equal successive samples are valid.
+  uint64_t seen = atomic_load_explicit(&g_monotonic_last_ns,
+                                       memory_order_relaxed);
+  while (seen < ns &&
+         !atomic_compare_exchange_weak_explicit(
+             &g_monotonic_last_ns, &seen, ns, memory_order_relaxed,
+             memory_order_relaxed)) {
+  }
+  return seen > ns ? seen : ns;
 }
 
 void x86_lapic_timer_arm_oneshot(uint8_t vector, uint64_t us) {
   asserts(g_lapic_timer_ticks_per_ms > 0, "lapic: timer not calibrated");
-  uint64_t ticks = g_lapic_timer_ticks_per_ms * us / 1000;
+  uint64_t max_us = UINT32_MAX * 1000ull / g_lapic_timer_ticks_per_ms;
+  uint64_t ticks = us >= max_us
+                       ? UINT32_MAX
+                       : g_lapic_timer_ticks_per_ms * us / 1000;
   if (ticks == 0) {
     ticks = 1;
   }

@@ -55,7 +55,7 @@ switch_context:
 ;
 ; uthread_resume_prepare does the non-asm bookkeeping (drops the scheduler's
 ; irq_disable depth without sti — iretq sets IF from the saved rflags —
-; plus, later, FSBASE/XSAVE restore) and returns &t->arch.uframe. We then
+; plus FSBASE/GSBASE/XSAVE restore) and returns &t->arch.uframe. We then
 ; point RSP at the frame and pop it in trap_frame order, mirroring the
 ; restore tail of _isr_handler in interrupts.asm.
 ; ----------------------------------------------------------------------------

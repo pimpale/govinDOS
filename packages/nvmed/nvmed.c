@@ -403,14 +403,14 @@ void _start(uint64_t arg) {
   if (setup == nullptr || setup->version != PCI_DRIVER_START_VERSION ||
       setup->n_bars == 0) {
     print("nvmed: invalid start record\n");
-    sys_exit();
+    sys_proc_exit(1);
   }
   struct nvme_device dev = {.bar = setup->bars[0].base};
   uint64_t cap = *(volatile uint64_t *)dev.bar;
   if ((cap & 0xffffu) + 1 < QUEUE_ENTRIES || ((cap >> 37) & 1) == 0 ||
       ((cap >> 48) & 0xf) != 0) {
     print("nvmed: unsupported controller capabilities\n");
-    sys_exit();
+    sys_proc_exit(1);
   }
   dev.doorbell_stride = 4u << ((cap >> 32) & 0xf);
   dev.admin = (struct nvme_queue){.qid = 0, .phase = true};
@@ -420,16 +420,16 @@ void _start(uint64_t arg) {
   *cc = 0;
   if (!wait_ready(csts, false)) {
     print("nvmed: reset timeout\n");
-    sys_exit();
+    sys_proc_exit(1);
   }
 
   struct kring iommu;
   if (kring_create(&iommu, KSCHEME_IOMMU, PAGE_SIZE) != 0)
-    sys_exit();
+    sys_proc_exit(1);
   dev.dma = sys_vm_alloc(DMA_PAGES * PAGE_SIZE,
                          VM_PROT_READ | VM_PROT_WRITE);
   if (sys_iserr(dev.dma))
-    sys_exit();
+    sys_proc_exit(1);
   memset((void *)dev.dma, 0, DMA_PAGES * PAGE_SIZE);
   dev.admin.sq = (void *)dev.dma;
   dev.admin.cq = (void *)(dev.dma + PAGE_SIZE);
@@ -442,20 +442,20 @@ void _start(uint64_t arg) {
       kring_iommu_attach(&iommu, domain, &setup->iommu_token,
                          setup->function_id) != 0) {
     print("nvmed: IOMMU setup failed\n");
-    sys_exit();
+    sys_proc_exit(1);
   }
   signal_state(setup, PCI_DRIVER_IOMMU_READY);
 
   if (!wait_state(setup, PCI_DRIVER_IRQ_GRANTED))
-    sys_exit();
+    sys_proc_exit(1);
   struct kring irq;
   if (kring_create(&irq, KSCHEME_IRQ, PAGE_SIZE) != 0 ||
       kring_irq_bind(&irq, &setup->irq_token, setup->function_id,
                      nullptr) != 0)
-    sys_exit();
+    sys_proc_exit(1);
   signal_state(setup, PCI_DRIVER_IRQ_READY);
   if (!wait_state(setup, PCI_DRIVER_LIVE))
-    sys_exit();
+    sys_proc_exit(1);
 
   *(volatile uint32_t *)(dev.bar + 0x24) =
       (QUEUE_ENTRIES - 1u) | ((QUEUE_ENTRIES - 1u) << 16);
@@ -465,13 +465,13 @@ void _start(uint64_t arg) {
   *cc = 1u | (6u << 16) | (4u << 20);
   if (!wait_ready(csts, true)) {
     print("nvmed: enable timeout\n");
-    sys_exit();
+    sys_proc_exit(1);
   }
   print("nvmed: live with isolated queues and bounce pool\n");
 
   if (!discover_namespace(&dev)) {
     print("nvmed: namespace discovery FAILED\n");
-    sys_exit();
+    sys_proc_exit(1);
   }
   print("nvmed: namespace blocks=");
   print_hex(dev.capacity_blocks);
@@ -506,16 +506,16 @@ void _start(uint64_t arg) {
     print(saw_fault ? "nvmed: bad PRP contained by IOMMU\n"
                     : "nvmed: IOMMU fault event MISSING\n");
     print("nvmed: exiting first instance for reap/restart test\n");
-    sys_exit();
+    sys_proc_exit(1);
   }
 
   if (!setup_io_queues(&dev)) {
     print("nvmed: I/O queue creation FAILED\n");
-    sys_exit();
+    sys_proc_exit(1);
   }
   struct kring shares;
   if (kring_create(&shares, KSCHEME_SHARES, PAGE_SIZE) != 0)
-    sys_exit();
+    sys_proc_exit(1);
   print("nvmed: block service ready\n");
   service_loop(&dev, setup, &shares, &irq, &iommu);
 
@@ -529,5 +529,5 @@ void _start(uint64_t arg) {
   kring_destroy(&iommu);
   kring_destroy(&irq);
   sys_vm_free(dev.dma);
-  sys_exit();
+  sys_proc_exit(1);
 }

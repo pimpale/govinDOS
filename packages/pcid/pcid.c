@@ -713,15 +713,15 @@ static void driver_died(void) {
 void _start(uint64_t bootstrap_address) {
   g_bootstrap = (const void *)bootstrap_address;
   if (g_bootstrap == nullptr || g_bootstrap->acpi_rsdp == 0)
-    sys_exit();
+    sys_proc_exit(1);
   uint64_t rsdp_address = g_bootstrap->acpi_rsdp;
   if (kring_cap_open(&g_cap_control, g_bootstrap->cap_channel, PAGE_SIZE) != 0)
-    sys_exit();
+    sys_proc_exit(1);
   print("pcid: starting, RSDP=");
   print_hex(rsdp_address);
   if (!map_firmware(rsdp_address, sizeof(struct acpi_rsdp))) {
     print("pcid: cannot map RSDP\n");
-    sys_exit();
+    sys_proc_exit(1);
   }
   const struct acpi_rsdp *rsdp = (const void *)rsdp_address;
   if (!sig(rsdp->signature, "RSD PTR ", 8) || !checksum_zero(rsdp, 20) ||
@@ -730,13 +730,13 @@ void _start(uint64_t bootstrap_address) {
         !map_firmware(rsdp_address, rsdp->length) ||
         !checksum_zero(rsdp, rsdp->length)))) {
     print("pcid: invalid RSDP\n");
-    sys_exit();
+    sys_proc_exit(1);
   }
   const struct acpi_mcfg *mcfg =
       (const struct acpi_mcfg *)find_table(rsdp, "MCFG");
   if (mcfg == nullptr || !parse_mcfg(mcfg)) {
     print("pcid: invalid/missing MCFG\n");
-    sys_exit();
+    sys_proc_exit(1);
   }
   for (uint32_t i = 0; i < g_nallocs; i++) {
     bool visited[256] = {0};
@@ -746,7 +746,7 @@ void _start(uint64_t bootstrap_address) {
   print_hex(g_nfunctions);
   if (kring_create(&g_tree, KSCHEME_TREE, PAGE_SIZE) != 0 ||
       kring_create(&g_irq_control, KSCHEME_IRQ, PAGE_SIZE) != 0)
-    sys_exit();
+    sys_proc_exit(1);
   for (uint32_t i = 0; i < g_nfunctions; i++)
     prepare_nvme(&g_functions[i]);
 

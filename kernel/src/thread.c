@@ -18,7 +18,8 @@
 //                   declared loosely here to keep this file arch-free.
 extern void switch_context(uint64_t *old_sp_out, uint64_t new_sp);
 extern void arch_thread_init_user(struct thread *t, uint64_t entry,
-                                  uint64_t user_stack_top, uint64_t arg);
+                                  uint64_t user_stack_pointer, uint64_t arg,
+                                  uint64_t fs_base, uint64_t gs_base);
 extern void arch_uthread_set_result(struct thread *t, uint64_t v);
 
 static _Atomic uint64_t g_next_tid = 1;
@@ -30,15 +31,19 @@ static _Atomic uint64_t g_next_tid = 1;
 // context switch — each side locks/unlocks locally.
 
 struct thread *uthread_spawn(struct process *proc, uint64_t entry,
-                             uint64_t user_stack_top, uint64_t arg) {
+                             uint64_t user_stack_pointer, uint64_t arg,
+                             uint64_t fs_base, uint64_t gs_base,
+                             struct ublock *completion_block,
+                             uint64_t completion_event) {
   asserts(proc != nullptr, "uthread_spawn: needs a user process");
   struct thread *t = calloc(1, sizeof(*t));
   asserts(t != nullptr, "thread: alloc failed");
   t->tid = atomic_fetch_add(&g_next_tid, 1);
   t->proc = proc;
   t->status = THREAD_RUNNABLE;
-  arch_thread_init_user(t, entry, user_stack_top, arg);
-  scheduler_enqueue(t);
+  t->completion_block = completion_block;
+  t->completion_event = completion_event;
+  arch_thread_init_user(t, entry, user_stack_pointer, arg, fs_base, gs_base);
   return t;
 }
 

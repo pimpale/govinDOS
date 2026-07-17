@@ -29,6 +29,7 @@
 #include <gdosabi/kring_cap.h>
 #include <gdosabi/kring_irq.h>
 #include <gdosabi/kring_iommu.h>
+#include <gdosabi/kring_timer.h>
 
 struct kring {
   uint64_t base; // block base — the channel's name to the syscalls
@@ -85,6 +86,14 @@ uint64_t kring_wait_cqe(struct kring *r, struct kcqe *cqe);
 // Consumption ack: publish cq_head and ring the doorbell so the kernel
 // replays pending level-state events into the freed slots.
 uint64_t kring_ack(struct kring *r);
+
+// Timer commands are asynchronous like the other ring commands: these submit
+// an SQE and return the doorbell result. The caller consumes the ordinary
+// command completion and any KEV_TIMER events from the same CQ.
+uint64_t kring_timer_now(struct kring *r);
+uint64_t kring_timer_arm_abs(struct kring *r, uint64_t id,
+                             uint64_t deadline_ns, uint64_t cookie);
+uint64_t kring_timer_cancel(struct kring *r, uint64_t id);
 
 uint64_t kring_cap_subgrant(struct kring *r, const struct cap_token *parent,
                             uint64_t p0, uint64_t p1, uint64_t p2,

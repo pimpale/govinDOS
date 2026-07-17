@@ -10,5 +10,7 @@
 void free(void *ptr);
 
 [[noreturn]] void abort(void);
+[[noreturn]] void _Exit(int status);
+[[noreturn]] void exit(int status);
 
 #endif // stdlib_h_INCLUDED

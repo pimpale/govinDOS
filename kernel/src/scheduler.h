@@ -12,18 +12,15 @@
 
 // IDT vector for the cross-CPU reschedule IPI. Value is arbitrary as long
 // as it doesn't collide with any other installed vector (currently
-// VECTOR_TLB_SHOOTDOWN=0xFD and VECTOR_PREEMPT=0xFB are the others). The
+// VECTOR_TLB_SHOOTDOWN=0xFD and VECTOR_TIMER=0xFB are the others). The
 // handler is a no-op + EOI; its only job is to wake a HLT'd CPU so its
 // scheduler loop iterates and picks up newly-enqueued work.
 #define VECTOR_RESCHED 0xFC
 
-// IDT vector for the per-CPU preemption timer (LAPIC one-shot). Armed by
-// the scheduler loop just before every dispatch, so each thread gets a
-// full quantum; disarmed on the idle path. Kernel code runs IRQs-off
-// (IA32_FMASK masks the whole syscall path), so the shot can only land
-// in ring 3 — or in the scheduler loop's own brief IF=1 windows, where
-// the handler treats it as spurious.
-#define VECTOR_PREEMPT 0xFB
+// IDT vector for the per-CPU LAPIC one-shot shared by scheduling quanta and
+// scheme -5 timers. The earliest absolute deadline wins. Kernel code runs
+// IRQs-off, so delivery normally lands in ring 3 or the scheduler idle path.
+#define VECTOR_TIMER 0xFB
 
 // Length of one dispatch quantum. A thread that neither parks nor blocks
 // for this long is preempted as if it had called SYS_YIELD.
@@ -49,6 +46,14 @@ struct scheduler {
   struct spinlock lock;
   uint64_t sched_rsp;
   _Atomic bool idle;
+
+  // One local-APIC timer is multiplexed between this CPU's scheduling
+  // quantum and the absolute timers armed on it. timer_lock is never held
+  // while scheduler.lock is held.
+  struct spinlock timer_lock;
+  struct kernel_timer *timers_armed;  // deadline-sorted
+  struct kernel_timer *timers_pending; // expired, waiting for CQ space
+  uint64_t quantum_deadline_ns;       // zero outside a dispatched quantum
 };
 
 // One-time global init. Allocates each CPU's queue and initializes its

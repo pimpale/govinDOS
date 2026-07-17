@@ -26,7 +26,13 @@ out/%.asm.o: %.asm
 
 # Member names relative to out/initfs/, no leading "./" (gdoslib-dev/cpio.c
 # is the parser). cpio newc.
-out/initdata.cpio: $(INITFS_PROGRAMS)
+# Package payloads carry reproducible mtimes, so timestamp comparison cannot
+# tell whether buildrepo just installed a newer executable into the sysroot.
+# Refresh the small embedded archive whenever gdos-init itself is built.
+.PHONY: FORCE
+FORCE:
+
+out/initdata.cpio: FORCE $(INITFS_PROGRAMS)
 	rm -rf out/initfs
 	mkdir -p out/initfs
 	cp $(INITFS_PROGRAMS) out/initfs/

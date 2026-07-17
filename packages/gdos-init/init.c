@@ -7,8 +7,7 @@
 // must never exit — that's a kernel panic.
 //
 // Freestanding: no libc, no imports (the loader rejects import tables).
-// Built with -mgeneral-regs-only — the kernel preserves x87/SSE across
-// switches but not AVX, so YMM+ state must stay unused.
+// Built with -mgeneral-regs-only because init does not need vector code.
 
 #include <stdint.h>
 
@@ -85,6 +84,18 @@ static uint64_t await_child_death(struct kring *tch) {
 }
 
 void _start(uint64_t arg) {
+  // init has no userspace parent loader, so it applies its own guard. The
+  // bootstrap PE loader left the allocation's lower bound in StackLimit.
+  uint64_t teb;
+  __asm__ volatile("movq %%gs:0x30, %0" : "=r"(teb));
+  uint64_t stack_low = *(uint64_t *)(teb + 0x10);
+  uint64_t guard_rc = sys_vm_protect(stack_low, 4096, 0);
+  if (guard_rc == 0) {
+    *(uint64_t *)(teb + 0x10) = stack_low + 4096;
+  }
+  print(guard_rc == 0 ? "init: userspace stack guard installed\n"
+                      : "init: USERSPACE STACK GUARD FAILED\n");
+
   print("init: hello from the root of the process tree!\n");
   g_reloc_fn(g_reloc_str);
   bootinfo_report((const struct bootinfo *)arg);

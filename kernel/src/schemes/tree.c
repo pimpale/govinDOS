@@ -21,7 +21,7 @@ void tree_replay(struct ring *ring) {
     // Only directly dead children notify a live parent. Effective-dead
     // interior descendants belong to the already-announced subtree root.
     if (c->state == PROC_DEAD && !c->death_notified) {
-      if (!channel_post(ring, KEV_CHILD_DEAD, c->pid, 0, 0)) {
+      if (!channel_post(ring, KEV_CHILD_DEAD, c->pid, c->exit_status, 0)) {
         return;
       }
       c->death_notified = true;
@@ -31,7 +31,8 @@ void tree_replay(struct ring *ring) {
 
 void channel_child_dead_notify(struct process *parent, struct process *child) {
   struct ring *ring = parent->tree_ch;
-  if (ring != nullptr && channel_post(ring, KEV_CHILD_DEAD, child->pid, 0, 0)) {
+  if (ring != nullptr &&
+      channel_post(ring, KEV_CHILD_DEAD, child->pid, child->exit_status, 0)) {
     child->death_notified = true;
   }
 }

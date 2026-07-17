@@ -17,6 +17,7 @@ C_SOURCES := \
 	source/stdio.c \
 	source/stdlib.c \
 	source/string.c \
+	source/tls.c \
 	vendor/printf/printf.c
 C_OBJECTS := $(patsubst %.c,out/%.c.o,$(C_SOURCES))
 

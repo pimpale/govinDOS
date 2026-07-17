@@ -145,6 +145,10 @@ void syscall_entry(struct trap_frame *tf) {
     tf->rax = curr->proc->pid;
     return;
 
+  case SYS_GETTID:
+    tf->rax = curr->tid;
+    return;
+
   case SYS_VM_ALLOC:
     tf->rax = sys_vm_alloc(curr, a0, a1);
     return;
@@ -195,18 +199,25 @@ void syscall_entry(struct trap_frame *tf) {
     return;
 
   case SYS_THREAD_SPAWN:
-    tf->rax = proc_sys_thread_spawn(curr, a0, a1, a2, a3);
+    tf->rax = proc_sys_thread_spawn(curr, a0, a1, a2);
+    return;
+
+  case SYS_THREAD_BASES_SET:
+    tf->rax = arch_uthread_set_bases(curr, a0, a1);
     return;
 
   case SYS_PROC_KILL:
     tf->rax = proc_sys_kill(curr, a0);
     return;
 
+  case SYS_PROC_EXIT:
+    proc_sys_process_exit(curr, a0);
+
   case SYS_PROC_REAP:
     tf->rax = proc_sys_reap(curr, a0);
     return;
 
-  case SYS_EXIT:
+  case SYS_THREAD_EXIT:
     uthread_park_exit();
 
   case SYS_YIELD:

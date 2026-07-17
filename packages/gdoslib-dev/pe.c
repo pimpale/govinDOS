@@ -65,6 +65,7 @@ struct [[gnu::packed]] section_header {
 
 #define PE_DIR_IMPORT 1
 #define PE_DIR_BASERELOC 5
+#define PE_DIR_TLS 9
 
 #define SEC_EXEC 0x20000000u
 #define SEC_READ 0x40000000u
@@ -74,6 +75,20 @@ struct [[gnu::packed]] section_header {
 #define RELOC_DIR64 10
 
 #define UPAGE_SIZE 4096ull
+#define PE_TLS_DIRECTORY_BYTES 40u
+#define PE_TEB_TLS_VECTOR_OFFSET 0x58u
+#define PE_TEB_SELF_OFFSET 0x30u
+#define PE_TLS_VECTOR_OFFSET 0x80u
+#define PE_TLS_DATA_MIN_OFFSET 0x100u
+
+struct [[gnu::packed]] image_tls_directory64 {
+  uint64_t start_address_of_raw_data;
+  uint64_t end_address_of_raw_data;
+  uint64_t address_of_index;
+  uint64_t address_of_callbacks;
+  uint32_t size_of_zero_fill;
+  uint32_t characteristics;
+};
 
 static uint64_t page_ceil(uint64_t v) {
   return (v + UPAGE_SIZE - 1) & ~(UPAGE_SIZE - 1);
@@ -84,6 +99,88 @@ static uint64_t fail(const char *why) {
   print(why);
   print("\n");
   return 0;
+}
+
+static bool range_inside(uint64_t base, uint64_t bytes, uint64_t address,
+                         uint64_t length) {
+  uint64_t image_end;
+  uint64_t end;
+  return !__builtin_add_overflow(base, bytes, &image_end) &&
+         !__builtin_add_overflow(address, length, &end) && address >= base &&
+         end <= image_end;
+}
+
+static uint64_t align_up(uint64_t value, uint64_t alignment) {
+  return (value + alignment - 1) & ~(alignment - 1);
+}
+
+uint64_t pe_tls_create(uint64_t image_base) {
+  const struct dos_header *dos = (const void *)image_base;
+  if (dos->e_magic != 0x5A4D) {
+    return fail("TLS image has no DOS header");
+  }
+  const struct coff_header *coff =
+      (const void *)(image_base + dos->e_lfanew);
+  const struct optional_header64 *opt = (const void *)(coff + 1);
+  uint64_t image_bytes = page_ceil(opt->size_of_image);
+  if (coff->signature != 0x00004550 || opt->magic != 0x20B ||
+      opt->n_data_dirs <= PE_DIR_TLS ||
+      opt->dirs[PE_DIR_TLS].size < PE_TLS_DIRECTORY_BYTES ||
+      !range_inside(image_base, image_bytes,
+                    image_base + opt->dirs[PE_DIR_TLS].va,
+                    PE_TLS_DIRECTORY_BYTES)) {
+    return fail("missing PE TLS directory");
+  }
+
+  struct image_tls_directory64 *tls =
+      (void *)(image_base + opt->dirs[PE_DIR_TLS].va);
+  if (tls->start_address_of_raw_data > tls->end_address_of_raw_data ||
+      tls->address_of_callbacks != 0 ||
+      !range_inside(image_base, image_bytes, tls->start_address_of_raw_data,
+                    tls->end_address_of_raw_data -
+                        tls->start_address_of_raw_data) ||
+      !range_inside(image_base, image_bytes, tls->address_of_index,
+                    sizeof(uint32_t))) {
+    return fail("unsupported PE TLS directory");
+  }
+
+  uint32_t align_code = (tls->characteristics >> 20) & 0xFu;
+  if (align_code == 15) {
+    return fail("invalid PE TLS alignment");
+  }
+  uint64_t alignment = align_code == 0 ? 1 : 1ull << (align_code - 1);
+  if (alignment > UPAGE_SIZE) {
+    return fail("PE TLS alignment exceeds one page");
+  }
+  uint64_t raw_bytes =
+      tls->end_address_of_raw_data - tls->start_address_of_raw_data;
+  uint64_t tls_bytes;
+  if (__builtin_add_overflow(raw_bytes, (uint64_t)tls->size_of_zero_fill,
+                             &tls_bytes) ||
+      tls_bytes > (1ull << 20)) {
+    return fail("PE TLS template too large");
+  }
+  uint64_t data_offset = align_up(PE_TLS_DATA_MIN_OFFSET, alignment);
+  uint64_t runtime_bytes;
+  if (__builtin_add_overflow(data_offset, tls_bytes, &runtime_bytes)) {
+    return fail("PE TLS runtime overflow");
+  }
+  uint64_t runtime =
+      sys_vm_alloc(runtime_bytes, VM_PROT_READ | VM_PROT_WRITE);
+  if (sys_iserr(runtime)) {
+    return fail("vm_alloc(TLS) failed");
+  }
+
+  uint64_t vector = runtime + PE_TLS_VECTOR_OFFSET;
+  uint64_t data = runtime + data_offset;
+  *(uint64_t *)(runtime + PE_TEB_SELF_OFFSET) = runtime;
+  *(uint64_t *)(runtime + PE_TEB_TLS_VECTOR_OFFSET) = vector;
+  *(uint64_t *)vector = data;
+  *(uint32_t *)tls->address_of_index = 0;
+  memcpy((void *)data, (const void *)tls->start_address_of_raw_data,
+         raw_bytes);
+  // VM_ALLOC already zeroed SizeOfZeroFill and all TEB/vector padding.
+  return runtime;
 }
 
 uint64_t pe_spawn_resources(const uint8_t *image, uint64_t len, uint64_t arg,
@@ -170,6 +267,12 @@ uint64_t pe_spawn_resources(const uint8_t *image, uint64_t len, uint64_t arg,
     }
   }
 
+  uint64_t tls_runtime = pe_tls_create(base);
+  if (tls_runtime == 0) {
+    sys_vm_free(base);
+    return 0;
+  }
+
   // Embryo construction (§5): image and stack move down the tree edge,
   // then the parent sets the moved image's per-section W^X — its one
   // window of authority over another process's views.
@@ -178,15 +281,34 @@ uint64_t pe_spawn_resources(const uint8_t *image, uint64_t len, uint64_t arg,
     sys_vm_free(base);
     return fail("proc_create failed");
   }
-  uint64_t stack = sys_vm_alloc(stack_len, VM_PROT_READ | VM_PROT_WRITE);
+  uint64_t stack_request;
+  if (__builtin_add_overflow(stack_len, UPAGE_SIZE, &stack_request)) {
+    sys_vm_free(tls_runtime);
+    sys_vm_free(base);
+    sys_proc_kill(pid);
+    return fail("stack size overflow");
+  }
+  uint64_t stack =
+      sys_vm_alloc(stack_request, VM_PROT_READ | VM_PROT_WRITE);
   if (sys_iserr(stack)) {
+    sys_vm_free(tls_runtime);
     sys_vm_free(base);
     sys_proc_kill(pid);
     return fail("vm_alloc(stack) failed");
   }
-  if (sys_iserr(sys_vm_move(base, pid)) || sys_iserr(sys_vm_move(stack, pid))) {
+  uint64_t stack_bytes = sys_vm_size(stack);
+  *(uint64_t *)(tls_runtime + 0x08) = stack + stack_bytes;
+  *(uint64_t *)(tls_runtime + 0x10) = stack + UPAGE_SIZE;
+  if (sys_iserr(sys_vm_move(base, pid)) ||
+      sys_iserr(sys_vm_move(stack, pid)) ||
+      sys_iserr(sys_vm_move(tls_runtime, pid))) {
     sys_proc_kill(pid);
     return fail("vm_move failed");
+  }
+
+  if (sys_iserr(sys_vm_protect_for(stack, UPAGE_SIZE, 0, pid))) {
+    sys_proc_kill(pid);
+    return fail("stack guard failed");
   }
   for (uint32_t i = 0; i < nresources; i++) {
     uint64_t rc = sys_vm_share(resources[i].base, pid, resources[i].prot);
@@ -214,8 +336,15 @@ uint64_t pe_spawn_resources(const uint8_t *image, uint64_t len, uint64_t arg,
     sys_vm_protect_for(base + s->virtual_address, size, prot, pid);
   }
 
-  uint64_t tid =
-      sys_thread_spawn(pid, base + opt->entry_point, stack + stack_len, arg);
+  struct gdos_thread_start start = {
+      .version = GDOS_THREAD_START_VERSION,
+      .size = sizeof(start),
+      .entry = base + opt->entry_point,
+      .argument = arg,
+      .stack_pointer = stack + stack_bytes,
+      .gs_base = tls_runtime,
+  };
+  uint64_t tid = sys_thread_spawn(pid, &start);
   if (sys_iserr(tid)) {
     sys_proc_kill(pid);
     return fail("thread_spawn failed");

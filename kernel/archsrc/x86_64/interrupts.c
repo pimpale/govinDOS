@@ -15,6 +15,7 @@
 #include "process.h"
 #include "stdlib/stdio.h"
 #include "thread.h"
+#include "timer.h"
 #include "trap_frame.h"
 
 #define INT_NMI 0x02
@@ -115,22 +116,22 @@ uint64_t interrupt_handler(struct trap_frame *tf, uint64_t vector,
     cull_if_killed(tf);
     irq_exit();
     return 0;
-  case VECTOR_PREEMPT:
-    // Quantum expiry: an involuntary SYS_YIELD. From ring 3 the trap
-    // frame on this stack is the thread's complete GPR state (the FPU
-    // half is captured by the frame save), so park it requeued; the
-    // dispatch that picks it back up arms a fresh quantum. In kernel
-    // mode the only IF=1 context is the scheduler loop's own
-    // idle/dispatch windows — a stale shot there is spurious, and that
-    // loop reschedules on its own.
+  case VECTOR_TIMER: {
+    // One LAPIC shot multiplexes userspace absolute timers and the current
+    // scheduling quantum. A timer-only expiry returns to the interrupted
+    // thread with its original absolute quantum still armed; only an actual
+    // quantum expiry becomes an involuntary yield.
     x86_lapic_eoi();
-    if ((tf->cs & 3) == 3) {
+    bool preempt = timer_cpu_interrupt();
+    if (preempt && (tf->cs & 3) == 3) {
       cull_if_killed(tf); // preempted thread of a dead process exits here
       arch_uthread_save_frame(thread_current(), tf);
       uthread_park_yield(); // never returns
     }
+    cull_if_killed(tf);
     irq_exit();
     return 0;
+  }
   default:
     if (irq_is_device_vector(vector)) {
       irq_deliver((uint8_t)vector);

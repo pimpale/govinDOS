@@ -368,7 +368,8 @@ int umem_free(struct process *p, uint64_t base) {
   }
   ublock *b;
   vec_ublock_ptr_get(p->blocks, (uint32_t)i, &b);
-  if (b->dma_pins != 0 || !channel_block_destroyable(b)) {
+  if (b->dma_pins != 0 || atomic_load(&b->thread_pins) != 0 ||
+      !channel_block_destroyable(b)) {
     umem_proc_unlock(p);
     umem_unlock();
     return (int)SYSERR_EXIST;
@@ -399,6 +400,10 @@ int umem_protect(struct process *p, uint64_t base, size_t len,
   // between wait's user_range_ok and its load.
   umem_proc_lock(p);
   ublock *b = umem_view_locked(p, base, len);
+  if (b != nullptr && atomic_load(&b->thread_pins) != 0) {
+    umem_proc_unlock(p);
+    return -1;
+  }
   // A kernel channel's CQ is written from borrowed contexts, including IRQ
   // context where a kernel-mode page fault is fatal. Scheme creation holds
   // this same list lock through b->ring publication, so this test cannot
@@ -426,7 +431,7 @@ uint64_t umem_share(struct process *p, uint64_t base, uint64_t target_pid,
   umem_proc_unlock(p); // b stays pinned by g_umem
   struct process *target = proc_lookup(target_pid);
   if (b == nullptr || target == nullptr || target == p || b->ring != nullptr ||
-      !b->delegatable ||
+      atomic_load(&b->thread_pins) != 0 || !b->delegatable ||
       (b->backing == UBLOCK_DEVICE &&
        ((prot & ~b->device_flags) != 0 || (prot & PAGE_X)))) {
     umem_unlock();
@@ -554,7 +559,7 @@ void umem_reap_finish_locked(struct process *p) {
 
 uint64_t umem_move_locked(ublock *b, struct process *from, struct process *to,
                           bool src_as_live) {
-  if (b->dma_pins != 0)
+  if (b->dma_pins != 0 || atomic_load(&b->thread_pins) != 0)
     return SYSERR_EXIST;
   if (!b->delegatable)
     return SYSERR_INVAL;

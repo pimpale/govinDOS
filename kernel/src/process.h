@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+#include <gdosabi/thread.h>
+
 #include "thread.h"
 
 // Process trees, parent-driven creation, and parent-driven teardown
@@ -32,9 +34,10 @@
 struct process *process_create(struct process *parent);
 
 // Spawn a thread into `p` (kernel-driven: init's first thread, boot
-// tests), sealing an embryo. Takes the umem lock.
-struct thread *process_spawn_thread(struct process *p, uint64_t entry,
-                                    uint64_t stack_top, uint64_t arg);
+// tests), sealing an embryo. Takes the umem lock. Stack bounds and guards are
+// userspace policy; start->stack_pointer is only the initial user RSP.
+struct thread *process_spawn_thread(struct process *p,
+                                    const struct gdos_thread_start *start);
 
 // Effective liveness: true when p or any immutable ancestor is directly
 // PROC_DEAD. Safe for lock-free checkpoint reads because process structs are
@@ -66,8 +69,8 @@ void process_set_init(struct process *p);
 // Syscall backends (syscall.c).
 uint64_t proc_sys_create(struct thread *curr);
 uint64_t proc_sys_thread_spawn(struct thread *curr, uint64_t pid,
-                               uint64_t entry, uint64_t stack_top,
-                               uint64_t arg);
+                               uint64_t start_ptr, uint64_t start_size);
+[[noreturn]] void proc_sys_process_exit(struct thread *curr, uint64_t status);
 uint64_t proc_sys_kill(struct thread *curr, uint64_t pid);
 uint64_t proc_sys_reap(struct thread *curr, uint64_t pid);
 uint64_t proc_sys_vm_move(struct thread *curr, uint64_t base, uint64_t pid);

@@ -58,6 +58,10 @@ void x86_lapic_eoi(void);
 // clocks off the shared bus clock, so one measurement serves all CPUs.
 void x86_lapic_timer_calibrate(void);
 
+// Monotonic nanoseconds from the TSC calibrated during the same PIT interval
+// as the LAPIC timer. Safe on every CPU after BSP calibration.
+uint64_t x86_monotonic_ns(void);
+
 // Arm this CPU's LAPIC timer as a one-shot: `vector` is delivered here
 // in `us` microseconds (clamped to the 32-bit count range). Re-arming
 // replaces the pending shot. Requires x86_lapic_timer_calibrate.

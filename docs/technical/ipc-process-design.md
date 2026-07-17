@@ -513,7 +513,11 @@ zero-copy.
 SYS_PROC_CREATE()                        -> pid   // embryo: AS clone, no threads
 SYS_VM_MOVE(base, pid)                            // ownership transfer along tree edges only (below)
 SYS_VM_PROTECT(base, len, prot [, pid])           // parent may set an embryo's views (W^X after writing)
-SYS_THREAD_SPAWN(pid, entry, stack_top)  -> tid   // parent+embryo only; first spawn seals the child
+SYS_THREAD_SPAWN(pid, &start, sizeof start) -> tid // versioned entry/arg/RSP/TLS/completion descriptor
+SYS_THREAD_BASES_SET(fsbase, gsbase)        -> 0   // change the current thread's user TLS bases
+SYS_GETTID()                                -> tid
+SYS_THREAD_EXIT()                           -> never // current thread only
+SYS_PROC_EXIT(status)                       -> never // whole process; status reported to parent
 SYS_PROC_KILL(pid)                                // own descendant; logical subtree death (O(depth))
 SYS_PROC_REAP(pid)     -> more | done | again     // own dead child; one bounded step (§4)
 ```
@@ -538,6 +542,13 @@ SYS_PROC_REAP(pid)     -> more | done | again     // own dead child; one bounded
   introduced.
 - `SYS_THREAD_SPAWN(self, ...)` post-embryo gives in-process
   multithreading with no extra mechanism.
+- The kernel consumes only an initial user `stack_pointer`; allocation bounds
+  and guard pages belong to the userspace loader/thread library. It checks that
+  the initial stack page is writable, but does not infer or enforce a stack
+  layout. The versioned start descriptor also supplies initial FS/GS bases and
+  an optional private completion word. Completion is release-published only
+  after the departing thread is off every CPU, so an acquire-observing joiner
+  may immediately reclaim that thread's userspace stack and TLS allocation.
 
 ### The tree
 
@@ -594,10 +605,13 @@ rings/dummydev (and their kthreads) had to go with it.
 
 ## 7. Implementation notes and deliberate divergences (2026-07-07)
 
-- **Timer preemption is implemented (2026-07-08).** A LAPIC one-shot
-  (VECTOR_PREEMPT=0xFB) is armed by the scheduler loop before every
-  dispatch (fresh 10 ms quantum per dispatch) and disarmed on the idle
-  path, so idle is tickless. Expiry from ring 3 is an involuntary
+- **Timer preemption is implemented (2026-07-08), and the timer scheme
+  shares it (2026-07-17).** Each CPU's LAPIC one-shot
+  (`VECTOR_TIMER=0xFB`) is armed for the earlier of its absolute 10 ms
+  dispatch-quantum deadline and its earliest `KSCHEME_TIMER` deadline. The
+  idle path removes the quantum but preserves user timers. A timer-only
+  interrupt rearms the remainder of the existing quantum; it never grants
+  more CPU time. Quantum expiry from ring 3 is an involuntary
   SYS_YIELD: the handler EOIs, runs the death checkpoint, saves the trap
   frame into the TCB and parks-requeued — the same path as a voluntary
   yield, so nothing downstream can tell the difference. The kernel is
@@ -606,12 +620,17 @@ rings/dummydev (and their kthreads) had to go with it.
   instruction into ring 3 (syscalls are implicit critical sections;
   worst-case preemption latency = longest syscall). A shot landing in
   the scheduler loop's own IF=1 windows is treated as spurious. The
-  timer is calibrated once on the BSP against polled PIT channel 2 (the
-  APIC timer clocks off the shared bus clock). Preemption at arbitrary
-  ring-3 instructions is what forced eager FPU handling: fxsave64 into a
-  512-byte TCB area at every frame save, fxrstor64 at resume. x87/SSE
-  only — userspace stays -mgeneral-regs-only / AVX-free until XSAVE
-  lands. This also closed the last reap gap: a CPU-bound thread of a
+  LAPIC timer and TSC are calibrated once on the BSP against polled PIT
+  channel 2. `KTIMER_NOW` converts the TSC in-kernel; absolute one-shot
+  events remain durable when their CQ is full. Preemption at arbitrary
+  ring-3 instructions is what forced eager extended-state handling. The
+  original fixed FXSAVE area was replaced on 2026-07-17 by a dynamically
+  CPUID.0D-sized, 64-byte-aligned standard XSAVE area per TCB. Each CPU
+  enables the BSP-selected XCR0 policy (x87/SSE, AVX when present, and the
+  complete AVX-512 state group when present), and every park/resume eagerly
+  XSAVEs/XRSTORs it. FSBASE and GSBASE are saved beside that state and restored
+  before iretq; `SYS_THREAD_BASES_SET` lets a PE or ELF CRT establish both.
+  This also closed the last reap gap: a CPU-bound thread of a
   killed process now hits its death checkpoint within one quantum, so
   nthreads/AS-drain gates clear in bounded time.
 - **SYSCALL/SYSRET replaced `int 0x80`** (requested during
@@ -656,9 +675,10 @@ rings/dummydev (and their kthreads) had to go with it.
   path are gone. Process-private ublock events plus sharded server queues are
   the userspace building blocks for multiplexing. Existing scheme ids were
   intentionally not renumbered.
-- **SYS_THREAD_SPAWN carries an `arg`** (4th syscall argument) delivered
-  in the child thread's first argument register — how init hands a
-  child its bootstrap-channel address without any other channel yet.
+- **SYS_THREAD_SPAWN takes a versioned start descriptor** whose `argument` is
+  delivered in the new thread's first argument register — how init hands a
+  child its bootstrap-channel address without any other channel yet. Syscall
+  14 was changed in place; there is no legacy `SYS_THREAD_SPAWN2` spelling.
 - **init**: loaded by the kernel from the embedded PE blob (pe.c's one
   remaining caller); its death is a kernel panic. hello.c is init and
   the whole ring-3 test suite: it builds children per §5 (embryo, move,

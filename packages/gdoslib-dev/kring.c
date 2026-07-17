@@ -104,6 +104,28 @@ uint64_t kring_ack(struct kring *r) {
   return sys_block_doorbell(r->base);
 }
 
+static uint64_t timer_submit(struct kring *r, uint64_t op, uint64_t a,
+                             uint64_t b, uint64_t c) {
+  struct ksqe *sqe = kring_get_sqe(r);
+  if (sqe == nullptr)
+    return SYSERR_AGAIN;
+  *sqe = (struct ksqe){.op = op, .a = a, .b = b, .c = c};
+  return kring_submit(r);
+}
+
+uint64_t kring_timer_now(struct kring *r) {
+  return timer_submit(r, KTIMER_NOW, 0, 0, 0);
+}
+
+uint64_t kring_timer_arm_abs(struct kring *r, uint64_t id,
+                             uint64_t deadline_ns, uint64_t cookie) {
+  return timer_submit(r, KTIMER_ARM_ABS, id, deadline_ns, cookie);
+}
+
+uint64_t kring_timer_cancel(struct kring *r, uint64_t id) {
+  return timer_submit(r, KTIMER_CANCEL, id, 0, 0);
+}
+
 static uint64_t irq_submit(struct kring *r, uint64_t op, uint64_t a,
                            uint64_t b) {
   struct ksqe *sqe = kring_get_sqe(r);

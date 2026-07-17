@@ -12,6 +12,6 @@
 
 #define KSCHEME_TREE ((int64_t)-3)
 
-#define KEV_CHILD_DEAD KEV(2) // a = dead child pid
+#define KEV_CHILD_DEAD KEV(2) // a = dead child pid, b = process exit status
 
 #endif // gdos_kring_tree_h_INCLUDED

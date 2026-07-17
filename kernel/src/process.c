@@ -9,11 +9,15 @@
 #include "iommu.h"
 #include "irq_scheme.h"
 #include "paging.h"
+#include "scheduler.h"
 #include "stdlib/stdio.h"
 #include "stdlib/stdlib.h"
 #include "syscall.h"
 #include "thread.h"
 #include "umem.h"
+#include "uaccess.h"
+
+#include <gdosabi/thread.h>
 
 // Monotonic, never reused: 2^63 pids outlast the hardware, so a
 // (pid, base) pair is forever unambiguous (no ABA on stale references).
@@ -23,8 +27,12 @@ static struct process *g_init;
 
 static struct thread *process_spawn_thread_locked(struct process *p,
                                                   uint64_t entry,
-                                                  uint64_t stack_top,
-                                                  uint64_t arg);
+                                                  uint64_t stack_pointer,
+                                                  uint64_t arg,
+                                                  uint64_t fs_base,
+                                                  uint64_t gs_base,
+                                                  ublock *completion_block,
+                                                  uint64_t completion_event);
 
 #define REAP_TCB_BATCH 256
 
@@ -59,28 +67,37 @@ struct process *process_create(struct process *parent) {
   return p;
 }
 
-struct thread *process_spawn_thread(struct process *p, uint64_t entry,
-                                    uint64_t stack_top, uint64_t arg) {
+struct thread *process_spawn_thread(struct process *p,
+                                    const struct gdos_thread_start *start) {
   umem_lock();
-  struct thread *t = process_spawn_thread_locked(p, entry, stack_top, arg);
+  struct thread *t = process_spawn_thread_locked(
+      p, start->entry, start->stack_pointer, start->argument, start->fs_base,
+      start->gs_base, nullptr, 0);
   umem_unlock();
   return t;
 }
 
 static struct thread *process_spawn_thread_locked(struct process *p,
                                                   uint64_t entry,
-                                                  uint64_t stack_top,
-                                                  uint64_t arg) {
+                                                  uint64_t stack_pointer,
+                                                  uint64_t arg,
+                                                  uint64_t fs_base,
+                                                  uint64_t gs_base,
+                                                  ublock *completion_block,
+                                                  uint64_t completion_event) {
   asserts(!process_is_dead(p), "process: spawning into the dead");
   // First spawn seals the embryo: parent authority (VM_MOVE in,
   // parent-set protections) drops to normal peer.
   p->state = PROC_LIVE;
-  atomic_fetch_add(&p->nthreads, 1);
-  // Bookkeeping before the enqueue inside uthread_spawn: the thread can
-  // run (and exit) on another CPU the moment it is enqueued.
-  struct thread *t = uthread_spawn(p, entry, stack_top, arg);
+  // Construct privately, install every process/ABI field, then enqueue as
+  // the final publication. The old order queued first and let a fast exit on
+  // another CPU race remove_thread_ref before proc_slot/vector insertion.
+  struct thread *t = uthread_spawn(p, entry, stack_pointer, arg, fs_base,
+                                   gs_base, completion_block, completion_event);
   t->proc_slot = vec_thread_ptr_len(p->threads);
   vec_thread_ptr_push(p->threads, &t);
+  atomic_fetch_add(&p->nthreads, 1);
+  scheduler_enqueue(t);
   return t;
 }
 
@@ -154,7 +171,15 @@ void process_kill_subtree(struct process *p) {
 void process_thread_exited(struct thread *t) {
   struct process *p = t->proc;
   umem_lock();
+  // This hook is reached only after scheduler_loop release-stored on_cpu=false.
+  // Therefore an acquiring joiner may reclaim the departed thread's stack and
+  // TLS immediately after observing this publication.
+  if (!process_is_dead(p) && t->completion_block != nullptr) {
+    channel_thread_complete_locked(p, t->completion_block,
+                                   t->completion_event);
+  }
   remove_thread_ref(p, t);
+  arch_thread_destroy(t);
   free(t);
   uint64_t left = atomic_fetch_sub(&p->nthreads, 1) - 1;
   if (left == 0 && !process_is_dead(p)) {
@@ -216,6 +241,7 @@ static uint64_t reap_step_locked(struct process *target,
       break;
     }
     remove_thread_ref(z, t);
+    arch_thread_destroy(t);
     free(t);
     atomic_fetch_sub(&z->nthreads, 1);
     ntcbs++;
@@ -293,25 +319,104 @@ uint64_t proc_sys_create(struct thread *curr) {
   return child->pid;
 }
 
+static bool canonical48(uint64_t address) {
+  uint64_t high = address >> 47;
+  return high == 0 || high == 0x1FFFF;
+}
+
+static bool user_page_has(struct process *p, uint64_t address,
+                          paging_flags_t required) {
+  paging_flags_t flags = 0;
+  bool present = false;
+  as_getinfo(p->as, address, &flags, &present);
+  return present && (flags & required) == required;
+}
+
 uint64_t proc_sys_thread_spawn(struct thread *curr, uint64_t pid,
-                               uint64_t entry, uint64_t stack_top,
-                               uint64_t arg) {
-  struct process *me = curr->proc;
+                               uint64_t start_ptr, uint64_t start_size) {
+  if (start_size != sizeof(struct gdos_thread_start)) {
+    return SYSERR_INVAL;
+  }
+  struct gdos_thread_start start;
+  // Pin the caller's list across validation+copy so a sibling cannot free or
+  // guard the descriptor between user_range_ok and the load.
+  umem_proc_lock(curr->proc);
+  bool readable = user_range_ok(curr->proc, start_ptr, sizeof(start), false);
+  if (readable) {
+    start = *(const struct gdos_thread_start *)start_ptr;
+  }
+  umem_proc_unlock(curr->proc);
+  if (!readable) {
+    return SYSERR_FAULT;
+  }
+  if (start.version != GDOS_THREAD_START_VERSION ||
+      start.size != sizeof(start) || !canonical48(start.entry) ||
+      !canonical48(start.stack_pointer) ||
+      !canonical48(start.fs_base) || !canonical48(start.gs_base) ||
+      start.stack_pointer % 16 != 0) {
+    return SYSERR_INVAL;
+  }
+
   umem_lock();
+  struct process *me = curr->proc;
   struct process *target = umem_proc_lookup_locked(pid);
-  // Self (post-embryo in-process multithreading) or own embryo (the
-  // parent explicitly spawns the child's first thread; this seals it).
-  bool ok = target == me ||
-            (target != nullptr && target->parent == me &&
-             target->state == PROC_EMBRYO);
-  if (!ok) {
+  bool authority = target == me ||
+                   (target != nullptr && target->parent == me &&
+                    target->state == PROC_EMBRYO);
+  if (!authority ||
+      !user_page_has(target, start.entry, PAGE_U | PAGE_R | PAGE_X) ||
+      start.stack_pointer == 0 ||
+      !user_page_has(target, start.stack_pointer - 1,
+                     PAGE_U | PAGE_R | PAGE_W)) {
     umem_unlock();
     return SYSERR_INVAL;
   }
-  struct thread *t = process_spawn_thread_locked(target, entry, stack_top, arg);
+
+  ublock *completion_block = nullptr;
+  umem_proc_lock(target);
+  bool start_ok = true;
+  if (start.completion_event != 0) {
+    // Join completion is process-private. Cross-process first-thread
+    // lifetime is represented by the tree channel instead.
+    completion_block =
+        target == me
+            ? umem_view_locked(target, start.completion_event, sizeof(uint32_t))
+            : nullptr;
+    start_ok = start.completion_event % alignof(uint32_t) == 0 &&
+               completion_block != nullptr &&
+               completion_block->owner == target &&
+               completion_block->backing == UBLOCK_RAM &&
+               completion_block->ring == nullptr &&
+               vec_share_edge_len(completion_block->sharers) == 0 &&
+               user_range_ok(target, start.completion_event, sizeof(uint32_t),
+                             true) &&
+               *(volatile _Atomic uint32_t *)start.completion_event ==
+                   GDOS_THREAD_PENDING;
+    if (start_ok) {
+      atomic_fetch_add(&completion_block->thread_pins, 1);
+    }
+  }
+  umem_proc_unlock(target);
+  if (!start_ok) {
+    umem_unlock();
+    return SYSERR_INVAL;
+  }
+
+  struct thread *t = process_spawn_thread_locked(
+      target, start.entry, start.stack_pointer, start.argument, start.fs_base,
+      start.gs_base, completion_block, start.completion_event);
   uint64_t tid = t->tid;
   umem_unlock();
   return tid;
+}
+
+[[noreturn]] void proc_sys_process_exit(struct thread *curr, uint64_t status) {
+  umem_lock();
+  curr->proc->exit_status = status;
+  mark_dead_locked(curr->proc);
+  notify_parent_locked(curr->proc);
+  umem_unlock();
+  uthread_park_exit();
 }
 
 uint64_t proc_sys_kill(struct thread *curr, uint64_t pid) {

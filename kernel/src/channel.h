@@ -31,6 +31,7 @@
 #include <gdosabi/kring_irq.h>
 #include <gdosabi/kring_iommu.h>
 #include <gdosabi/kring_shares.h>
+#include <gdosabi/kring_timer.h>
 #include <gdosabi/kring_tree.h>
 
 // Kernel-channel endpoint. Lives on the ublock (b->ring); owner-only.
@@ -51,6 +52,9 @@ struct ring {
   // count are g_umem-only; each route's delivery state has its own lock.
   struct irq_route *irq_claims;
   uint32_t nclaims;
+  // Scheme -5 only. IRQ expiration decrements this concurrently with command
+  // submission; endpoint destruction has removed every timer before free.
+  _Atomic uint32_t timer_count;
 };
 
 // ---------------------------------------------------------------------------
@@ -101,5 +105,11 @@ void channel_block_torn(ublock *b, bool destroy_endpoint);
 // Voluntary VM_FREE must not destroy a stateful endpoint until its scheme
 // resources are gone. Reap performs the scheme cleanup first.
 bool channel_block_destroyable(ublock *b);
+
+// Publish a thread's post-deschedule completion and wake a waiter on its
+// private event block. Caller holds g_umem; the TCB owns one thread_pins
+// reference on `block`. The reference is consumed here.
+void channel_thread_complete_locked(struct process *p, ublock *block,
+                                    uint64_t event);
 
 #endif // channel_h_INCLUDED

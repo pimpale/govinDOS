@@ -14,16 +14,4 @@ void scheduler_arch_idle(void);
 // EOI — the iretq alone is what bounces the target out of hlt/wfi.
 void scheduler_arch_wake_cpu(uint64_t hw_id);
 
-// Arm THIS CPU's preemption timer: one shot, VECTOR_PREEMPT in `us`
-// microseconds. Called with IRQs off immediately before dispatching a
-// thread; re-arming replaces any earlier shot, so every dispatch starts
-// a fresh quantum.
-void scheduler_arch_preempt_arm(uint64_t us);
-
-// Disarm THIS CPU's preemption timer. Called on the idle path so a shot
-// left over from a thread that parked early doesn't wake the hlt. One
-// already-accepted shot may still land; its handler no-ops in kernel
-// mode, which is all an idle CPU ever is.
-void scheduler_arch_preempt_disarm(void);
-
 #endif // scheduler_arch_h_INCLUDED
