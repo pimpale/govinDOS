@@ -8,13 +8,19 @@
 #define GDOS_THREAD_START_VERSION 1u
 #define GDOS_THREAD_START_SIZE 56u
 
+// A plain Win64 entry function starts after a conceptual call: one return
+// slot followed by the caller-owned 32-byte shadow area. Thread libraries
+// reserve this below their allocation's stack top before supplying RSP.
+#define GDOS_THREAD_ENTRY_FRAME_BYTES 40u
+
 struct gdos_thread_start {
   uint32_t version;
   uint32_t size;
   uint64_t entry;
   uint64_t argument;
-  // Initial user RSP. Stack allocation bounds and guard-page policy are
-  // entirely userspace state retained by the thread library.
+  // Exact initial user RSP. Stack allocation bounds and guard-page policy are
+  // entirely userspace state retained by the thread library. A plain C entry
+  // normally uses allocation_top - GDOS_THREAD_ENTRY_FRAME_BYTES.
   uint64_t stack_pointer;
   uint64_t fs_base;
   uint64_t gs_base;

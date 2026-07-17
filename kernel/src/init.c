@@ -385,7 +385,8 @@ static void init_setup(const uint8_t *image, size_t image_len) {
       .size = sizeof(start),
       .entry = entry,
       .argument = (uint64_t)bi,
-      .stack_pointer = (uint64_t)stack + stack_bytes,
+      .stack_pointer =
+          (uint64_t)stack + stack_bytes - GDOS_THREAD_ENTRY_FRAME_BYTES,
       .gs_base = gs_base,
   };
   process_spawn_thread(p, &start);

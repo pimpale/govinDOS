@@ -19,8 +19,8 @@ export AS=nasm
 
 export SYSROOT="$CBUILDROOT"
 export CPPFLAGS="-I$SYSROOT/usr/include"
-export CFLAGS="-std=c23 -ffreestanding -fno-builtin -mno-red-zone -mgeneral-regs-only -fno-stack-protector -O1"
-export CXXFLAGS="-ffreestanding -fno-builtin -mno-red-zone -mgeneral-regs-only -fno-stack-protector -O1"
+export CFLAGS="-std=c23 -ffreestanding -fno-builtin -mno-red-zone -fno-stack-protector -O1"
+export CXXFLAGS="-ffreestanding -fno-builtin -mno-red-zone -fno-stack-protector -O1"
 export LDFLAGS="-nostdlib -L$SYSROOT/usr/lib -Wl,/subsystem:native,/entry:_start,/nodefaultlib,/fixed:no,/dynamicbase,/debug:none,/include:_tls_used"
 export ARFLAGS=rcs
 export ASFLAGS="-f win64"

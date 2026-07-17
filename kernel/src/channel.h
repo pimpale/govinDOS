@@ -52,9 +52,10 @@ struct ring {
   // count are g_umem-only; each route's delivery state has its own lock.
   struct irq_route *irq_claims;
   uint32_t nclaims;
-  // Scheme -5 only. IRQ expiration decrements this concurrently with command
-  // submission; endpoint destruction has removed every timer before free.
-  _Atomic uint32_t timer_count;
+  // Scheme -5 only. Both fields are protected by timer.c's global timer lock;
+  // the endpoint list bounds ID lookup and teardown by this ring's nslots.
+  struct kernel_timer *timers;
+  uint32_t timer_count;
 };
 
 // ---------------------------------------------------------------------------

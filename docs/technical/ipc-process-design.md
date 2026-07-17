@@ -542,13 +542,14 @@ SYS_PROC_REAP(pid)     -> more | done | again     // own dead child; one bounded
   introduced.
 - `SYS_THREAD_SPAWN(self, ...)` post-embryo gives in-process
   multithreading with no extra mechanism.
-- The kernel consumes only an initial user `stack_pointer`; allocation bounds
-  and guard pages belong to the userspace loader/thread library. It checks that
-  the initial stack page is writable, but does not infer or enforce a stack
-  layout. The versioned start descriptor also supplies initial FS/GS bases and
-  an optional private completion word. Completion is release-published only
-  after the departing thread is off every CPU, so an acquire-observing joiner
-  may immediately reclaim that thread's userspace stack and TLS allocation.
+- The kernel consumes only an initial user `stack_pointer` (`8 mod 16` at a
+  Win64 function entry); allocation bounds and guard pages belong to the
+  userspace loader/thread library. It checks that the initial stack page is
+  writable, but does not infer or enforce a stack layout. The versioned start
+  descriptor also supplies initial FS/GS bases and an optional private
+  completion word. Completion is release-published only after the departing
+  thread is off every CPU, so an acquire-observing joiner may immediately
+  reclaim that thread's userspace stack and TLS allocation.
 
 ### The tree
 
@@ -724,6 +725,6 @@ specifically — the authoritative comments live in `umem.h`,
   the owner's list lock while tearing a private waiter and publishing the
   ring, so nobody can re-park in between.
 - **Layout**: per-scheme logic moved to `kernel/src/schemes/{shares,
-  tree,irq}.c` over the shared internals in `channel_internal.h`;
+  tree,irq,timer}.c` over the shared internals in `channel_internal.h`;
   `channel.c` keeps the plumbing, data-plane syscalls, drains, and
   teardown.

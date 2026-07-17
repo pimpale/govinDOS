@@ -26,8 +26,14 @@ then apply a global atomic monotonic clamp to tolerate small cross-CPU skew.
 There is deliberately no userspace conversion page: `KTIMER_NOW` is the sole
 public read interface.
 
-Timers are assigned to the CPU executing `KTIMER_ARM_ABS` and kept in a sorted
-per-CPU queue. Each CPU's one-shot LAPIC deadline is:
+Timers are assigned to the CPU executing `KTIMER_ARM_ABS` and kept in a per-CPU
+left-leaning red-black tree keyed by `(absolute deadline, insertion sequence)`.
+Arm, cancellation, and expiry removal are `O(log n)`, minimum lookup is
+allocation-free, and equal deadlines retain FIFO order. A global timer spinlock
+also protects a deadline-sorted, per-endpoint list capped at
+`min(ring slots, 1024)`. ID lookup, cancellation, and teardown are therefore
+fixed-bounded rather than proportional to total system timer count. Each CPU's
+one-shot LAPIC deadline is:
 
 ```
 min(current absolute quantum deadline, earliest armed timer deadline)
@@ -38,6 +44,10 @@ quantum; it never grants a fresh quantum. The scheduler idle path removes its
 quantum but preserves the earliest timer, allowing a thread parked on the timer
 ring to wake without polling. Distant deadlines are handled by harmless early
 checkpoints when the 32-bit LAPIC count saturates.
+
+An interrupt processes at most 64 expirations. If more are simultaneously due,
+the still-due queue head schedules another near-immediate shot. This keeps IRQ
+work bounded independently of the number of timer endpoints in the system.
 
 Cancellation from the timer's owning CPU reprograms immediately. Cross-CPU
 cancellation may leave the old earlier one-shot in place; its eventual

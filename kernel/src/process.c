@@ -353,7 +353,7 @@ uint64_t proc_sys_thread_spawn(struct thread *curr, uint64_t pid,
       start.size != sizeof(start) || !canonical48(start.entry) ||
       !canonical48(start.stack_pointer) ||
       !canonical48(start.fs_base) || !canonical48(start.gs_base) ||
-      start.stack_pointer % 16 != 0) {
+      start.stack_pointer % 16 != 8) {
     return SYSERR_INVAL;
   }
 

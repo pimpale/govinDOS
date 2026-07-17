@@ -5,6 +5,7 @@
 
 #include "spinlock.h"
 #include "thread.h"
+#include "timer_queue.h"
 
 #define LIST_DTYPE thread_ptr
 #include <list/list.h>
@@ -48,12 +49,10 @@ struct scheduler {
   _Atomic bool idle;
 
   // One local-APIC timer is multiplexed between this CPU's scheduling
-  // quantum and the absolute timers armed on it. timer_lock is never held
-  // while scheduler.lock is held.
-  struct spinlock timer_lock;
-  struct kernel_timer *timers_armed;  // deadline-sorted
-  struct kernel_timer *timers_pending; // expired, waiting for CQ space
-  uint64_t quantum_deadline_ns;       // zero outside a dispatched quantum
+  // quantum and the absolute timers armed on it. The global timer lock is
+  // never held while scheduler.lock is held.
+  llrb_timer_deadline *timers_armed; // keyed by (deadline, sequence)
+  uint64_t quantum_deadline_ns;      // zero outside a dispatched quantum
 };
 
 // One-time global init. Allocates each CPU's queue and initializes its

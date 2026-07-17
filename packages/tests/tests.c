@@ -267,7 +267,8 @@ static void child_process_exit_main(uint64_t arg) {
       .version = GDOS_THREAD_START_VERSION,
       .size = sizeof(peer),
       .entry = (uint64_t)child_burn_main,
-      .stack_pointer = stack + stack_bytes,
+      .stack_pointer =
+          stack + stack_bytes - GDOS_THREAD_ENTRY_FRAME_BYTES,
   };
   uint64_t peer_tid = sys_thread_spawn(sys_getpid(), &peer);
   print("process-exit child: spinning peer tid=");
@@ -315,7 +316,8 @@ static uint64_t spawn_child(void (*entry)(uint64_t), uint64_t boot_ch) {
       .size = sizeof(start),
       .entry = (uint64_t)entry,
       .argument = boot_ch,
-      .stack_pointer = stack + stack_bytes,
+      .stack_pointer =
+          stack + stack_bytes - GDOS_THREAD_ENTRY_FRAME_BYTES,
   };
   uint64_t tid = sys_thread_spawn(pid, &start);
   print("tests: thread_spawn tid=");
@@ -349,7 +351,7 @@ static void reap_child(uint64_t pid) {
 
 // Wait for the next KEV_CHILD_DEAD on the tree channel and consume it.
 static uint64_t await_child_death(struct kring *tch) {
-  struct kcqe cqe;
+  struct kcqe cqe = {0};
   kring_wait_cqe(tch, &cqe);
   print(cqe.type == KEV_CHILD_DEAD ? "tests: KEV_CHILD_DEAD pid="
                                    : "tests: BAD TREE EVENT pid=");
@@ -404,7 +406,8 @@ static void test_thread_lifecycle(void) {
       .size = sizeof(start),
       .entry = (uint64_t)lifecycle_worker,
       .argument = event_base,
-      .stack_pointer = stack + stack_bytes,
+      .stack_pointer =
+          stack + stack_bytes - GDOS_THREAD_ENTRY_FRAME_BYTES,
       .fs_base = fs,
       .gs_base = tls,
       .completion_event = (uint64_t)&event->complete,
@@ -476,7 +479,7 @@ static void test_timer_scheme(void) {
     return;
   }
 
-  struct kcqe cqe;
+  struct kcqe cqe = {0};
   bool ok = kring_timer_now(&timer) == 0 &&
             timer_command(&timer, KTIMER_NOW, &cqe) && cqe.status == 0;
   uint64_t before = cqe.a;
@@ -493,6 +496,18 @@ static void test_timer_scheme(void) {
         timer_command(&timer, KTIMER_NOW, &cqe) && cqe.status == 0 &&
         cqe.a >= deadline && cqe.a >= before;
   uint64_t now = cqe.a;
+
+  // Equal deadlines are distinct in the deadline tree and expire in arm
+  // order (the tree's sequence-number tiebreaker).
+  uint64_t shared_deadline = now + 20 * 1000 * 1000;
+  ok &= kring_timer_arm_abs(&timer, 5, shared_deadline, 0x55) == 0 &&
+        timer_command(&timer, KTIMER_ARM_ABS, &cqe) && cqe.status == 0;
+  ok &= kring_timer_arm_abs(&timer, 6, shared_deadline, 0x66) == 0 &&
+        timer_command(&timer, KTIMER_ARM_ABS, &cqe) && cqe.status == 0;
+  ok &= timer_take(&timer, &cqe) && cqe.type == KEV_TIMER && cqe.a == 5 &&
+        cqe.b == 0x55;
+  ok &= timer_take(&timer, &cqe) && cqe.type == KEV_TIMER && cqe.a == 6 &&
+        cqe.b == 0x66;
 
   // Duplicate live ids are rejected. Cancellation removes the original and
   // endpoint teardown below must also cancel a different outstanding timer.
@@ -514,7 +529,8 @@ static void test_timer_scheme(void) {
   struct kring full;
   bool full_ok = kring_create(&full, KSCHEME_TIMER, 4096) == 0;
   if (full_ok) {
-    full_ok &= kring_timer_arm_abs(&full, 9, full_now + 5000000ull, 0x99) == 0 &&
+    full_ok &= kring_timer_arm_abs(&full, 9, full_now + 5000000ull, 0x99) ==
+                   0 &&
                timer_command(&full, KTIMER_ARM_ABS, &cqe) && cqe.status == 0;
     for (uint32_t i = 0; full_ok && i < full.nslots; i++) {
       struct ksqe *sqe = kring_get_sqe(&full);
@@ -526,9 +542,9 @@ static void test_timer_scheme(void) {
 
     // A later timer on the ordinary ring gives the CQ-full expiration time to
     // occur without iteration-count timing or polling.
-    full_ok &= kring_timer_arm_abs(&timer, 4, full_now + 20000000ull, 0x44) == 0 &&
-               timer_command(&timer, KTIMER_ARM_ABS, &cqe) &&
-               cqe.status == 0;
+    full_ok &=
+        kring_timer_arm_abs(&timer, 4, full_now + 20000000ull, 0x44) == 0 &&
+        timer_command(&timer, KTIMER_ARM_ABS, &cqe) && cqe.status == 0;
     full_ok &= timer_take(&timer, &cqe) && cqe.type == KEV_TIMER &&
                cqe.a == 4 && cqe.b == 0x44;
 

@@ -341,7 +341,8 @@ uint64_t pe_spawn_resources(const uint8_t *image, uint64_t len, uint64_t arg,
       .size = sizeof(start),
       .entry = base + opt->entry_point,
       .argument = arg,
-      .stack_pointer = stack + stack_bytes,
+      .stack_pointer =
+          stack + stack_bytes - GDOS_THREAD_ENTRY_FRAME_BYTES,
       .gs_base = tls_runtime,
   };
   uint64_t tid = sys_thread_spawn(pid, &start);
