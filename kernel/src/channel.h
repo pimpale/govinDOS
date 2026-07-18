@@ -16,9 +16,10 @@
 // inside the block is userspace convention; when the far end is a kernel
 // scheme (VM_SHARE to a negative id) the layout below is kernel ABI.
 //
-// There is no session object and no IPC registry: kernel-side state is
-// two waiter slots per ublock, a notified bit per share edge, and one
-// ring endpoint per kernel channel — the slots guarded by the block's
+// There is no session object and no IPC registry: kernel-side state is an
+// intrusive multi-waiter FIFO for a private block, two structural waiter
+// slots for shared endpoints, a notified bit per share edge, and one
+// ring endpoint per kernel channel — all guarded by the block's
 // stripe lock, the ring/edge state by g_umem (hierarchy in umem.h), all
 // torn down by the umem revoke path (channel_block_torn).
 
@@ -81,7 +82,7 @@ uint64_t channel_scheme_create(struct process *p, uint64_t base,
 
 // SYS_BLOCK_DOORBELL: wake the far side (user channel), the owner waiter
 // (private block), or drain + execute the SQ (kernel channel). Never parks.
-uint64_t channel_block_doorbell(struct thread *curr, uint64_t base);
+uint64_t channel_block_doorbell(struct thread *curr, uint64_t address);
 
 // SYS_BLOCK_WAIT: park on the 32-bit word at `addr` until a doorbell/CQE
 // post/revocation, unless it already differs from `expected`. Parks via
@@ -111,6 +112,17 @@ void channel_child_dead_notify(struct process *parent, struct process *child);
 // classification; scheme creation may instead hold the owner's list lock
 // across tear + ring publication, which excludes new private waiters.
 void channel_block_torn(ublock *b, bool destroy_endpoint);
+
+// Begin/continue the bounded waiter-drain phase of VM_FREE/reap. Marks the
+// block as freeing, rejects future waits, detaches at most BLOCK_WAKE_BATCH
+// waiters with SYSERR_DEAD, and returns true only once no waiters remain.
+// Caller holds g_umem and the owner's list lock, and not the stripe.
+bool channel_block_free_step(ublock *b);
+
+// Identity changes are single-shot and therefore require an empty private
+// FIFO. The caller must hold the owner's list lock so a private waiter cannot
+// race in after this check. False also covers an in-progress VM_FREE.
+bool channel_block_private_idle(ublock *b);
 
 // Voluntary VM_FREE must not destroy a stateful endpoint until its scheme
 // resources are gone. Reap performs the scheme cleanup first.

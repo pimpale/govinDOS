@@ -88,9 +88,10 @@ inside the block is userspace convention; when the far end is a kernel
 scheme (§2), the same two data-plane syscalls apply and the layout is
 kernel ABI.
 
-Kernel-side state lives entirely on existing umem structures: two
-waiter slots per ublock (one for the owner, one for the sharer), a
-notified bit per share edge, and per-scheme endpoint state
+Kernel-side state lives entirely on existing umem structures: an intrusive
+FIFO for an owned private event block, two structural waiter slots for a
+shared endpoint (one for the owner and one for the sharer), a notified bit per
+share edge, and per-scheme endpoint state
 for kernel channels (§2). The ublock sharer machinery is the single
 source of truth for who participates, and its revoke path is the single
 teardown authority. There is no session object, no per-process session
@@ -130,10 +131,14 @@ these verbs create and destroy blocks, they don't position anything.)
     `SYSERR_EXIST` (scheme-specific singleton rule, e.g. one share
     channel per process).
 
-- `SYS_BLOCK_DOORBELL(base) -> 0` — role-inferred, never blocks.
-  - Owned block with no sharers or scheme: wakes the owner's waiter slot.
-    This is a process-private event block; userspace supplies the durable
-    sequence/queue state and may use it to wake another thread locally.
+- `SYS_BLOCK_DOORBELL(address) -> 0 | SYSERR_AGAIN` — role-inferred, never
+  blocks. `address` may be anywhere in the block; wakeup is block-scoped.
+  - Owned block with no sharers or scheme: detaches and wakes at most
+    `BLOCK_WAKE_BATCH` (16) threads from its private FIFO. `SYSERR_AGAIN`
+    means a full batch was woken and waiters remain, so userspace rings again
+    when it requires a broadcast. Userspace supplies durable predicate state;
+    unrelated predicates in the same block tolerate spurious wakes by
+    rechecking their atomic words.
   - User peer on the far side: wakes the thread parked on the *other*
     side of the block, if any (its `SYS_BLOCK_WAIT` returns 0); success
     and no-op otherwise. Never reads the block.
@@ -154,7 +159,8 @@ these verbs create and destroy blocks, they don't position anything.)
   4-byte-aligned address inside a block the caller has a view of
   (`SYSERR_INVAL` otherwise). Under the block's stripe lock: load the
   32-bit word at `addr`; if it differs from `expected`, return 0
-  immediately; else park in the caller's side slot until a wake: the
+  immediately; else append to the private FIFO, or park in the caller's
+  structural side slot for a shared/kernel endpoint, until a wake: the
   local or peer doorbell or, on a kernel channel, the kernel posting a CQE
   (returns 0); or revocation/identity change (`SYSERR_DEAD`). Parking on a user channel
   whose peer process is no longer live fails `SYSERR_DEAD` up front (a
@@ -164,16 +170,47 @@ these verbs create and destroy blocks, they don't position anything.)
   its park cannot be lost — the protocol is verbatim the old
   `ring_wait_user`, generalized to a caller-chosen word. The loaded word is untrusted:
   the kernel only compares it, and a lying peer can only misdirect
-  waiters who chose to rendezvous with it. `SYSERR_EXIST` if the side
-  already has a waiter — one thread per side, or per private block;
-  multi-threaded endpoints shard across blocks.
+  waiters who chose to rendezvous with it. Private blocks admit any number of
+  waiters without kernel allocation because each TCB embeds its one intrusive
+  wait node. `SYSERR_EXIST` if a shared endpoint's side already has its one
+  structural waiter; multi-threaded shared endpoints still shard across
+  blocks.
 
 An owned block with zero sharers is the process-private case. A user↔user
 channel has exactly one sharer. Both data-plane calls return `SYSERR_INVAL`
 on a block with several sharers or when the caller is neither participant.
 A kernel channel's far side is the scheme; it has no sharer entry. The
-first share changes private-event identity into channel identity and wakes
-any prior private waiter with `SYSERR_DEAD`.
+first share changes private-event identity into channel identity and is
+rejected with `SYSERR_EXIST` while the private FIFO is nonempty. Userspace
+must stop new local waits and drain the existing FIFO before sharing.
+
+### Resumable voluntary free
+
+`SYS_VM_FREE(base)` is the userspace-driven continuation for a block with an
+arbitrary private waiter population; there is no kernel reaper or deferred
+work queue. The first call marks the block `freeing`, rejects every new
+`SYS_BLOCK_WAIT` with `SYSERR_DEAD`, and detaches at most
+`BLOCK_WAKE_BATCH` existing waiters with that result. If waiters remain, it
+returns `SYSERR_AGAIN` and deliberately leaves all mappings and metadata
+accessible so the owner can call `SYS_VM_FREE(base)` again. Once the FIFO is
+empty, the completing call performs ordinary revoke, pristine restoration,
+shootdown, and physical release, then returns zero.
+
+Thus `SYSERR_AGAIN` means the live caller owns the continuation; abandoning it
+leaves a mapped allocation in the monotonic `freeing` state. Standard libc
+`free()` hides the retry loop. When the owner is dead, each parent-driven
+`SYS_PROC_REAP` call advances the same drain by one bounded batch. A
+thread-completion or DMA pin instead returns `SYSERR_EXIST` before free begins
+because another immediate free call cannot make progress.
+
+**Remaining boundedness boundary:** waiter draining is strictly batched, but
+the completing call still restores and flushes every sharer view in one
+release transaction, and page-table work scales with the block/view layout.
+If adversarially large sharer sets become possible, `freeing` needs a second
+userspace-driven `DRAINING_VIEWS` cursor so each `SYS_VM_FREE` revokes a fixed
+number of views while retaining the owner's mapping as the continuation name.
+The current implementation preserves the pre-existing all-views-at-once
+revocation semantics rather than silently making access revocation partial.
 
 ### Establishment flow
 
@@ -455,8 +492,9 @@ scheduler dispatch, peer-liveness checks, and live-pid lookup all use that
 predicate. Reap materializes descendants' direct death one leaf at a time,
 removing their hidden registry entries as it reaches them. Runnable/running
 threads die at dispatch or their next kernel entry. Blocked victims are not
-woken merely to be culled: resource teardown detaches their waiter slots and
-reap frees up to 256 detached TCBs per call.
+woken merely to be culled: each bounded block-reap step detaches at most 16
+private wait nodes (or the structural endpoint slots), and later reap frees up
+to 256 detached TCBs per call.
 
 **Zombies hold everything.** Pristinity needs no revocation at death:
 revocation guards *recycled* memory, and a zombie's blocks are still
@@ -469,9 +507,10 @@ callable by the parent on a dead child, covering the child's whole
 dead subtree (post-order cursor; nothing ever reparents, so the
 subtree is closed). One bounded step per call, whichever applies:
 
-1. revoke + free one owned block of the deepest unreaped zombie,
-   waking live parked sharer-side threads `SYSERR_DEAD` — exactly the §1
-   revoke path; dead waiters are detached without enqueueing; or
+1. advance one owned block of the deepest unreaped zombie: detach at most 16
+   private waiters, or once drained revoke + free it, waking live parked
+   sharer-side threads `SYSERR_DEAD` — exactly the §1 revoke path; dead
+   waiters are detached without enqueueing; or
 2. drop one shared-in view, waking the owner-side waiter parked for a
    doorbell that will never come (the zombie's own *views* need no
    unmapping — they die with its AS); or
@@ -667,8 +706,9 @@ rings/dummydev (and their kthreads) had to go with it.
   move; a receiver's pre-existing shared-in view is subsumed. Any move
   wakes parked waiters SYSERR_DEAD — ownership is channel identity.
 - **Sharing changes wait identity at both boundaries.** The first share
-  turns a private event block into a channel; the second makes it ordinary
-  multi-sharer memory. Either transition wakes existing waiters SYSERR_DEAD.
+  turns a private event block into a channel and requires an empty private
+  FIFO; the second makes it ordinary multi-sharer memory. Structural endpoint
+  waiters are bounded one per side and wake `SYSERR_DEAD` on either transition.
 - **Resource budgets are not wired**: there are no kernel uid accounts or
   per-process limits. A later capability design may add explicit budgets.
 - **Wait-groups were removed (2026-07-12).** Scheme `-2`, its ABI, channel
@@ -717,13 +757,13 @@ specifically — the authoritative comments live in `umem.h`,
   operation must pin both blocks and acquire stripe indices in ascending
   order; the old registration-specific release/reacquire/revalidate path
   was removed with scheme `-2`.
-- **`channel_block_torn` contract**: callers mutate channel identity
+- **`channel_block_torn` contract**: callers mutate shared/channel identity
   first (edge pushed/removed, owner swapped, lists unlinked), then
   call torn *without* the stripe — torn takes it itself and wakes parked
   threads. Post-mutation parkers fail classification; pre-mutation parkers
   are woken by torn. Scheme creation is the controlled exception: it holds
-  the owner's list lock while tearing a private waiter and publishing the
-  ring, so nobody can re-park in between.
+  the owner's list lock, verifies the private FIFO is empty, and publishes the
+  ring before releasing the list lock, so nobody can park in between.
 - **Layout**: per-scheme logic moved to `kernel/src/schemes/{shares,
   tree,irq,timer}.c` over the shared internals in `channel_internal.h`;
   `channel.c` keeps the plumbing, data-plane syscalls, drains, and

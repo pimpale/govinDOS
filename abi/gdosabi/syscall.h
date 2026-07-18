@@ -38,17 +38,24 @@
 // along tree edges only: down into an own embryo, up out of an own
 // zombie child.
 #define SYS_VM_ALLOC   5 // (len, prot)             -> base
-#define SYS_VM_FREE    6 // (base)                  -> 0
+#define SYS_VM_FREE    6 // (base)                  -> 0 | SYSERR_AGAIN
 #define SYS_VM_PROTECT 7 // (base, len, prot[, pid])-> 0
 #define SYS_VM_SHARE   8 // (base, target, prot)    -> 0 (target signed)
 #define SYS_VM_UNSHARE 9 // (base)                  -> 0
 #define SYS_VM_MOVE   10 // (base, pid)             -> 0
 
 // Block waits and doorbells (ipc-process-design.md §1). An owned unshared
-// block is process-private; a block with one sharer is a two-party channel.
-// The block's base is its doorbell name; WAIT takes a word within it.
-#define SYS_BLOCK_DOORBELL 11 // (base)           -> 0 (never blocks)
+// block is process-private and admits any number of parked threads. A
+// doorbell wakes a bounded batch and returns SYSERR_AGAIN while more remain.
+// Shared/kernel endpoints retain one structural waiter per side. The block's
+// base (or any address within it) is its doorbell name; WAIT takes a word
+// within it.
+#define SYS_BLOCK_DOORBELL 11 // (address)        -> 0 | SYSERR_AGAIN
 #define SYS_BLOCK_WAIT     12 // (addr, expected) -> 0 (may park; SYSERR_DEAD on revoke)
+
+// Maximum number of private-block waiters detached by one doorbell or
+// VM_FREE call. Kernel work and runqueue publication are therefore bounded.
+#define BLOCK_WAKE_BATCH 16u
 
 // Process trees (ipc-process-design.md §5): parent-driven creation
 // (embryo -> VM_MOVE/VM_PROTECT -> first THREAD_SPAWN seals), recursive

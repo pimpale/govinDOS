@@ -61,9 +61,10 @@ void thread_unblock(struct thread *t) {
   while (atomic_load_explicit(&t->on_cpu, memory_order_acquire)) {
     __asm__ volatile("pause");
   }
-  // There is only one possible unblocker per blocked thread (the SPSC
-  // waiter-slot rule). Death does not enqueue blocked victims; resource
-  // reap later detaches their slots.
+  // A blocked thread has one intrusive wait node and the block stripe lets
+  // exactly one waker detach it, even though a private block may have many
+  // waiters. Death does not enqueue blocked victims; resource reap later
+  // detaches their nodes.
   asserts(atomic_load_explicit(&t->status, memory_order_acquire) ==
               THREAD_BLOCKED,
           "thread_unblock: not blocked");

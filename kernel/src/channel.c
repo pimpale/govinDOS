@@ -86,6 +86,49 @@ static void wake_slot(struct thread **slot, uint64_t result) {
   thread_unblock(t);
 }
 
+static void private_wait_push(ublock *b, struct thread *t) {
+  asserts(t->wait_prev == nullptr && t->wait_next == nullptr,
+          "channel: thread already wait-linked");
+  t->wait_prev = b->private_wait_tail;
+  if (b->private_wait_tail != nullptr)
+    b->private_wait_tail->wait_next = t;
+  else
+    b->private_wait_head = t;
+  b->private_wait_tail = t;
+}
+
+static struct thread *private_wait_pop(ublock *b) {
+  struct thread *t = b->private_wait_head;
+  if (t == nullptr)
+    return nullptr;
+  b->private_wait_head = t->wait_next;
+  if (b->private_wait_head != nullptr)
+    b->private_wait_head->wait_prev = nullptr;
+  else
+    b->private_wait_tail = nullptr;
+  t->wait_prev = nullptr;
+  t->wait_next = nullptr;
+  return t;
+}
+
+static void wake_thread(struct thread *t, uint64_t result) {
+  if (process_is_dead(t->proc))
+    return;
+  thread_deliver_wait_result(t, result);
+  thread_unblock(t);
+}
+
+// Caller holds the block stripe. Returns true once the private FIFO is empty.
+static bool private_wake_batch(ublock *b, uint64_t result) {
+  for (uint32_t n = 0; n < BLOCK_WAKE_BATCH; n++) {
+    struct thread *t = private_wait_pop(b);
+    if (t == nullptr)
+      return true;
+    wake_thread(t, result);
+  }
+  return b->private_wait_head == nullptr;
+}
+
 // Post one CQE. Full against the *user-owned* consumption index, read
 // once and never trusted: a cq_head run ahead of cq_count makes the
 // in-flight count wrap huge and the channel look permanently full,
@@ -283,6 +326,11 @@ uint64_t channel_scheme_create(struct process *p, uint64_t base,
     umem_unlock();
     return SYSERR_EXIST;
   }
+  if (!channel_block_private_idle(b)) {
+    umem_proc_unlock(p);
+    umem_unlock();
+    return SYSERR_EXIST;
+  }
 
   struct ring *ring = calloc(1, sizeof(*ring));
   asserts(ring != nullptr, "channel: ring alloc failed");
@@ -299,8 +347,8 @@ uint64_t channel_scheme_create(struct process *p, uint64_t base,
     }
   }
   // The kernel is the trusted producer: it owns the header from here on.
-  // First tear a possible private-block waiter. p's list lock prevents a
-  // new local waiter until b->ring is published below.
+  // The empty-private-queue check above and p's list lock prevent a local
+  // waiter from entering until b->ring is published below.
   channel_block_torn(b, false);
   struct kring_hdr *h = (struct kring_hdr *)b->base;
   memset(h, 0, sizeof(*h));
@@ -342,17 +390,26 @@ uint64_t channel_block_doorbell(struct thread *curr, uint64_t base) {
     umem_proc_unlock(p);
     return SYSERR_INVAL;
   }
+  if (b->freeing) {
+    umem_stripe_unlock(si);
+    umem_proc_unlock(p);
+    return SYSERR_DEAD;
+  }
   if (b->ring != nullptr) {
     umem_stripe_unlock(si);
     umem_proc_unlock(p);
     return doorbell_ring(curr, base);
   }
-  // A private event block self-wakes its owner slot; a channel wakes its
-  // peer. The persistent notification state remains the userspace word.
-  wake_slot(side_waiter(b, local ? true : !owner), 0);
+  // A private event wakes one bounded FIFO batch. A two-party channel keeps
+  // its structural one-waiter-per-side contract and wakes the peer slot.
+  bool drained = true;
+  if (local)
+    drained = private_wake_batch(b, 0);
+  else
+    wake_slot(side_waiter(b, !owner), 0);
   umem_stripe_unlock(si);
   umem_proc_unlock(p);
-  return 0;
+  return drained ? 0 : SYSERR_AGAIN;
 }
 
 uint64_t channel_block_wait(struct thread *curr, uint64_t addr,
@@ -384,6 +441,11 @@ uint64_t channel_block_wait(struct thread *curr, uint64_t addr,
     umem_proc_unlock(p);
     return SYSERR_INVAL;
   }
+  if (b->freeing) {
+    umem_stripe_unlock(si);
+    umem_proc_unlock(p);
+    return SYSERR_DEAD;
+  }
   if (b->ring == nullptr && !local) {
     // Fail fast if the peer process is no longer live: only threads
     // already parked at its death wait for reap-time revocation. (The
@@ -397,7 +459,7 @@ uint64_t channel_block_wait(struct thread *curr, uint64_t addr,
       return SYSERR_DEAD;
     }
   }
-  if (*side_waiter(b, owner) != nullptr) {
+  if (!local && *side_waiter(b, owner) != nullptr) {
     umem_stripe_unlock(si);
     umem_proc_unlock(p);
     return SYSERR_EXIST; // one parked thread per side / private block
@@ -415,7 +477,10 @@ uint64_t channel_block_wait(struct thread *curr, uint64_t addr,
     umem_proc_unlock(p);
     return 0;
   }
-  *side_waiter(b, owner) = curr;
+  if (local)
+    private_wait_push(b, curr);
+  else
+    *side_waiter(b, owner) = curr;
   umem_stripe_unlock(si);
   umem_proc_unlock(p);
   uthread_park_blocked();
@@ -433,6 +498,10 @@ void channel_block_torn(ublock *b, bool destroy_endpoint) {
   uint32_t si = umem_stripe(b->base);
   struct ring *ring = nullptr;
   umem_stripe_lock(si);
+  // Identity changes retain one structural waiter per side. Private queues
+  // are drained only by the resumable VM_FREE path below.
+  asserts(b->private_wait_head == nullptr,
+          "channel: identity changed with private waiters");
   wake_slot(&b->owner_waiter, SYSERR_DEAD);
   wake_slot(&b->sharer_waiter, SYSERR_DEAD);
   if (destroy_endpoint && b->ring != nullptr) {
@@ -457,6 +526,29 @@ void channel_block_torn(ublock *b, bool destroy_endpoint) {
   }
 }
 
+bool channel_block_free_step(ublock *b) {
+  uint32_t si = umem_stripe(b->base);
+  umem_stripe_lock(si);
+  b->freeing = true;
+  bool private_done = private_wake_batch(b, SYSERR_DEAD);
+  // Shared and kernel endpoints have at most one structural waiter per side,
+  // so including them in every free step remains a strict constant bound.
+  wake_slot(&b->owner_waiter, SYSERR_DEAD);
+  wake_slot(&b->sharer_waiter, SYSERR_DEAD);
+  bool done = private_done && b->owner_waiter == nullptr &&
+              b->sharer_waiter == nullptr;
+  umem_stripe_unlock(si);
+  return done;
+}
+
+bool channel_block_private_idle(ublock *b) {
+  uint32_t si = umem_stripe(b->base);
+  umem_stripe_lock(si);
+  bool idle = !b->freeing && b->private_wait_head == nullptr;
+  umem_stripe_unlock(si);
+  return idle;
+}
+
 bool channel_block_destroyable(ublock *b) {
   return b->ring == nullptr || b->ring->ops->destroyable == nullptr ||
          b->ring->ops->destroyable(b->ring);
@@ -472,7 +564,12 @@ void channel_thread_complete_locked(struct process *p, ublock *block,
   umem_stripe_lock(si);
   // Registration kept the block private, writable, and identity-stable.
   *(volatile _Atomic uint32_t *)event = GDOS_THREAD_COMPLETE;
-  wake_slot(&block->owner_waiter, 0);
+  if (block->private_wait_head != nullptr) {
+    // A completion word is durable and pthread permits only one joiner, but
+    // drain a bounded batch so raw users of the completion ABI cannot lose a
+    // wake if they chose to wait with several threads.
+    private_wake_batch(block, 0);
+  }
   umem_stripe_unlock(si);
   atomic_fetch_sub(&block->thread_pins, 1);
 }

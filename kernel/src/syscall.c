@@ -74,6 +74,8 @@ static uint64_t sys_vm_free(struct thread *curr, uint64_t base) {
   int rc = umem_free(curr->proc, base);
   if (rc == (int)SYSERR_EXIST)
     return SYSERR_EXIST;
+  if (rc == 1)
+    return SYSERR_AGAIN;
   if (rc != 0) {
     return SYSERR_PERM;
   }

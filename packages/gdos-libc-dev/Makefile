@@ -8,16 +8,28 @@ CFLAGS += \
 
 C_PUBLIC_HEADERS := \
 	source/assert.h \
+	source/ctype.h \
+	source/errno.h \
+	source/limits.h \
 	source/math.h \
+	source/pthread.h \
+	source/sched.h \
 	source/stdio.h \
 	source/stdlib.h \
 	source/string.h \
+	source/strings.h \
+	source/time.h \
+	source/unistd.h \
 	vendor/printf/printf.h
 C_SOURCES := \
+	source/ctype.c \
+	source/errno.c \
+	source/pthread.c \
 	source/stdio.c \
 	source/stdlib.c \
 	source/string.c \
 	source/tls.c \
+	source/unistd.c \
 	vendor/printf/printf.c
 C_OBJECTS := $(patsubst %.c,out/%.c.o,$(C_SOURCES))
 

@@ -47,6 +47,12 @@ typedef struct thread {
   // saving its context could be dispatched on another CPU.
   _Atomic bool on_cpu;
 
+  // Intrusive private-event wait queue links. A thread can be blocked in at
+  // most one syscall, so its TCB supplies all queue storage; waiter growth
+  // never allocates kernel memory. Guarded by the waited block's stripe.
+  struct thread *wait_prev;
+  struct thread *wait_next;
+
   // Optional join completion. A live-process exit consumes one pin and
   // publishes the word after on_cpu becomes false. Process death skips the
   // notification because no in-process joiner can survive it.

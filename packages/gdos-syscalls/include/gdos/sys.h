@@ -67,7 +67,8 @@ static inline uint64_t sys_gettid(void) { return sys0(SYS_GETTID); }
 static inline uint64_t sys_vm_alloc(uint64_t len, uint64_t prot) {
   return sys2(SYS_VM_ALLOC, len, prot);
 }
-// base alone names the block — blocks are the unit, no length needed.
+// base alone names the block. SYSERR_AGAIN means a bounded waiter batch was
+// notified and the still-mapped block must be passed to VM_FREE again.
 static inline uint64_t sys_vm_free(uint64_t base) {
   return sys1(SYS_VM_FREE, base);
 }
@@ -103,8 +104,8 @@ static inline uint64_t sys_vm_map_device(const struct cap_token *token,
   return sys3(SYS_VM_MAP_DEVICE, (uint64_t)token, CAP_TOKEN_SIZE, flags);
 }
 
-static inline uint64_t sys_block_doorbell(uint64_t base) {
-  return sys1(SYS_BLOCK_DOORBELL, base);
+static inline uint64_t sys_block_doorbell(uint64_t address) {
+  return sys1(SYS_BLOCK_DOORBELL, address);
 }
 // Parks while the 32-bit word at addr equals expected; addr must sit in
 // a block the caller has a view of.

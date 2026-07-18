@@ -82,12 +82,18 @@ struct ublock {
   struct process *owner;
   vec_share_edge *sharers; // processes other than owner with a view
 
-  // Wait state (channel.c, under stripe(base) — the per-block lock stripe,
-  // level 3 of the hierarchy below). Each side holds at most one parked
-  // thread. An owned, unshared block uses owner_waiter as a process-private
-  // event; a two-party user channel uses the two slots as its endpoint waits.
+  // Wait state (channel.c, under stripe(base)). Private event blocks use an
+  // intrusive FIFO with nodes embedded in TCBs. Shared and kernel endpoints
+  // retain one structural waiter per side; identity-changing operations can
+  // therefore remain one bounded transaction.
+  struct thread *private_wait_head;
+  struct thread *private_wait_tail;
   struct thread *owner_waiter;
   struct thread *sharer_waiter;
+  // First VM_FREE sets this before draining private waiters. The block stays
+  // mapped and owned so userspace can repeat VM_FREE; new waits/identity
+  // changes fail until the final call unlinks and reclaims it.
+  bool freeing;
   // Non-null iff this block is a kernel channel; owned here, freed by the
   // revoke path (channel_block_torn). Written under g_umem + stripe(base)
   // like owner/sharers; ring *internals* are control-plane state (g_umem).
@@ -127,8 +133,10 @@ uint64_t umem_map_device(struct process *p, uint64_t base, uint64_t len,
 uint64_t umem_map_device_locked(struct process *p, uint64_t base, uint64_t len,
                                 uint32_t flags);
 
-// Free a block owned by `p`. base must be the exact block base — blocks
-// are the unit, so the base alone is unambiguous. Revokes every
+// Free a block owned by `p`. base must be the exact block base. The first
+// call marks it freeing and wakes a bounded waiter batch; 1 means userspace
+// must call again, 0 means fully reclaimed, and -1 is an invalid request.
+// Once the waiter queue is empty, revokes every
 // sharer's view, restores all views to pristine, flushes every view in
 // one shootdown round (outside the control-plane lock), and only then
 // returns the block to the buddy. -1 if base isn't an owned block.

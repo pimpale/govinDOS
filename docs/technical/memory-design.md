@@ -247,8 +247,17 @@ Notes:
 
 ### Free path (also the owner-exit path per block)
 
-Two phases (as implemented 2026-07-11 — the flush is the single
-longest thing the old global lock ever covered, so it moved outside):
+Voluntary free begins with a userspace-driven waiter drain. There is no kernel
+work queue: the first `SYS_VM_FREE(base)` marks the still-mapped block
+`freeing`, rejects new waits, wakes at most 16 existing private waiters with
+`SYSERR_DEAD`, and returns `SYSERR_AGAIN` while more remain. The owner repeats
+the same call until it returns zero. Keeping the mapping accessible supplies
+the continuation handle and ensures no parked syscall refers to recycled
+memory. libc `free()` performs this loop; process reap advances one batch per
+`SYS_PROC_REAP` call.
+
+After the waiter FIFO is empty, two release phases run (the flush is the
+single longest thing the old global lock ever covered, so it moved outside):
 
 1. **Under `g_umem`** (`block_release_prepare`): unlink from the
    owner's `blocks` and every sharer's `shared_in` (their list locks,
@@ -260,6 +269,11 @@ longest thing the old global lock ever covered, so it moved outside):
    **one combined shootdown round** (`as_flush_multi` — union dirty
    range, one IPI per target CPU regardless of sharer count), unpin,
    `buddy_page_free`.
+
+This final release is still proportional to the number of sharer views and
+page-table changes. Strictly bounding that phase requires another resumable
+`DRAINING_VIEWS` state; it is intentionally left as an explicit follow-up
+rather than weakening the current synchronous all-view revocation guarantee.
 
 Flush-before-buddy-free is the pristinity/TLB rule from §2. The pins
 are what let the flush leave the lock: a concurrently-reaped sharer's

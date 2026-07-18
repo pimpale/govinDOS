@@ -374,6 +374,14 @@ int umem_free(struct process *p, uint64_t base) {
     umem_unlock();
     return (int)SYSERR_EXIST;
   }
+  // VM_FREE is its own continuation. The block remains in the owner's list
+  // and mapped while each call detaches at most BLOCK_WAKE_BATCH waiters.
+  // `freeing` rejects new waits, so every SYSERR_AGAIN call makes progress.
+  if (!channel_block_free_step(b)) {
+    umem_proc_unlock(p);
+    umem_unlock();
+    return 1;
+  }
   vec_ublock_ptr_swap_and_pop(p->blocks, (uint32_t)i);
   umem_proc_unlock(p);
   block_release_prepare(b, &rel);
@@ -400,7 +408,8 @@ int umem_protect(struct process *p, uint64_t base, size_t len,
   // between wait's user_range_ok and its load.
   umem_proc_lock(p);
   ublock *b = umem_view_locked(p, base, len);
-  if (b != nullptr && atomic_load(&b->thread_pins) != 0) {
+  if (b != nullptr &&
+      (b->freeing || atomic_load(&b->thread_pins) != 0)) {
     umem_proc_unlock(p);
     return -1;
   }
@@ -428,25 +437,32 @@ uint64_t umem_share(struct process *p, uint64_t base, uint64_t target_pid,
   umem_lock();
   umem_proc_lock(p);
   ublock *b = umem_owned_locked(p, base);
-  umem_proc_unlock(p); // b stays pinned by g_umem
   struct process *target = proc_lookup(target_pid);
   if (b == nullptr || target == nullptr || target == p || b->ring != nullptr ||
-      atomic_load(&b->thread_pins) != 0 || !b->delegatable ||
+      b->freeing || atomic_load(&b->thread_pins) != 0 || !b->delegatable ||
       (b->backing == UBLOCK_DEVICE &&
        ((prot & ~b->device_flags) != 0 || (prot & PAGE_X)))) {
+    umem_proc_unlock(p);
     umem_unlock();
     return SYSERR_INVAL;
   }
   if (find_edge(b->sharers, target) >= 0) {
+    umem_proc_unlock(p);
     umem_unlock();
     return SYSERR_EXIST;
   }
   uint32_t nsharers = vec_share_edge_len(b->sharers);
+  if (nsharers == 0 && !channel_block_private_idle(b)) {
+    umem_proc_unlock(p);
+    umem_unlock();
+    return SYSERR_EXIST;
+  }
   uint32_t si = umem_stripe(b->base);
   umem_stripe_lock(si);
   share_edge e = {.to = target, .notified = false};
   vec_share_edge_push(b->sharers, &e);
   umem_stripe_unlock(si);
+  umem_proc_unlock(p);
   // Both 0->1 (private event block becomes a user channel) and 1->2
   // (valid channel becomes non-channel shared memory) change the identity
   // a parked waiter relied on. Wake it SYSERR_DEAD after publishing the
@@ -484,6 +500,11 @@ int umem_unshare(struct process *p, uint64_t base) {
   }
   ublock *b;
   vec_ublock_ptr_get(p->shared_in, (uint32_t)i, &b);
+  if (b->freeing) {
+    umem_proc_unlock(p);
+    umem_unlock();
+    return -1;
+  }
   vec_ublock_ptr_swap_and_pop(p->shared_in, (uint32_t)i);
   umem_proc_unlock(p);
   uint32_t si = umem_stripe(b->base);
@@ -512,6 +533,12 @@ bool umem_reap_one_block_locked(struct process *p, struct umem_release *rel) {
   }
   ublock *b;
   vec_ublock_ptr_get(p->blocks, 0, &b);
+  // A dead process cannot drive VM_FREE itself, so each parent-driven reap
+  // call advances the same bounded waiter drain by one batch.
+  if (!channel_block_free_step(b)) {
+    umem_proc_unlock(p);
+    return true;
+  }
   vec_ublock_ptr_swap_and_pop(p->blocks, 0);
   umem_proc_unlock(p);
   // The zombie's own AS is restored too (block_release_prepare): it
@@ -559,7 +586,7 @@ void umem_reap_finish_locked(struct process *p) {
 
 uint64_t umem_move_locked(ublock *b, struct process *from, struct process *to,
                           bool src_as_live) {
-  if (b->dma_pins != 0 || atomic_load(&b->thread_pins) != 0)
+  if (b->freeing || b->dma_pins != 0 || atomic_load(&b->thread_pins) != 0)
     return SYSERR_EXIST;
   if (!b->delegatable)
     return SYSERR_INVAL;
@@ -571,6 +598,10 @@ uint64_t umem_move_locked(ublock *b, struct process *from, struct process *to,
   // which only gains sight at the final push: the swap is atomic to
   // every observer that can actually run.
   umem_proc_lock(from);
+  if (!channel_block_private_idle(b)) {
+    umem_proc_unlock(from);
+    return SYSERR_EXIST;
+  }
   remove_block(from->blocks, b);
   umem_proc_unlock(from);
   umem_proc_lock(to);

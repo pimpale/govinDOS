@@ -28,6 +28,12 @@
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <ctype.h>
+#include <errno.h>
+#include <limits.h>
+#include <pthread.h>
+#include <string.h>
+#include <strings.h>
 
 #include <gdosabi/kring_shares.h>
 #include <gdosabi/kring_tree.h>
@@ -154,6 +160,227 @@ static void test_realloc(void) {
   print(contents_ok && size_ok && shrink_ok && free_ok
             ? "tests: realloc/vm_size ok\n"
             : "tests: REALLOC/VM_SIZE FAILED\n");
+}
+
+static int compare_ints(const void *left, const void *right) {
+  int a = *(const int *)left;
+  int b = *(const int *)right;
+  return (a > b) - (a < b);
+}
+
+static void test_libc_surface(void) {
+  char buffer[32] = "govind";
+  char tokens[] = "one,two,three";
+  char *save = nullptr;
+  int values[] = {7, 1, 9, 3, 2};
+  int key = 3;
+  char *end = nullptr;
+
+  strcat(buffer, "os");
+  qsort(values, sizeof(values) / sizeof(values[0]), sizeof(values[0]),
+        compare_ints);
+  int *found = bsearch(&key, values, sizeof(values) / sizeof(values[0]),
+                       sizeof(values[0]), compare_ints);
+  errno = 0;
+  long overflow = strtol("2147483648tail", &end, 10);
+  char *copy = strdup(buffer);
+  bool ok = strcmp(buffer, "govindos") == 0 &&
+            strcasecmp("GovindOS", "govindos") == 0 &&
+            strstr("small libc surface", "libc") != nullptr &&
+            strtok_r(tokens, ",", &save) == tokens &&
+            strcmp(strtok_r(nullptr, ",", &save), "two") == 0 &&
+            isalpha('Q') && isdigit('7') && tolower('Z') == 'z' &&
+            values[0] == 1 && values[4] == 9 && found != nullptr &&
+            *found == 3 && overflow == LONG_MAX && errno == ERANGE &&
+            strcmp(end, "tail") == 0 && copy != nullptr &&
+            strcmp(copy, "govindos") == 0;
+  free(copy);
+  print(ok ? "tests: basic libc surface ok\n"
+           : "tests: BASIC LIBC SURFACE FAILED\n");
+}
+
+static pthread_mutex_t g_pthread_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_pthread_cond = PTHREAD_COND_INITIALIZER;
+static pthread_once_t g_pthread_once = PTHREAD_ONCE_INIT;
+static pthread_key_t g_pthread_key;
+static _Atomic uint32_t g_pthread_ready;
+static _Atomic uint32_t g_pthread_once_calls;
+static _Atomic uint32_t g_pthread_destructors;
+static _Atomic uint32_t g_pthread_failures;
+static _Atomic uint32_t g_detached_done;
+static int g_pthread_sum;
+static _Thread_local uint64_t g_pthread_tls = 0x5054485245414454ull;
+
+static void pthread_once_probe(void) {
+  atomic_fetch_add_explicit(&g_pthread_once_calls, 1, memory_order_relaxed);
+}
+
+static void pthread_destructor_probe(void *value) {
+  if (value == nullptr)
+    atomic_fetch_add_explicit(&g_pthread_failures, 1, memory_order_relaxed);
+  atomic_fetch_add_explicit(&g_pthread_destructors, 1,
+                            memory_order_relaxed);
+}
+
+static void *pthread_worker(void *argument) {
+  uint32_t id = (uint32_t)(uintptr_t)argument;
+  pthread_t self = pthread_self();
+  if (self == nullptr || !pthread_equal(self, pthread_self()) ||
+      g_pthread_tls != 0x5054485245414454ull)
+    atomic_fetch_add_explicit(&g_pthread_failures, 1, memory_order_relaxed);
+  g_pthread_tls = id;
+  if (pthread_once(&g_pthread_once, pthread_once_probe) != 0 ||
+      pthread_setspecific(g_pthread_key, (void *)(uintptr_t)id) != 0)
+    atomic_fetch_add_explicit(&g_pthread_failures, 1, memory_order_relaxed);
+
+  pthread_mutex_lock(&g_pthread_mutex);
+  g_pthread_sum += (int)id;
+  atomic_fetch_add_explicit(&g_pthread_ready, 1, memory_order_release);
+  pthread_cond_broadcast(&g_pthread_cond);
+  pthread_mutex_unlock(&g_pthread_mutex);
+  sys_yield();
+  if (g_pthread_tls != id ||
+      pthread_getspecific(g_pthread_key) != (void *)(uintptr_t)id)
+    atomic_fetch_add_explicit(&g_pthread_failures, 1, memory_order_relaxed);
+  return (void *)(uintptr_t)(0x100u + id);
+}
+
+static void *detached_worker(void *argument) {
+  (void)argument;
+  atomic_store_explicit(&g_detached_done, 1, memory_order_release);
+  return nullptr;
+}
+
+static void test_pthreads(void) {
+  pthread_t threads[2] = {nullptr, nullptr};
+  void *results[2] = {nullptr, nullptr};
+  bool ok = pthread_key_create(&g_pthread_key, pthread_destructor_probe) == 0;
+  unsigned created = 0;
+  for (unsigned i = 0; i < 2; i++) {
+    if (pthread_create(&threads[i], nullptr, pthread_worker,
+                       (void *)(uintptr_t)(i + 1)) == 0)
+      created++;
+  }
+
+  pthread_mutex_lock(&g_pthread_mutex);
+  while (atomic_load_explicit(&g_pthread_ready, memory_order_acquire) <
+         created)
+    pthread_cond_wait(&g_pthread_cond, &g_pthread_mutex);
+  pthread_mutex_unlock(&g_pthread_mutex);
+
+  for (unsigned i = 0; i < 2; i++) {
+    if (threads[i] != nullptr)
+      ok &= pthread_join(threads[i], &results[i]) == 0;
+  }
+  ok &= created == 2 && results[0] == (void *)(uintptr_t)0x101 &&
+        results[1] == (void *)(uintptr_t)0x102 && g_pthread_sum == 3 &&
+        atomic_load_explicit(&g_pthread_once_calls, memory_order_relaxed) ==
+            1 &&
+        atomic_load_explicit(&g_pthread_destructors, memory_order_relaxed) ==
+            2 &&
+        atomic_load_explicit(&g_pthread_failures, memory_order_relaxed) == 0 &&
+        g_pthread_tls == 0x5054485245414454ull;
+  pthread_key_delete(g_pthread_key);
+
+  pthread_mutexattr_t mutex_attr;
+  pthread_mutex_t recursive;
+  ok &= pthread_mutexattr_init(&mutex_attr) == 0 &&
+        pthread_mutexattr_settype(&mutex_attr, PTHREAD_MUTEX_RECURSIVE) == 0 &&
+        pthread_mutex_init(&recursive, &mutex_attr) == 0 &&
+        pthread_mutex_lock(&recursive) == 0 &&
+        pthread_mutex_lock(&recursive) == 0 &&
+        pthread_mutex_unlock(&recursive) == 0 &&
+        pthread_mutex_unlock(&recursive) == 0 &&
+        pthread_mutex_destroy(&recursive) == 0;
+  pthread_mutexattr_destroy(&mutex_attr);
+
+  pthread_rwlock_t rwlock = PTHREAD_RWLOCK_INITIALIZER;
+  pthread_spinlock_t spin = 0;
+  pthread_barrier_t barrier;
+  ok &= pthread_rwlock_rdlock(&rwlock) == 0 &&
+        pthread_rwlock_unlock(&rwlock) == 0 &&
+        pthread_rwlock_wrlock(&rwlock) == 0 &&
+        pthread_rwlock_unlock(&rwlock) == 0 &&
+        pthread_spin_init(&spin, PTHREAD_PROCESS_PRIVATE) == 0 &&
+        pthread_spin_lock(&spin) == 0 && pthread_spin_unlock(&spin) == 0 &&
+        pthread_barrier_init(&barrier, nullptr, 1) == 0 &&
+        pthread_barrier_wait(&barrier) == PTHREAD_BARRIER_SERIAL_THREAD &&
+        pthread_barrier_destroy(&barrier) == 0;
+
+  pthread_attr_t detached_attr;
+  pthread_t detached = nullptr;
+  ok &= pthread_attr_init(&detached_attr) == 0 &&
+        pthread_attr_setdetachstate(&detached_attr,
+                                    PTHREAD_CREATE_DETACHED) == 0 &&
+        pthread_create(&detached, &detached_attr, detached_worker, nullptr) ==
+            0;
+  pthread_attr_destroy(&detached_attr);
+  while (ok &&
+         atomic_load_explicit(&g_detached_done, memory_order_acquire) == 0)
+    sys_yield();
+  for (unsigned i = 0; i < 8; i++)
+    sys_yield();
+
+  print(ok ? "tests: pthread lifecycle/TLS/synchronization ok\n"
+           : "tests: PTHREAD IMPLEMENTATION FAILED\n");
+}
+
+#define FREE_WAITER_COUNT (BLOCK_WAKE_BATCH + 4)
+
+struct free_waiter_arg {
+  uint64_t event;
+  uint64_t result;
+};
+
+static _Atomic uint32_t g_free_waiters_ready;
+static struct free_waiter_arg g_free_waiter_args[FREE_WAITER_COUNT];
+
+static void *free_waiter(void *argument) {
+  struct free_waiter_arg *arg = argument;
+  atomic_fetch_add_explicit(&g_free_waiters_ready, 1, memory_order_release);
+  arg->result = sys_block_wait((const volatile void *)arg->event, 0);
+  return nullptr;
+}
+
+static void test_bounded_multiwait_free(void) {
+  uint64_t event = sys_vm_alloc(4096, VM_PROT_READ | VM_PROT_WRITE);
+  pthread_t threads[FREE_WAITER_COUNT] = {0};
+  bool allocated = !sys_iserr(event);
+  bool ok = allocated;
+  unsigned created = 0;
+  for (unsigned i = 0; allocated && i < FREE_WAITER_COUNT; i++) {
+    g_free_waiter_args[i] = (struct free_waiter_arg){.event = event};
+    if (pthread_create(&threads[i], nullptr, free_waiter,
+                       &g_free_waiter_args[i]) != 0)
+      break;
+    else
+      created++;
+  }
+  ok &= created == FREE_WAITER_COUNT;
+  while (atomic_load_explicit(&g_free_waiters_ready, memory_order_acquire) !=
+         created)
+    sys_yield();
+  // Once each worker has published readiness it immediately enters WAIT;
+  // let every runnable worker finish that adjacent syscall before freeing.
+  for (unsigned i = 0; allocated && i < 256; i++)
+    sys_yield();
+
+  uint64_t first = allocated ? sys_vm_free(event) : SYSERR_INVAL;
+  ok &= first == SYSERR_AGAIN && sys_vm_size(event) == 4096;
+  uint64_t rc = first;
+  unsigned steps = 1;
+  while (rc == SYSERR_AGAIN) {
+    rc = sys_vm_free(event);
+    steps++;
+  }
+  ok &= rc == 0 && steps >= 2 && sys_vm_size(event) == SYSERR_PERM;
+
+  for (unsigned i = 0; i < created; i++) {
+    ok &= pthread_join(threads[i], nullptr) == 0;
+    ok &= g_free_waiter_args[i].result == SYSERR_DEAD;
+  }
+  print(ok ? "tests: bounded multi-waiter VM_FREE continuation ok\n"
+           : "tests: BOUNDED MULTI-WAITER VM_FREE FAILED\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -761,6 +988,9 @@ void _start(uint64_t arg) {
 
   test_memory();
   test_realloc();
+  test_libc_surface();
+  test_pthreads();
+  test_bounded_multiwait_free();
   test_thread_lifecycle();
   test_timer_scheme();
   test_arch_context();
