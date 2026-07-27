@@ -247,16 +247,36 @@ Notes:
 
 ### Free path (also the owner-exit path per block)
 
-Voluntary free begins with a userspace-driven waiter drain. There is no kernel
-work queue: the first `SYS_VM_FREE(base)` marks the still-mapped block
-`freeing`, rejects new waits, wakes at most 16 existing private waiters with
-`SYSERR_DEAD`, and returns `SYSERR_AGAIN` while more remain. The owner repeats
-the same call until it returns zero. Keeping the mapping accessible supplies
-the continuation handle and ensures no parked syscall refers to recycled
-memory. libc `free()` performs this loop; process reap advances one batch per
-`SYS_PROC_REAP` call.
+`SYS_VM_FREE(base)` is a single bounded transaction. It **fails** while
+anything is still attached to the block — sharers, DMA pins, capability
+grants, reflected-fault waiters — and detaching those is userspace's job,
+done with bounded per-item verbs beforehand (`SYS_VM_UNSHARE(base, pid)` per
+sharer, and so on). There is no kernel work queue and no waiter drain: the
+kernel does not notify threads parked in a block that is being revoked, so
+free has nothing to iterate. See [futex-design.md](futex-design.md) §5 for
+the teardown flow and why notification moved to userspace.
 
-After the waiter FIFO is empty, two release phases run (the flush is the
+`SYSERR_AGAIN` remains reserved in the ABI and libc `free()` keeps its retry
+loop so a continuation can be added later without touching callers; no path
+returns it today. The two candidates are noted at the end of this section.
+
+**TODO — enumeration syscalls.** The flow above assumes userspace can find
+what is attached to a block. None of these exist yet:
+
+| what | owning document |
+|---|---|
+| sharers of a block; blocks owned by a (zombie) process | this document |
+| DMA pins / IOMMU domain attachments | [pci-design.md](pci-design.md), [iommu-design.md](iommu-design.md) |
+| capability grants anchored on a block | [capability-design.md](capability-design.md) |
+| threads parked on a reflected fault | [ipc-process-design.md](ipc-process-design.md) §3 |
+
+Each is a resumable *read* — a cursor, a buffer, and a length — which is a
+categorically easier thing to get right than the resumable *mutation* the
+`freeing` protocol used to be. Only the owner can add sharers, so an owner
+enumerating its own block races with nobody; the pinning cases can race, and
+the answer there is simply that free fails and the caller loops.
+
+Once nothing is attached, two release phases run (the flush is the
 single longest thing the old global lock ever covered, so it moved outside):
 
 1. **Under `g_umem`** (`block_release_prepare`): unlink from the
@@ -271,9 +291,16 @@ single longest thing the old global lock ever covered, so it moved outside):
    `buddy_page_free`.
 
 This final release is still proportional to the number of sharer views and
-page-table changes. Strictly bounding that phase requires another resumable
-`DRAINING_VIEWS` state; it is intentionally left as an explicit follow-up
-rather than weakening the current synchronous all-view revocation guarantee.
+page-table changes, and it is where the two reserved `SYSERR_AGAIN` consumers
+would land. Adversarially large sharer sets are largely defused by the
+userspace pre-pass above — an owner revokes sharers one bounded call at a
+time and only then frees — leaving the **page-table walk of a large block**
+as the one unbounded step no pre-pass can remove: a 64 MB block at 4 K
+granularity is ~16k PTE rewrites per view, plus a shootdown that waits for
+cross-CPU acks. It is bounded by the caller's own allocation rather than by
+anything an adversary controls, which is why it is accepted for now. Linux
+solves the same problem with `cond_resched()` inside `zap_pte_range`; without
+preemption the equivalent is a cursor and a resumable free.
 
 Flush-before-buddy-free is the pristinity/TLB rule from §2. The pins
 are what let the flush leave the lock: a concurrently-reaped sharer's

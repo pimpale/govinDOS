@@ -76,6 +76,15 @@ pinning, or device-assignment model below.
   buddy, or reclaimed by reap until its IOMMU PTEs are gone, the IOTLB has
   been invalidated, and the pin has been released. CPU mapping lifetime and
   DMA mapping lifetime cannot disagree.
+  - **TODO — pin enumeration.** `SYS_VM_FREE` refuses a pinned block and
+    does not drive the unmap itself ([memory-design.md](memory-design.md)
+    §5): userspace detaches first, then frees. That requires a way to ask
+    which domains hold pins on a block, and for a zombie's blocks, which
+    pins the parent must clear before it can reclaim the memory. A
+    resumable read (cursor, buffer, length) on the iommu ring or as a
+    `SYS_VM_*` query; not yet designed. Without it a pinned block reports
+    only an opaque `SYSERR_EXIST`, and a driver that dies holding a pin
+    can be diagnosed but not cleaned up systematically.
 - **All kernel-channel commands stay bounded.** One map or unmap SQE
   installs or removes every leaf of one block in a single invocation. This
   is bounded without a resumable cursor because block page counts are

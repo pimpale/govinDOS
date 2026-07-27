@@ -1,73 +1,83 @@
-# Kernel timer scheme
+# Kernel time and deadlines
 
-`KSCHEME_TIMER` (`-5`) supplies the mechanism needed for monotonic deadlines
-without putting waitset policy in the kernel. A process may create any number
-of timer rings. The shared ABI is `gdosabi/kring_timer.h`.
+Status: **revised 2026-07-26.** `KSCHEME_TIMER` (scheme `-5`, implemented
+2026-07-17) is deleted, and `gdosabi/kring_timer.h` with it. Timed
+waiting moves into `SYS_FUTEX_WAIT`'s deadline argument
+([futex-design.md](futex-design.md) §6), which serves every consumer the
+scheme had — sleeps, `*_timedwait`, `poll`-family timeouts — without
+timer rings, timer events, or helper threads. What remains is the clock
+itself, one syscall to read it, and the per-CPU deadline machinery,
+which the dispatch quantum requires regardless of how anything waits.
 
-## Commands and events
+## The clock
 
 All time values are unsigned nanoseconds from an unspecified boot epoch.
-`KTIMER_NOW` completes immediately with the sampled monotonic time in `a`.
-`KTIMER_ARM_ABS` registers the one-shot `(id, absolute deadline, cookie)` in
-`(a, b, c)`. IDs must be unique among that endpoint's armed or CQ-blocked
-timers. `KTIMER_CANCEL` removes an armed ID; it returns `SYSERR_AGAIN` when the
-deadline has already expired and its event is waiting for CQ space.
-
-Expiration posts `KEV_TIMER { a=id, b=cookie }`. CQ-full expiration is durable:
-the timer moves off the hardware-deadline queue onto a pending list, and the
-consumption-ack doorbell replays it once space is available. Destroying the
-ring cancels all armed and pending timers before the endpoint memory is freed.
-
-## Clock and LAPIC integration
-
-The BSP calibrates the TSC and LAPIC counter together against PIT channel 2.
-Kernel reads convert the TSC to nanoseconds with quotient/remainder arithmetic,
-then apply a global atomic monotonic clamp to tolerate small cross-CPU skew.
-There is deliberately no userspace conversion page: `KTIMER_NOW` is the sole
-public read interface.
-
-Each timer endpoint owns a left-leaning red-black tree of timer values keyed by
-`(absolute deadline, per-ring insertion sequence)`. Equal deadlines therefore
-retain FIFO order within an endpoint. ID lookup and cancellation deliberately
-scan this tree linearly; an endpoint is capped at `min(ring slots, 1024)`, so
-the scan is bounded without maintaining a second owning index.
-
-Each endpoint is assigned to its creation CPU. That CPU owns a second LLRB
-containing one borrowed pointer per nonempty timer ring, keyed by
-`(the ring's earliest deadline, stable ring ID)`. Arming, cancelling, or
-expiring a timer updates the CPU entry only when that ring's minimum changes.
-Thus the CPU finds its globally earliest timer without duplicating timer
-ownership, and removing or eventually migrating a ring requires moving only
-one CPU-index entry. Waiter-following migration is not implemented yet.
-
-One timer spinlock per CPU protects the CPU ring index, the timer and pending
-trees of every endpoint assigned to that CPU, and the current quantum
-deadline. There is no global timer lock. Each CPU's one-shot LAPIC deadline is:
+The BSP calibrates the TSC and LAPIC counter together against PIT
+channel 2, once. Kernel reads convert the TSC to nanoseconds with
+quotient/remainder arithmetic, then apply a global atomic monotonic
+clamp to tolerate small cross-CPU skew.
 
 ```
-min(current absolute quantum deadline, earliest armed timer deadline)
+SYS_GETTIME 22 // () -> monotonic ns
 ```
 
-A timer-only interrupt expires events and rearms the remainder of the existing
-quantum; it never grants a fresh quantum. The scheduler idle path removes its
-quantum but preserves the earliest timer, allowing a thread parked on the timer
-ring to wake without polling. Distant deadlines are handled by harmless early
-checkpoints when the 32-bit LAPIC count saturates.
+is the sole public read interface, replacing the scheme's `KTIMER_NOW`
+command. There is deliberately no userspace conversion page; if the
+syscall on `clock_gettime`'s hot path ever measures, a read-only page of
+TSC factors is the recorded alternative. Absolute deadlines passed to
+`SYS_FUTEX_WAIT` are values in this domain.
 
-An interrupt processes at most 64 expirations. If more are simultaneously due,
-the still-due ring minimum schedules another near-immediate shot. This keeps
-IRQ work bounded independently of the number of timer endpoints in the system.
-If the CQ is full, an expired timer value is transformed into a completion
-value owned by that endpoint's pending LLRB, ordered by the timer's original
-deadline and sequence. It no longer participates in hardware deadline
-selection.
+## Per-CPU deadlines
 
-Local changes reprogram the LAPIC immediately. If a remote arm creates a new
-earliest deadline, it sends a timer-reprogram IPI to the endpoint's assigned
-CPU so a sleeping CPU cannot miss it. Remote cancellation or destruction may
-leave an obsolete earlier one-shot in place; its eventual interrupt observes
-the updated hierarchy and is harmless.
+Each CPU owns one spinlock-guarded LLRB of deadline entries keyed
+`(absolute deadline, tid)`, value `struct thread *`. Parked threads with
+deadlines are the only entry kind ([futex-design.md](futex-design.md)
+§6): inserted at park, on the CPU the thread parks on, and removed on
+wake or expiry. Arming is therefore always local, and the scheme's
+remote-reprogram IPI is gone — nothing ever arms a deadline on another
+CPU's tree. A wake that beats the deadline leaves a stale entry whose
+`wake_state` CAS fails when it fires; nothing is cancelled, locally or
+remotely.
 
-Userspace implements `clock_gettime(CLOCK_MONOTONIC)`, sleeps, and waitset
-helper threads over this scheme. Civil/realtime clock policy remains a future
-userspace service.
+Each CPU's one-shot LAPIC deadline is:
+
+```
+min(current absolute quantum deadline, earliest parked deadline)
+```
+
+A timer-only interrupt expires entries and rearms the remainder of the
+existing quantum; it never grants a fresh quantum. The scheduler idle
+path removes its quantum but preserves the earliest deadline, so a
+thread parked with a timeout wakes without polling. Distant deadlines
+are handled by harmless early checkpoints when the 32-bit LAPIC count
+saturates.
+
+An interrupt processes at most 64 expirations; if more are
+simultaneously due, the still-due tree minimum schedules another
+near-immediate shot, keeping IRQ work bounded independently of how many
+threads are parked. Expiry pops its due entries, drops the timer lock,
+and CASes each thread's `wake_state`; a winner removes the thread's
+futex node by its `wait_key` and unblocks it with `SYSERR_TIMEDOUT`
+(the arbitration is [futex-design.md](futex-design.md) §6's).
+
+## What the deletion removes
+
+Timer rings and endpoints; per-endpoint timer trees with ID/cookie
+arming and linear-scan cancellation; `KTIMER_ARM_ABS`, `KTIMER_CANCEL`,
+`KEV_TIMER`, and the CQ-full pending list with its durable replay;
+ring-destruction cancellation of armed timers; the remote-reprogram IPI;
+the waiter-following migration TODO. That is most of
+`kernel/src/schemes/timer.c` (~350 lines), the `kring_timer.h` ABI, the
+timer helpers in `kring.c`, and their tests. Every one of those
+mechanisms existed to deliver a timer expiry through a ring as an event;
+with deadlines native to the wait call, no consumer needs a timer event
+at all.
+
+## Userspace
+
+`clock_gettime(CLOCK_MONOTONIC)` is `SYS_GETTIME`. `nanosleep`,
+`clock_nanosleep`, and every timed wait are `SYS_FUTEX_WAIT` with a
+deadline — for pure sleeps, on a private word nothing wakes
+([futex-design.md](futex-design.md) §8). The waitset helper threads that
+converted timer events into wakes are gone with the events. Civil and
+realtime clock policy remains a future userspace service.

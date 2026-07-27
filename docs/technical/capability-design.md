@@ -332,13 +332,23 @@ precedent, but this is an observation, not a v1 goal.
 
 - **Reap** gains one step type: advance revocation of one grant created by
   the zombie,
-  deepest-first, before owned blocks are freed (a route grant's teardown
-  may release a claim on a ring living in an owned block — verify this
-  ordering against `channel_block_destroyable` sequencing at
+  deepest-first, before the parent reclaims owned blocks (a route grant's
+  teardown may release a claim on a ring living in an owned block — verify
+  this ordering against `channel_block_destroyable` sequencing at
   implementation time). Grants die with their creators; tokens die with
   their grants; no other capability cleanup exists because no other
   capability state exists. Established mappings, claims, and attachments
   retain their ordinary object lifetimes.
+  - Reap no longer frees the zombie's memory
+    ([ipc-process-design.md](ipc-process-design.md) §4) — the parent claims
+    each block with `VM_MOVE` and frees it itself — so grant revocation must
+    complete before the parent's reclaim, not before a kernel-side free.
+- **TODO — grant enumeration.** `SYS_VM_FREE` refuses a block that still
+  anchors grants and does not revoke them itself
+  ([memory-design.md](memory-design.md) §5). Userspace therefore needs to
+  ask which grants a block anchors — a resumable read over the creator's
+  grant list, plausibly a `KCAP_LIST` op on the `-2` ring. Not yet
+  designed; until it exists, a caller learns only that the free failed.
 - **Pids are never reused** (monotonic 64-bit): creator ties require it;
   the phase-2 identity split (§9) wants it
   anyway.

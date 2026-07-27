@@ -184,33 +184,36 @@ first share changes private-event identity into channel identity and is
 rejected with `SYSERR_EXIST` while the private FIFO is nonempty. Userspace
 must stop new local waits and drain the existing FIFO before sharing.
 
-### Resumable voluntary free
+### Free is a single transaction; userspace drives what precedes it
 
-`SYS_VM_FREE(base)` is the userspace-driven continuation for a block with an
-arbitrary private waiter population; there is no kernel reaper or deferred
-work queue. The first call marks the block `freeing`, rejects every new
-`SYS_BLOCK_WAIT` with `SYSERR_DEAD`, and detaches at most
-`BLOCK_WAKE_BATCH` existing waiters with that result. If waiters remain, it
-returns `SYSERR_AGAIN` and deliberately leaves all mappings and metadata
-accessible so the owner can call `SYS_VM_FREE(base)` again. Once the FIFO is
-empty, the completing call performs ordinary revoke, pristine restoration,
-shootdown, and physical release, then returns zero.
+`SYS_VM_FREE(base)` is one bounded operation. It **fails** while anything is
+still attached to the block — sharers, DMA pins, capability grants,
+reflected-fault waiters — rather than driving their removal itself. Detaching
+them is userspace's job, done with bounded per-item verbs before the free:
 
-Thus `SYSERR_AGAIN` means the live caller owns the continuation; abandoning it
-leaves a mapped allocation in the monotonic `freeing` state. Standard libc
-`free()` hides the retry loop. When the owner is dead, each parent-driven
-`SYS_PROC_REAP` call advances the same drain by one bounded batch. A
-thread-completion or DMA pin instead returns `SYSERR_EXIST` before free begins
-because another immediate free call cannot make progress.
+```
+enumerate sharers -> VM_UNSHARE(base, pid) each
+                  -> FUTEX_WAKE the protocol words
+                  -> VM_FREE(base)
+```
 
-**Remaining boundedness boundary:** waiter draining is strictly batched, but
-the completing call still restores and flushes every sharer view in one
-release transaction, and page-table work scales with the block/view layout.
-If adversarially large sharer sets become possible, `freeing` needs a second
-userspace-driven `DRAINING_VIEWS` cursor so each `SYS_VM_FREE` revokes a fixed
-number of views while retaining the owner's mapping as the continuation name.
-The current implementation preserves the pre-existing all-views-at-once
-revocation semantics rather than silently making access revocation partial.
+The kernel never wakes a parked thread because its block was revoked
+([futex-design.md](futex-design.md) §5). An owner tearing down a channel knows
+which words its peers park on — the protocol names them, since the kernel no
+longer infers roles — so it wakes them itself after revoking their views, and
+their re-park fails because the view is gone. A party that wants to survive an
+*uncooperative* peer parks with a deadline.
+
+`SYSERR_AGAIN` stays reserved in the ABI and libc `free()` keeps its retry
+loop, so a future continuation can be added without touching callers. No path
+returns it today. The known candidates are recorded in
+[memory-design.md](memory-design.md) §5: adversarially large sharer sets, and
+the page-table walk of a large block, which is the one unbounded step no
+userspace pre-pass can remove.
+
+**TODO (not yet designed):** the enumeration syscalls this flow assumes —
+sharers of a block, blocks of a zombie, DMA pins, grants — with their owning
+documents named in memory-design §5.
 
 ### Establishment flow
 
@@ -492,9 +495,8 @@ scheduler dispatch, peer-liveness checks, and live-pid lookup all use that
 predicate. Reap materializes descendants' direct death one leaf at a time,
 removing their hidden registry entries as it reaches them. Runnable/running
 threads die at dispatch or their next kernel entry. Blocked victims are not
-woken merely to be culled: each bounded block-reap step detaches at most 16
-private wait nodes (or the structural endpoint slots), and later reap frees up
-to 256 detached TCBs per call.
+woken merely to be culled: reap frees up to 256 detached TCBs per call,
+removing each one's futex tree node before the TCB itself.
 
 **Zombies hold everything.** Pristinity needs no revocation at death:
 revocation guards *recycled* memory, and a zombie's blocks are still
@@ -505,30 +507,40 @@ resource containment is deferred to capability budgets.
 **`SYS_PROC_REAP(pid) -> REAP_MORE | REAP_DONE | SYSERR_AGAIN`** —
 callable by the parent on a dead child, covering the child's whole
 dead subtree (post-order cursor; nothing ever reparents, so the
-subtree is closed). One bounded step per call, whichever applies:
+subtree is closed).
 
-1. advance one owned block of the deepest unreaped zombie: detach at most 16
-   private waiters, or once drained revoke + free it, waking live parked
-   sharer-side threads `SYSERR_DEAD` — exactly the §1 revoke path; dead
-   waiters are detached without enqueueing; or
-2. drop one shared-in view, waking the owner-side waiter parked for a
-   doorbell that will never come (the zombie's own *views* need no
-   unmapping — they die with its AS); or
-3. free up to 256 detached blocked TCBs; scheduler-owned runnable/running
-   TCBs yield `SYSERR_AGAIN` until dispatch/preemption culls them; or
-4. free K page-table nodes of the AS — `SYSERR_AGAIN` until the drain
-   flag is up; or
-5. all resources gone: free the metadata vec in one
+**Reap handles process and thread state only. It does not free memory.**
+The parent claims each block the zombie owned with the upward `VM_MOVE`
+(§5) and then frees it with the ordinary §1 flow — the same cleanup
+routine it runs for its own memory, with the same handling of sharers,
+DMA pins, and grants. Reap reports the count still outstanding and
+cannot finish until they are gone. This keeps every entanglement of
+memory teardown on one userspace-driven path, and it makes accounting
+honest: a parent that takes over a dead child's memory is charged for
+it, and one that declines to reclaim leaks only inside its own subtree.
+Post-mortem inspection and exec-image recycling fall out of the same
+primitive — construction run in reverse.
+
+One bounded step per call, whichever applies:
+
+1. drop one share edge naming the zombie from a live owner's block (the
+   zombie's own *views* need no unmapping — they die with its AS); or
+2. free up to 256 detached blocked TCBs, removing each thread's futex
+   node by its wait key first ([futex-design.md](futex-design.md) §5);
+   scheduler-owned runnable/running TCBs yield `SYSERR_AGAIN` until
+   dispatch/preemption culls them; or
+3. free K page-table nodes of the AS — `SYSERR_AGAIN` until the drain
+   flag is up and every owned block has been claimed; or
+4. all thread and process state gone: free the metadata vec in one
    shot, free the process struct — `REAP_DONE`.
 
-A block can instead be **claimed** with the upward `VM_MOVE` (§5)
-before its reap step frees it — post-mortem inspection and exec-image
-recycling built from the same primitives, construction run in reverse.
-Threads already parked on a zombie's channels at death wait for the
-reap-time revocation; anyone parking afterwards fails fast on the §1
-liveness check. That latency rides on prompt parents — a libc default
-(park on the tree channel, reap on `EV_CHILD_DEAD`), not a kernel
-guarantee — accepted.
+Mutexes the dead threads held are recovered by the parent walking their
+`SYS_SET_ROBUST_LIST` registrations, in userspace, during this loop.
+Threads parked on a zombie's channels are not woken by the kernel at
+any point; they recover through their own deadlines, or through a
+monitor thread on their tree or shares channel. That latency rides on
+prompt parents — a libc default (park on the tree channel, reap on
+`EV_CHILD_DEAD`), not a kernel guarantee — accepted.
 
 What stays lazy until touched or reaped: a dead sharer's entry in a live
 owner's sharer vec, share edges naming the dead, and an effective-dead
@@ -645,8 +657,9 @@ rings/dummydev (and their kthreads) had to go with it.
 
 ## 7. Implementation notes and deliberate divergences (2026-07-07)
 
-- **Timer preemption is implemented (2026-07-08), and the timer scheme
-  shares it (2026-07-17).** Each CPU's LAPIC one-shot
+- **Timer preemption is implemented (2026-07-08); the timer scheme
+  shared it (2026-07-17) and is now planned for deletion
+  ([timer-design.md](timer-design.md)).** Each CPU's LAPIC one-shot
   (`VECTOR_TIMER=0xFB`) is armed for the earlier of its absolute 10 ms
   dispatch-quantum deadline and its earliest `KSCHEME_TIMER` deadline. The
   idle path removes the quantum but preserves user timers. A timer-only
