@@ -293,10 +293,9 @@ static void block_release_prepare(ublock *b, struct umem_release *rel) {
   uint64_t end = b->base + ublock_bytes(b);
   uint32_t nsharers = vec_share_edge_len(b->sharers);
 
-  // Unlink every sharer's view first: after this no data-plane lookup
-  // can find b, and whoever already found it is drained out by the
-  // stripe acquisition below (lookups hold the stripe before dropping
-  // their list lock).
+  // Unlink every sharer's view first: after this no list-lock lookup can
+  // find b. (VM_FREE proper refuses while sharers remain; this path also
+  // serves reap, where the sharers are revoked wholesale.)
   for (uint32_t i = 0; i < nsharers; i++) {
     share_edge e;
     vec_share_edge_get(b->sharers, i, &e);
@@ -305,12 +304,10 @@ static void block_release_prepare(ublock *b, struct umem_release *rel) {
     umem_proc_unlock(e.to);
   }
 
-  // Single teardown authority: parked peers wake SYSERR_DEAD exactly
-  // where the views are torn out, and a ring endpoint dies with its
-  // block — error-on-park and fault-on-touch can never disagree. Torn
-  // takes the stripe itself; its acquisition is the barrier that drains
-  // out any data-plane holder that resolved b before the unlinks above.
-  channel_block_torn(b, true);
+  // A ring endpoint dies with its block. Parked futex waiters are not
+  // notified — their recovery is their deadline, and a later touch of
+  // the block is the ordinary revocation death (futex-design.md §5).
+  channel_ring_destroy(b);
 
   rel->b = b;
   rel->nases = 1 + nsharers;
@@ -368,19 +365,15 @@ int umem_free(struct process *p, uint64_t base) {
   }
   ublock *b;
   vec_ublock_ptr_get(p->blocks, (uint32_t)i, &b);
+  // A single bounded transaction: fail while anything remains attached
+  // rather than driving its removal. Orderly teardown drains sharers
+  // first (sentinel -> wake -> peers DROPSHARE, VM_UNSHARE coercing).
   if (b->dma_pins != 0 || atomic_load(&b->thread_pins) != 0 ||
+      vec_share_edge_len(b->sharers) != 0 ||
       !channel_block_destroyable(b)) {
     umem_proc_unlock(p);
     umem_unlock();
     return (int)SYSERR_EXIST;
-  }
-  // VM_FREE is its own continuation. The block remains in the owner's list
-  // and mapped while each call detaches at most BLOCK_WAKE_BATCH waiters.
-  // `freeing` rejects new waits, so every SYSERR_AGAIN call makes progress.
-  if (!channel_block_free_step(b)) {
-    umem_proc_unlock(p);
-    umem_unlock();
-    return 1;
   }
   vec_ublock_ptr_swap_and_pop(p->blocks, (uint32_t)i);
   umem_proc_unlock(p);
@@ -403,13 +396,12 @@ int umem_protect(struct process *p, uint64_t base, size_t len,
   if (__builtin_add_overflow(base, (uint64_t)len, &end)) {
     return -1;
   }
-  // Flag + flush under the list lock: SYS_BLOCK_WAIT loads its user word
+  // Flag + flush under the list lock: SYS_FUTEX_WAIT loads its user word
   // under the same lock, so a guard (prot == 0) can never yank a mapping
   // between wait's user_range_ok and its load.
   umem_proc_lock(p);
   ublock *b = umem_view_locked(p, base, len);
-  if (b != nullptr &&
-      (b->freeing || atomic_load(&b->thread_pins) != 0)) {
+  if (b != nullptr && atomic_load(&b->thread_pins) != 0) {
     umem_proc_unlock(p);
     return -1;
   }
@@ -439,7 +431,7 @@ uint64_t umem_share(struct process *p, uint64_t base, uint64_t target_pid,
   ublock *b = umem_owned_locked(p, base);
   struct process *target = proc_lookup(target_pid);
   if (b == nullptr || target == nullptr || target == p || b->ring != nullptr ||
-      b->freeing || atomic_load(&b->thread_pins) != 0 || !b->delegatable ||
+      atomic_load(&b->thread_pins) != 0 || !b->delegatable ||
       (b->backing == UBLOCK_DEVICE &&
        ((prot & ~b->device_flags) != 0 || (prot & PAGE_X)))) {
     umem_proc_unlock(p);
@@ -451,25 +443,15 @@ uint64_t umem_share(struct process *p, uint64_t base, uint64_t target_pid,
     umem_unlock();
     return SYSERR_EXIST;
   }
-  uint32_t nsharers = vec_share_edge_len(b->sharers);
-  if (nsharers == 0 && !channel_block_private_idle(b)) {
-    umem_proc_unlock(p);
-    umem_unlock();
-    return SYSERR_EXIST;
-  }
   uint32_t si = umem_stripe(b->base);
   umem_stripe_lock(si);
   share_edge e = {.to = target, .notified = false};
   vec_share_edge_push(b->sharers, &e);
   umem_stripe_unlock(si);
   umem_proc_unlock(p);
-  // Both 0->1 (private event block becomes a user channel) and 1->2
-  // (valid channel becomes non-channel shared memory) change the identity
-  // a parked waiter relied on. Wake it SYSERR_DEAD after publishing the
-  // new edge. With two edges visible no waiter can re-park.
-  if (nsharers <= 1) {
-    channel_block_torn(b, false);
-  }
+  // Topology changes are not identity changes: waits are address-keyed,
+  // so parked waiters are unaffected by a new edge and any number of
+  // sharers is waitable (a count-capped wake is the bound).
 
   umem_proc_lock(target);
   vec_ublock_ptr_push(target->shared_in, &b);
@@ -489,7 +471,7 @@ uint64_t umem_share(struct process *p, uint64_t base, uint64_t target_pid,
   return 0;
 }
 
-int umem_unshare(struct process *p, uint64_t base) {
+int umem_dropshare(struct process *p, uint64_t base) {
   umem_lock();
   umem_proc_lock(p);
   int32_t i = find_block(p->shared_in, base);
@@ -500,22 +482,49 @@ int umem_unshare(struct process *p, uint64_t base) {
   }
   ublock *b;
   vec_ublock_ptr_get(p->shared_in, (uint32_t)i, &b);
-  if (b->freeing) {
-    umem_proc_unlock(p);
-    umem_unlock();
-    return -1;
-  }
   vec_ublock_ptr_swap_and_pop(p->shared_in, (uint32_t)i);
   umem_proc_unlock(p);
   uint32_t si = umem_stripe(b->base);
   umem_stripe_lock(si);
   remove_edge(b->sharers, p);
   umem_stripe_unlock(si);
-  // The channel (if the peers treated it as one) is gone: wake parked
-  // peers with SYSERR_DEAD. The block itself lives on with its owner.
-  channel_block_torn(b, false);
+  // The block lives on with its owner; nobody parked on its words is
+  // notified. In orderly teardown this drop IS the ack the owner's
+  // VM_FREE drain gate is waiting for.
   as_flag(p->as, b->base, b->base + ublock_bytes(b), b->kernel_flags);
   as_flush(p->as);
+  umem_unlock();
+  return 0;
+}
+
+uint64_t umem_unshare_from(struct process *p, uint64_t base, uint64_t pid) {
+  umem_lock();
+  umem_proc_lock(p);
+  ublock *b = umem_owned_locked(p, base);
+  umem_proc_unlock(p); // b stays pinned by g_umem
+  if (b == nullptr) {
+    umem_unlock();
+    return SYSERR_INVAL;
+  }
+  // The target may already be effectively dead (its edges then belong to
+  // reap); only a live sharer's view is revocable here.
+  struct process *target = proc_lookup(pid);
+  if (target == nullptr || find_edge(b->sharers, target) < 0) {
+    umem_unlock();
+    return SYSERR_INVAL;
+  }
+  umem_proc_lock(target);
+  remove_block(target->shared_in, b);
+  umem_proc_unlock(target);
+  uint32_t si = umem_stripe(b->base);
+  umem_stripe_lock(si);
+  remove_edge(b->sharers, target);
+  umem_stripe_unlock(si);
+  // The coerced peer is not notified; its later touch of the block is
+  // the ordinary revocation death, on the non-cooperating party by
+  // construction (futex-design.md §5).
+  as_flag(target->as, b->base, b->base + ublock_bytes(b), b->kernel_flags);
+  as_flush(target->as);
   umem_unlock();
   return 0;
 }
@@ -533,12 +542,6 @@ bool umem_reap_one_block_locked(struct process *p, struct umem_release *rel) {
   }
   ublock *b;
   vec_ublock_ptr_get(p->blocks, 0, &b);
-  // A dead process cannot drive VM_FREE itself, so each parent-driven reap
-  // call advances the same bounded waiter drain by one batch.
-  if (!channel_block_free_step(b)) {
-    umem_proc_unlock(p);
-    return true;
-  }
   vec_ublock_ptr_swap_and_pop(p->blocks, 0);
   umem_proc_unlock(p);
   // The zombie's own AS is restored too (block_release_prepare): it
@@ -564,9 +567,8 @@ bool umem_reap_one_view_locked(struct process *p) {
   umem_stripe_lock(si);
   remove_edge(b->sharers, p);
   umem_stripe_unlock(si);
-  // The owner's side of the channel wakes SYSERR_DEAD — it was parked
-  // for a doorbell that will never come.
-  channel_block_torn(b, false);
+  // Nobody is notified: a peer parked on words in this block recovers
+  // via its deadline (futex-design.md §5).
   as_flag(p->as, b->base, b->base + ublock_bytes(b), b->kernel_flags);
   as_flush(p->as);
   return true;
@@ -586,7 +588,7 @@ void umem_reap_finish_locked(struct process *p) {
 
 uint64_t umem_move_locked(ublock *b, struct process *from, struct process *to,
                           bool src_as_live) {
-  if (b->freeing || b->dma_pins != 0 || atomic_load(&b->thread_pins) != 0)
+  if (b->dma_pins != 0 || atomic_load(&b->thread_pins) != 0)
     return SYSERR_EXIST;
   if (!b->delegatable)
     return SYSERR_INVAL;
@@ -596,12 +598,9 @@ uint64_t umem_move_locked(ublock *b, struct process *from, struct process *to,
   // is into an own embryo, up is out of an own zombie — and that live
   // endpoint is `from`, which loses sight of the block here, or `to`,
   // which only gains sight at the final push: the swap is atomic to
-  // every observer that can actually run.
+  // every observer that can actually run. Parked waiters on the block's
+  // words are address-keyed and unaffected by the move.
   umem_proc_lock(from);
-  if (!channel_block_private_idle(b)) {
-    umem_proc_unlock(from);
-    return SYSERR_EXIST;
-  }
   remove_block(from->blocks, b);
   umem_proc_unlock(from);
   umem_proc_lock(to);
@@ -620,9 +619,6 @@ uint64_t umem_move_locked(ublock *b, struct process *from, struct process *to,
   }
   b->owner = to;
   umem_stripe_unlock(si);
-  // Ownership is channel identity: whoever was parked on this block was
-  // waiting on a peer that no longer exists. Mutate first, then tear.
-  channel_block_torn(b, false);
 
   if (src_as_live) {
     as_flag(from->as, b->base, b->base + bytes, b->kernel_flags);

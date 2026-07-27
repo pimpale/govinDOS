@@ -6,6 +6,7 @@
 #include "capability.h"
 #include "cpu_state.h"
 #include "debug.h"
+#include "futex.h"
 #include "iommu.h"
 #include "irq_scheme.h"
 #include "paging.h"
@@ -227,9 +228,13 @@ static uint64_t reap_step_locked(struct process *target,
   if (umem_reap_one_view_locked(z)) {
     return REAP_MORE;
   }
-  // Expensive resources are gone, so every blocked TCB has been detached
-  // from its waiter slot. Free a fixed batch from the vector tail. A
-  // RUNNABLE/RUNNING/DEAD tail remains scheduler-owned and is left alone.
+  // Free a fixed batch of blocked TCBs from the vector tail. A
+  // RUNNABLE/RUNNING/DEAD tail remains scheduler-owned and is left
+  // alone. A parked thread's futex node holds a thread pointer, so the
+  // TCB may be freed only by a reap that wins the PARKED -> CLAIMED
+  // claim and removes the node first; a CLAIMED or MOVING thread belongs
+  // to someone else for the moment, and off-CPU-and-blocked alone is no
+  // longer a licence to free (futex-design.md §5, §6).
   uint32_t ntcbs = 0;
   while (ntcbs < REAP_TCB_BATCH && vec_thread_ptr_len(z->threads) > 0) {
     uint32_t i = vec_thread_ptr_len(z->threads) - 1;
@@ -238,6 +243,18 @@ static uint64_t reap_step_locked(struct process *target,
     if (atomic_load_explicit(&t->on_cpu, memory_order_acquire) ||
         atomic_load_explicit(&t->status, memory_order_acquire) !=
             THREAD_BLOCKED) {
+      break;
+    }
+    enum futex_state ws =
+        atomic_load_explicit(&t->wake_state, memory_order_acquire);
+    if (ws == FUTEX_PARKED) {
+      if (!futex_try_claim(t)) {
+        break; // a waker or expiry owns it; retry contract reports progress
+      }
+      futex_reap_claimed(t);
+    } else if (ws != FUTEX_REAPABLE) {
+      // CLAIMED/MOVING (or a not-yet-published park): in someone else's
+      // hands right now — the existing SYSERR_AGAIN retry covers it.
       break;
     }
     remove_thread_ref(z, t);

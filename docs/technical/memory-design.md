@@ -245,10 +245,12 @@ Notes:
 - **Page-table pages must die like user frames (2026-07-26, required by
   futex-design §3).** `as_flag`'s overwrite and merge paths currently
   `free_table` during mutation, so a concurrent lock-free walker can chase a
-  freed-and-recycled table page. Freed sub-trees instead join the post-flush
-  release batch (`struct umem_release`), so no page-table page is recycled
-  before the shootdown completes. The futex wait path's view check depends on
-  this; until it lands, that path holds `p->ulock` instead.
+  freed-and-recycled table page. The fix lives in the AS layer so every
+  `as_flag` caller is covered: mutation detaches obsolete sub-trees onto a
+  per-AS retirement list, and `as_flush` drains that list only after its
+  shootdown is acknowledged — synchronous, no kernel worker. No table page is
+  recycled before the shootdown completes. The futex wait path's view check
+  depends on this; until it lands, that path holds `p->ulock` instead.
 - **Flags are per-view.** A sharer restricting its view to `PAGE_R` or punching
   a guard sub-range (`prot == 0`) affects only its own tree. No shared flag
   state to reconcile, and each AS's fragmentation is collapsed independently

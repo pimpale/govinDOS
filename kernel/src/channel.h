@@ -7,21 +7,19 @@
 
 // Shared-block channels + kernel schemes (ipc-process-design.md §1, §2).
 //
-// A shared ublock is a channel both sides may treat as a ring. An owned,
-// unshared ublock is also a process-private event block. The kernel
-// contributes exactly two data-plane verbs scoped to the block —
-// SYS_BLOCK_DOORBELL (wake the peer, self-wake a private block, or run kernel
-// commands) and SYS_BLOCK_WAIT (futex-shaped park on a 32-bit word) — plus
-// consented establishment via SYS_VM_SHARE. Between user peers everything
-// inside the block is userspace convention; when the far end is a kernel
-// scheme (VM_SHARE to a negative id) the layout below is kernel ABI.
+// A shared ublock is a channel both sides may treat as a ring. Waiting
+// and waking are the futex's (futex-design.md): threads park on 32-bit
+// words by address, and a FUTEX_WAKE whose address resolves to a kernel
+// channel is the doorbell (channel_ring_drain). Between user peers
+// everything inside the block is userspace convention; when the far end
+// is a kernel scheme (VM_SHARE to a negative id) the layout below is
+// kernel ABI.
 //
-// There is no session object and no IPC registry: kernel-side state is an
-// intrusive multi-waiter FIFO for a private block, two structural waiter
-// slots for shared endpoints, a notified bit per share edge, and one
-// ring endpoint per kernel channel — all guarded by the block's
-// stripe lock, the ring/edge state by g_umem (hierarchy in umem.h), all
-// torn down by the umem revoke path (channel_block_torn).
+// There is no session object and no IPC registry: kernel-side state is
+// a notified bit per share edge and one ring endpoint per kernel
+// channel — the ring/edge state under g_umem (hierarchy in umem.h), CQ
+// publication under the block's stripe, endpoints torn down by the umem
+// revoke path (channel_ring_destroy).
 
 // The kernel ring ABI — kring_hdr/ksqe/kcqe layout in gdos/kring.h, one
 // gdos/kring_*.h per scheme (ids, KEV_* event types, ops) — lives in the
@@ -32,10 +30,7 @@
 #include <gdosabi/kring_irq.h>
 #include <gdosabi/kring_iommu.h>
 #include <gdosabi/kring_shares.h>
-#include <gdosabi/kring_timer.h>
 #include <gdosabi/kring_tree.h>
-
-#include "timer_queue.h"
 
 // Kernel-channel endpoint. Lives on the ublock (b->ring); owner-only.
 // CQ publication (cq_count, CQ slots, the full-check) happens under
@@ -44,7 +39,6 @@
 // their posts must stay atomic with level-state flips
 // (notified/death_notified) that live under g_umem.
 struct scheme_ops;
-struct cpu_state;
 
 struct ring {
   const struct scheme_ops *ops;
@@ -56,23 +50,10 @@ struct ring {
   // count are g_umem-only; each route's delivery state has its own lock.
   struct irq_route *irq_claims;
   uint32_t nclaims;
-  // Scheme -5 only. The assigned CPU's timer lock protects these fields.
-  // Timers and pending expirations are values owned by their respective
-  // endpoint trees; the CPU tree contains only one borrowed ring pointer.
-  llrb_timer *timers;
-  llrb_timer_event *timer_pending;
-  struct cpu_state *timer_cpu;
-  struct ring_deadline_key timer_cpu_key;
-  uint64_t timer_sequence;
-  uint64_t timer_ring_id;
-  bool timer_indexed;
 };
 
 // ---------------------------------------------------------------------------
-// Syscall backends (syscall.c). `curr` is the calling user thread; both
-// may park it, so the caller must have saved its frame with rax
-// preloaded to 0 before calling (the RING_WAIT discipline). A non-parking
-// return value overwrites the live frame's rax as usual.
+// Syscall backends (syscall.c / futex.c)
 // ---------------------------------------------------------------------------
 
 // SYS_VM_SHARE with a negative target: turn the owned block at `base`
@@ -80,15 +61,10 @@ struct ring {
 uint64_t channel_scheme_create(struct process *p, uint64_t base,
                                int64_t scheme);
 
-// SYS_BLOCK_DOORBELL: wake the far side (user channel), the owner waiter
-// (private block), or drain + execute the SQ (kernel channel). Never parks.
-uint64_t channel_block_doorbell(struct thread *curr, uint64_t address);
-
-// SYS_BLOCK_WAIT: park on the 32-bit word at `addr` until a doorbell/CQE
-// post/revocation, unless it already differs from `expected`. Parks via
-// uthread_park_blocked (never returning) or returns immediately.
-uint64_t channel_block_wait(struct thread *curr, uint64_t addr,
-                            uint64_t expected);
+// FUTEX_WAKE's kernel-channel case (the old doorbell): drain + execute
+// the SQ in the caller's context and run the scheme's replay. `address`
+// is any address within the ring block. Never parks.
+uint64_t channel_ring_drain(struct thread *curr, uint64_t address);
 
 // ---------------------------------------------------------------------------
 // Hooks called by umem.c / process.c under g_umem
@@ -105,31 +81,19 @@ void channel_edge_notify(ublock *b, struct share_edge *e);
 // the bit clear for replay.
 void channel_child_dead_notify(struct process *parent, struct process *child);
 
-// The block is being revoked or its wait identity changed (first/second
-// share, ownership move): wake both waiter slots with SYSERR_DEAD and, if
-// `destroy_endpoint`, free the ring. Idempotent. Caller holds g_umem and
-// not the stripe. Normally mutate then tear so new parkers fail
-// classification; scheme creation may instead hold the owner's list lock
-// across tear + ring publication, which excludes new private waiters.
-void channel_block_torn(ublock *b, bool destroy_endpoint);
-
-// Begin/continue the bounded waiter-drain phase of VM_FREE/reap. Marks the
-// block as freeing, rejects future waits, detaches at most BLOCK_WAKE_BATCH
-// waiters with SYSERR_DEAD, and returns true only once no waiters remain.
-// Caller holds g_umem and the owner's list lock, and not the stripe.
-bool channel_block_free_step(ublock *b);
-
-// Identity changes are single-shot and therefore require an empty private
-// FIFO. The caller must hold the owner's list lock so a private waiter cannot
-// race in after this check. False also covers an in-progress VM_FREE.
-bool channel_block_private_idle(ublock *b);
+// The block is being revoked: destroy its kernel-channel endpoint, if
+// any (unhook the scheme anchor, run the scheme's destroy, free the
+// ring). Idempotent; a no-op for plain blocks. Caller holds g_umem and
+// not the stripe. Parked futex waiters are never notified — recovery is
+// the waiter's deadline (futex-design.md §5).
+void channel_ring_destroy(ublock *b);
 
 // Voluntary VM_FREE must not destroy a stateful endpoint until its scheme
 // resources are gone. Reap performs the scheme cleanup first.
 bool channel_block_destroyable(ublock *b);
 
-// Publish a thread's post-deschedule completion and wake a waiter on its
-// private event block. Caller holds g_umem; the TCB owns one thread_pins
+// Publish a thread's post-deschedule completion and wake one waiter on
+// the completion word. Caller holds g_umem; the TCB owns one thread_pins
 // reference on `block`. The reference is consumed here.
 void channel_thread_complete_locked(struct process *p, ublock *block,
                                     uint64_t event);

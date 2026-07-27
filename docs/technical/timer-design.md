@@ -1,7 +1,9 @@
 # Kernel time and deadlines
 
-Status: **revised 2026-07-26.** `KSCHEME_TIMER` (scheme `-5`, implemented
-2026-07-17) is deleted, and `gdosabi/kring_timer.h` with it. Timed
+Status: **implemented 2026-07-27.** `KSCHEME_TIMER` (scheme `-5`) is
+deleted, and `gdosabi/kring_timer.h` with it; what remains lives in
+`kernel/src/timer.c` and `SYS_GETTIME` sits at number 4 in the
+regrouped syscall table. Timed
 waiting moves into `SYS_FUTEX_WAIT`'s deadline argument
 ([futex-design.md](futex-design.md) §6), which serves every consumer the
 scheme had — sleeps, `*_timedwait`, `poll`-family timeouts — without
@@ -41,7 +43,8 @@ goes straight to ring 3 from its saved frame
 ([futex-design.md](futex-design.md) §6 has the full ordering). Arming
 is always local, and the scheme's remote-reprogram IPI is gone —
 nothing ever arms a deadline on another CPU's tree. A winner on another
-CPU may remove an entry from the arming CPU's tree, but removal never
+CPU — in syscall or interrupt context alike — may remove an entry from
+the arming CPU's tree, but removal never
 makes a tree minimum earlier, so it never reprograms a LAPIC and never
 needs an IPI; a one-shot firing for an already-removed entry finds
 nothing due and rearms harmlessly.
@@ -62,11 +65,14 @@ saturates.
 An interrupt processes at most 64 expirations; if more are
 simultaneously due, the still-due tree minimum schedules another
 near-immediate shot, keeping IRQ work bounded independently of how many
-threads are parked. Expiry pops its due entries, drops the timer lock,
-and CASes each thread's `wake_state`; a winner claims the thread — the
-claim is a lifetime pin against reap — removes both its entries, and
-unblocks it with `SYSERR_TIMEDOUT`, or leaves a dead process's thread
-detached for reap (the arbitration is
+threads are parked. Expiry claims each due thread while its entry is
+still in the tree — an entry in the tree means no winner has finished
+cleanup, so the TCB is alive for the CAS — pops the entries it won,
+drops the timer lock, and finishes each claimed thread: the claim is a
+lifetime pin against reap; the winner removes the futex node and
+unblocks with `SYSERR_TIMEDOUT`, or marks a dead process's thread
+`REAPABLE`. Lost claims leave their entries for the winner's keyed
+removal (the arbitration and claim lifecycle are
 [futex-design.md](futex-design.md) §6's).
 
 ## What the deletion removes

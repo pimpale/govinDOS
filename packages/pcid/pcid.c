@@ -208,7 +208,7 @@ static bool power_of_two(uint64_t v) { return v != 0 && !(v & (v - 1)); }
 
 static void signal_state(struct pci_driver_start *setup, uint32_t state) {
   atomic_store_explicit(&setup->state, state, memory_order_release);
-  sys_block_doorbell((uint64_t)setup);
+  sys_futex_wake(&setup->state, 1);
 }
 
 static bool wait_state(struct pci_driver_start *setup, uint32_t wanted) {
@@ -217,7 +217,9 @@ static bool wait_state(struct pci_driver_start *setup, uint32_t wanted) {
         atomic_load_explicit(&setup->state, memory_order_acquire);
     if (state >= wanted)
       return true;
-    if (sys_block_wait(&setup->state, state) != 0)
+    // SYSERR_AGAIN just means the word moved under us: re-check.
+    uint64_t rc = sys_futex_wait(&setup->state, state, nullptr, 0);
+    if (rc != 0 && rc != SYSERR_AGAIN)
       return false;
   }
 }
@@ -509,14 +511,15 @@ static bool block_request(struct gdos_block_channel *ch, uint32_t op,
   ch->data_length = length;
   uint32_t seq = old + 1;
   atomic_store_explicit(&ch->request_seq, seq, memory_order_release);
-  if (sys_block_doorbell((uint64_t)ch) != 0)
+  if (sys_iserr(sys_futex_wake(&ch->request_seq, 1)))
     return false;
   for (;;) {
     uint32_t response = atomic_load_explicit(&ch->response_seq,
                                              memory_order_acquire);
     if (response == seq)
       return ch->status == GDOS_BLOCK_STATUS_OK;
-    if (sys_block_wait(&ch->response_seq, response) != 0)
+    uint64_t rc = sys_futex_wait(&ch->response_seq, response, nullptr, 0);
+    if (rc != 0 && rc != SYSERR_AGAIN)
       return false;
   }
 }

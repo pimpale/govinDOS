@@ -515,9 +515,10 @@ parks unconditionally (a mismatch exits earlier with nothing armed and
 nothing linked). Whichever path wins the park — unparker, expiry, or
 reap — claims the thread, and the claim is a reap-visible lifetime pin:
 the winner removes the node and the deadline entry before unblocking
-(or, for a dead process's thread, leaves the TCB to reap), and reap
-frees only threads it claimed itself; a woken thread runs no kernel
-exit code, so cleanup is always the winner's. No entry outlives its park: nothing stale ever fires, a
+(or, for a dead process's thread, marks it reapable), and reap frees
+only threads it claimed itself or that a winner marked reapable; a
+woken thread runs no kernel exit code, so cleanup is always the
+winner's. No entry outlives its park: nothing stale ever fires, a
 re-park cannot receive an earlier park's timeout, and reap never meets
 a freed TCB.
 

@@ -112,11 +112,15 @@ static LLRB_NODE_T *LLRB_LOCAL(fix_up)(LLRB_NODE_T *h) {
   return h;
 }
 
+// `spare`, when non-NULL, supplies the new node's storage instead of
+// LLRB_MALLOC — the _insert_node path, which therefore cannot fail with
+// OOM (result -1).
 static LLRB_NODE_T *LLRB_LOCAL(insert)(LLRB_NODE_T *h, LLRB_NODE_T *parent,
                                        const LLRB_KEY *key,
-                                       const LLRB_VALUE *value, int *result) {
+                                       const LLRB_VALUE *value,
+                                       LLRB_NODE_T *spare, int *result) {
   if (h == NULL) {
-    LLRB_NODE_T *n = LLRB_MALLOC(sizeof(*n));
+    LLRB_NODE_T *n = spare != NULL ? spare : LLRB_MALLOC(sizeof(*n));
     if (n == NULL) {
       *result = -1;
       return NULL;
@@ -133,13 +137,14 @@ static LLRB_NODE_T *LLRB_LOCAL(insert)(LLRB_NODE_T *h, LLRB_NODE_T *parent,
 
   int cmp = LLRB_COMPARE(key, &h->key);
   if (cmp < 0) {
-    LLRB_NODE_T *left = LLRB_LOCAL(insert)(h->left, h, key, value, result);
+    LLRB_NODE_T *left =
+        LLRB_LOCAL(insert)(h->left, h, key, value, spare, result);
     if (*result < 0)
       return h;
     h->left = left;
   } else if (cmp > 0) {
     LLRB_NODE_T *right =
-        LLRB_LOCAL(insert)(h->right, h, key, value, result);
+        LLRB_LOCAL(insert)(h->right, h, key, value, spare, result);
     if (*result < 0)
       return h;
     h->right = right;
@@ -182,34 +187,46 @@ static const LLRB_NODE_T *LLRB_LOCAL(cmin)(const LLRB_NODE_T *h) {
   return h;
 }
 
-static LLRB_NODE_T *LLRB_LOCAL(delete_min)(LLRB_NODE_T *h) {
+// `keep`, when non-NULL, receives the one node each removal unlinks
+// instead of that node being freed — the _extract path. (In the
+// successor-swap case the unlinked node is the successor's storage, not
+// the matched node; key and value identity are what the caller asked
+// for, node identity is not part of the contract.)
+static LLRB_NODE_T *LLRB_LOCAL(delete_min)(LLRB_NODE_T *h,
+                                           LLRB_NODE_T **keep) {
   if (h->left == NULL) {
-    LLRB_FREE(h);
+    if (keep != NULL)
+      *keep = h;
+    else
+      LLRB_FREE(h);
     return NULL;
   }
   if (!LLRB_LOCAL(is_red)(h->left) &&
       !LLRB_LOCAL(is_red)(h->left->left))
     h = LLRB_LOCAL(move_red_left)(h);
-  h->left = LLRB_LOCAL(delete_min)(h->left);
+  h->left = LLRB_LOCAL(delete_min)(h->left, keep);
   if (h->left != NULL)
     h->left->parent = h;
   return LLRB_LOCAL(fix_up)(h);
 }
 
-static LLRB_NODE_T *LLRB_LOCAL(remove)(LLRB_NODE_T *h,
-                                       const LLRB_KEY *key) {
+static LLRB_NODE_T *LLRB_LOCAL(remove)(LLRB_NODE_T *h, const LLRB_KEY *key,
+                                       LLRB_NODE_T **keep) {
   if (LLRB_COMPARE(key, &h->key) < 0) {
     if (!LLRB_LOCAL(is_red)(h->left) &&
         !LLRB_LOCAL(is_red)(h->left->left))
       h = LLRB_LOCAL(move_red_left)(h);
-    h->left = LLRB_LOCAL(remove)(h->left, key);
+    h->left = LLRB_LOCAL(remove)(h->left, key, keep);
     if (h->left != NULL)
       h->left->parent = h;
   } else {
     if (LLRB_LOCAL(is_red)(h->left))
       h = LLRB_LOCAL(rotate_right)(h);
     if (LLRB_COMPARE(key, &h->key) == 0 && h->right == NULL) {
-      LLRB_FREE(h);
+      if (keep != NULL)
+        *keep = h;
+      else
+        LLRB_FREE(h);
       return NULL;
     }
     if (!LLRB_LOCAL(is_red)(h->right) &&
@@ -219,9 +236,9 @@ static LLRB_NODE_T *LLRB_LOCAL(remove)(LLRB_NODE_T *h,
       LLRB_NODE_T *successor = LLRB_LOCAL(min)(h->right);
       h->key = successor->key;
       h->value = successor->value;
-      h->right = LLRB_LOCAL(delete_min)(h->right);
+      h->right = LLRB_LOCAL(delete_min)(h->right, keep);
     } else {
-      h->right = LLRB_LOCAL(remove)(h->right, key);
+      h->right = LLRB_LOCAL(remove)(h->right, key, keep);
     }
     if (h->right != NULL)
       h->right->parent = h;
@@ -266,7 +283,22 @@ void LLRB_FN(_delete)(LLRB_T **tree) {
 bool LLRB_FN(_insert)(LLRB_T *tree, const LLRB_KEY *key,
                       const LLRB_VALUE *value) {
   int result = 0;
-  tree->root = LLRB_LOCAL(insert)(tree->root, NULL, key, value, &result);
+  tree->root =
+      LLRB_LOCAL(insert)(tree->root, NULL, key, value, NULL, &result);
+  if (tree->root != NULL) {
+    tree->root->parent = NULL;
+    tree->root->red = false;
+  }
+  if (result == 1)
+    tree->len++;
+  return result == 1;
+}
+
+bool LLRB_FN(_insert_node)(LLRB_T *tree, const LLRB_KEY *key,
+                           const LLRB_VALUE *value, LLRB_NODE_T *node) {
+  int result = 0;
+  tree->root =
+      LLRB_LOCAL(insert)(tree->root, NULL, key, value, node, &result);
   if (tree->root != NULL) {
     tree->root->parent = NULL;
     tree->root->red = false;
@@ -294,14 +326,15 @@ bool LLRB_FN(_get)(const LLRB_T *tree, const LLRB_KEY *key,
   return false;
 }
 
-bool LLRB_FN(_remove)(LLRB_T *tree, const LLRB_KEY *key,
-                      LLRB_VALUE *old_value) {
+static bool LLRB_LOCAL(remove_root)(LLRB_T *tree, const LLRB_KEY *key,
+                                    LLRB_VALUE *old_value,
+                                    LLRB_NODE_T **keep) {
   if (!LLRB_FN(_get)(tree, key, old_value))
     return false;
   if (!LLRB_LOCAL(is_red)(tree->root->left) &&
       !LLRB_LOCAL(is_red)(tree->root->right))
     tree->root->red = true;
-  tree->root = LLRB_LOCAL(remove)(tree->root, key);
+  tree->root = LLRB_LOCAL(remove)(tree->root, key, keep);
   if (tree->root != NULL) {
     tree->root->parent = NULL;
     tree->root->red = false;
@@ -310,10 +343,45 @@ bool LLRB_FN(_remove)(LLRB_T *tree, const LLRB_KEY *key,
   return true;
 }
 
+bool LLRB_FN(_remove)(LLRB_T *tree, const LLRB_KEY *key,
+                      LLRB_VALUE *old_value) {
+  return LLRB_LOCAL(remove_root)(tree, key, old_value, NULL);
+}
+
+bool LLRB_FN(_extract)(LLRB_T *tree, const LLRB_KEY *key,
+                       LLRB_VALUE *old_value, LLRB_NODE_T **node_out) {
+  LLRB_NODE_T *kept = NULL;
+  if (!LLRB_LOCAL(remove_root)(tree, key, old_value, &kept))
+    return false;
+  kept->left = NULL;
+  kept->right = NULL;
+  kept->parent = NULL;
+  *node_out = kept;
+  return true;
+}
+
 size_t LLRB_FN(_len)(const LLRB_T *tree) { return tree->len; }
 
 void LLRB_FN(_iter_begin)(const LLRB_T *tree, LLRB_ITER_T *iter) {
   iter->node = LLRB_LOCAL(cmin)(tree->root);
+}
+
+void LLRB_FN(_iter_lower_bound)(const LLRB_T *tree, const LLRB_KEY *key,
+                                LLRB_ITER_T *iter) {
+  const LLRB_NODE_T *n = tree->root;
+  const LLRB_NODE_T *best = NULL;
+  while (n != NULL) {
+    int cmp = LLRB_COMPARE(key, &n->key);
+    if (cmp <= 0) {
+      best = n;
+      if (cmp == 0)
+        break;
+      n = n->left;
+    } else {
+      n = n->right;
+    }
+  }
+  iter->node = best;
 }
 
 bool LLRB_FN(_iter_next)(LLRB_ITER_T *iter, LLRB_KEY *key,

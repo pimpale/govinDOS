@@ -1,32 +1,33 @@
 # Futex design: address-keyed waiting
 
-Status: **planned 2026-07-26.** Supersedes the `SYS_BLOCK_WAIT` /
+Status: **implemented 2026-07-27** (steps 1–6 and 8 of §10; the robust
+list, step 7, is not built — see §5). Supersedes the `SYS_BLOCK_WAIT` /
 `SYS_BLOCK_DOORBELL` pair described in
 [ipc-process-design.md](ipc-process-design.md) §1, and the
 "process-private events and userspace multiplexing" rules of its §2.
 [park-design.md](park-design.md) is an explicit alternative to this
-document — same problem, same syscall numbers, thread-directed rather
-than address-keyed waiting; exactly one of the two should be built, and
+document — same problem, thread-directed rather
+than address-keyed waiting; this one was built, and
 its §11 is the head-to-head. It
-must obey that document's design law unchanged: bounded non-blocking
+obeys that document's design law unchanged: bounded non-blocking
 kernel work, registrations for interest, events for results, **no kernel
 threads, no deferred kernel work**.
 
-Planned implementation map: `abi/gdosabi/syscall.h` (syscall numbers 11
-and 12 reused in place, `SYS_GETTIME 22` and `SYS_FUTEX_REQUEUE 23`
-added, plus `SYSERR_TIMEDOUT`), `kernel/src/futex.{c,h}` (new: bucket table,
-park, wake, requeue), `kernel/src/channel.c` (waiter slots delete;
-`channel_block_wait`/`channel_block_doorbell` delete),
-`kernel/src/umem.c` (`freeing` and the resumable free delete;
-`VM_UNSHARE` becomes the owner-revoke verb `(base, pid)` at a new
-number, the sharer's drop renaming to `VM_DROPSHARE` in slot 9),
-`kernel/src/process.c` (reap narrows
-to process and thread state; futex-node removal at TCB reap),
-`kernel/src/thread.h` (per-TCB wait key), `kernel/src/schemes/timer.c`
-(the scheme surface deletes — [timer-design.md](timer-design.md) —
-leaving the per-CPU deadline tree, repurposed for parked threads),
-`packages/gdoslib-dev/kring.c` and
-`packages/gdos-libc-dev/source/pthread.c` (the two consumers).
+Implementation map: `abi/gdosabi/syscall.h` (the renumbered, ability-
+grouped table below, plus `SYSERR_TIMEDOUT`), `kernel/src/futex.{c,h}`
+(bucket table, park, wake, requeue, the claim protocol),
+`kernel/src/channel.c` (waiter slots deleted;
+`channel_block_wait`/`channel_block_doorbell` deleted, the drain
+surviving as `channel_ring_drain`), `kernel/src/umem.c` (`freeing` and
+the resumable free deleted; `VM_UNSHARE` is the owner-revoke verb
+`(base, pid)`, the sharer's drop renamed to `VM_DROPSHARE`),
+`kernel/src/process.c` (TCB reap claims parked threads and removes
+their futex nodes), `kernel/src/thread.h` (per-TCB wait key, deadline,
+`wake_state`), `kernel/src/timer.c` (the scheme surface deleted —
+[timer-design.md](timer-design.md) — leaving the per-CPU deadline tree
+of parked threads), `packages/gdoslib-dev/kring.c` and
+`packages/gdos-libc-dev/source/pthread.c` (the two consumers), and
+`packages/gdos-libc-dev/source/time.c` (`clock_gettime`, `nanosleep`).
 
 ## 0. Decisions log
 
@@ -135,8 +136,13 @@ leaving the per-CPU deadline tree, repurposed for parked threads),
   argument).
 - **Thread completion stays an address wait for now, but is the one
   natural park/unpark case.** §4 and §9.
-- **Syscall numbers 11 and 12 are reused in place.** There is no
-  compatibility obligation; the old spellings simply cease to exist.
+- **The syscall table is renumbered and grouped by ability.** There is
+  no compatibility obligation; the old spellings simply cease to exist,
+  and the numbers regroup — identity/time (`SYS_GETTIME 4`), memory,
+  sharing (`SYS_VM_SHARE 9`, `SYS_VM_DROPSHARE 10`, `SYS_VM_UNSHARE
+  11`, `SYS_VM_MOVE 12`, `SYS_VM_MAP_DEVICE 13`), futexes
+  (`SYS_FUTEX_WAKE 14`, `SYS_FUTEX_WAIT 15`, `SYS_FUTEX_REQUEUE 16`),
+  then process/thread lifecycle.
 
 ## 1. Precedents
 
@@ -248,7 +254,9 @@ kernel channel, this is the old doorbell: drain and execute the SQ in
 the caller's context under the existing `RING_SQ_BATCH`/`RING_SQ_CHUNK`
 bounds, run the scheme's replay, and ignore `count`. Otherwise wake up
 to `min(count, FUTEX_WAKE_BATCH)` threads parked on exactly `addr`,
-FIFO, and return how many. `count == UINT64_MAX` spells "as many as you
+FIFO, and return how many. Only won claims are counted — a waiter lost
+to a racing timeout or reap is skipped, since its wake is delivered as
+that winner's result, not this one's. `count == UINT64_MAX` spells "as many as you
 will"; the caller loops while the return equals the cap. The word at
 `addr` is never read.
 
@@ -257,7 +265,12 @@ will"; the caller loops while the return equals the cap. The word at
 
 1. If `wake_addr != 0`, perform `FUTEX_WAKE(wake_addr, 1)` — or the
    ring drain, if `wake_addr` names a kernel channel — and release
-   everything it touched.
+   everything it touched. A failure here (say, `wake_addr`'s view was
+   revoked by a racing teardown — a live case during §5's choreography)
+   is ignored and the wait proceeds on its own merits: aborting would
+   return an error indistinguishable from the wait's own
+   `SYSERR_INVAL`, and the peer being gone is exactly when the caller
+   most needs its own park to run.
 2. Load the 32-bit word at `addr`. If it differs from `expected`,
    return `SYSERR_AGAIN`.
 3. Otherwise park until woken, revoked, or the deadline passes.
@@ -316,9 +329,10 @@ an IRQ spin window). Requeue therefore allocates nothing at all: the
 vendored LLRB grows an extract/insert-existing-node pair (`_remove`
 today frees its node and `_insert` allocates one, so relinking needs
 the two ~15-line variants), making the move a true relink. That also
-removes the failure mode: requeue has no `SYSERR_NOMEM` and no partial
-batch indistinguishable from an exhausted queue — the only short
-return is the batch cap, which the caller already loops on.
+removes the failure mode: requeue has no `SYSERR_NOMEM`, so a return of
+`n` means exactly one of two things — `n == cap`: call again; `n < cap`:
+the queue had no more matching waiters. There is no third case for an
+emulation layer to paper over.
 
 The condvar broadcast is `FUTEX_WAKE(cond, 1)` then
 `FUTEX_REQUEUE(cond, mutex, seq, UINT64_MAX)`; the wake-one is not
@@ -395,7 +409,7 @@ struct thread {
   struct futex_key wait_key;    // keyed node removal by wakers, expiry, reap
   uint64_t deadline;            // timer-tree key half; 0 = not armed (§6)
   uint32_t deadline_cpu;        // whose deadline tree holds the armed entry (§6)
-  _Atomic uint32_t wake_state;  // IDLE / PARKED / MOVING / CLAIMED (§2, §6)
+  _Atomic uint32_t wake_state;  // IDLE/PARKED/MOVING/CLAIMED/REAPABLE (§2, §6)
 };
 ```
 
@@ -469,15 +483,20 @@ The software walk chases child-table pointers, and `as_flag`'s
 overwrite and merge paths call `free_table` during mutation — freed
 page-table pages return to the buddy immediately, not after the
 shootdown — so a lock-free walker can dereference a recycled table
-page. The fix is to make table pages die like user frames: `as_flag`
-defers freed sub-trees into the existing post-flush release batch
-(`struct umem_release`), so no page-table page is recycled before the
-shootdown completes and the IRQs-off fence covers every pointer the
-walk touches. That change belongs to
+page. The fix is to make table pages die like user frames, and to do it
+in the address-space layer itself so *every* `as_flag` caller is
+covered — not every mutation has a block-free release batch to ride on.
+Mutation detaches obsolete sub-trees onto a per-AS retirement list, and
+`as_flush` drains that list only after its shootdown is acknowledged —
+synchronous, no kernel worker. No page-table page is then recycled
+before the shootdown completes, and the IRQs-off fence covers every
+pointer the walk touches. That change belongs to
 [memory-design.md](memory-design.md) and is a prerequisite of step 1
 (§10); until it lands, the interim discipline is the one
-`channel_block_wait` uses today — hold `p->ulock` across the check and
-the load, ahead of the bucket in lock order.
+`channel_block_wait` uses today — hold `p->ulock` across the check, the
+load, and the insert, dropped before the park, ahead of the bucket in
+lock order (`FUTEX_WAKE`'s resolve-then-bucket path already matches
+that ordering).
 
 With no topology branch, **park resolves no ublock at all** and touches
 no umem structure: the wait path drops out of the umem lock hierarchy
@@ -505,7 +524,7 @@ only one of them is a user thread that can be told "call me again".
 
 | site | context | rule |
 |---|---|---|
-| `FUTEX_WAKE`, revocation, free, reap | a user thread's syscall | cap per call, caller re-enters |
+| `FUTEX_WAKE`, reap's claim-and-free | a user thread's syscall | cap per call, caller re-enters |
 | `ring_post_locked` from `schemes/irq.c`, `schemes/timer.c`, `iommu.c` | IRQ handler | **wake exactly one** |
 | `channel_thread_complete_locked` | scheduler stack, post-deschedule | **wake exactly one**, chain the rest |
 
@@ -518,9 +537,9 @@ a local list under the bucket lock, drop the lock, then unblock each.
 The bucket hold becomes a few pointer writes. The waker CASes each
 thread `PARKED -> CLAIMED` as it detaches, skipping any it loses; after
 dropping the bucket it removes each won thread's deadline entry (§6),
-writes the syscall result into the saved frame, and unblocks — or, for
-a thread of a since-dead process, leaves the TCB detached for reap
-(§6). Result
+writes the syscall result into the saved frame, and releases via
+`thread_unblock_claimed()` — or, for a thread of a since-dead process,
+publishes `REAPABLE` (§6). Result
 delivery and cleanup are the waker's job by construction:
 `uthread_park_blocked` never returns, so a woken thread runs no kernel
 exit code — it resumes in ring 3 directly from its saved frame.
@@ -528,18 +547,28 @@ exit code — it resumes in ring 3 directly from its saved frame.
 **IRQ context.** One CQE means one worker is needed, so a post wakes one
 waiter on the ring's `cq_count`. This is the same bound as today's
 single slot and it is also the semantically correct count — waking N
-threads for one completion is a stampede, not a feature. The handler
-does a seek, a removal, and a `free()`, all bounded: O(log n) for the
-tree work, and `g_allocator_lock` is contended but never held for long
-and never held across a shootdown (§3).
+threads for one completion is a stampede, not a feature. A lost claim —
+the head waiter is simultaneously being timed out — does not spend the
+wake: the handler tries the next waiter on the address. (Even waking
+nobody would stay live, since the timed-out thread re-enters, sees
+`cq_count` moved, and consumes — but try-next keeps that a fallback
+argument, not the mechanism.) The handler does a seek, a removal, and a
+`free()`, all bounded: O(log n) for the tree work, and
+`g_allocator_lock` is contended but never held for long and never held
+across a shootdown (§3).
 
 The rules from [irq-design.md](irq-design.md) §4 carry over, with the
-lock list extended: the handler may take stripes, futex buckets,
-`g_allocator_lock`, and the scheduler lock, and must never take
-`g_umem`. All of those are plain cli-first spinlocks whose holders do
-bounded work with interrupts off; `g_umem` is excluded because it is a
-shootdown-servicing svclock and a handler spinning on it can be the very
-shootdown target its holder waits for.
+lock list extended: the handler may take stripes, futex buckets, the
+per-CPU timer locks, `g_allocator_lock`, and the scheduler lock, and
+must never take `g_umem`. The timer locks are in the list because a
+claimed ring waiter that parked with a deadline — `epoll_wait` with a
+timeout over a device ring is the common shape — has a deadline entry
+to remove, possibly on another CPU's tree; the nesting is bucket →
+timer everywhere (expiry drops the timer lock before it ever takes a
+bucket), so no cycle exists. All of these are plain cli-first spinlocks
+whose holders do bounded work with interrupts off; `g_umem` is excluded
+because it is a shootdown-servicing svclock and a handler spinning on
+it can be the very shootdown target its holder waits for.
 
 **Scheduler-stack context.** `pthread_join` works by registering a
 `completion_event` word at `SYS_THREAD_SPAWN`; the kernel pins the block
@@ -628,15 +657,17 @@ are handled by three different parties:
 
 - **Its own threads.** Culled at their next kernel entry or dispatch;
   blocked TCBs are freed in batches by reap.
-- **Mutexes it held.** `SYS_SET_ROBUST_LIST` registers the Linux-shaped
+- **Mutexes it held.** Not yet implemented (§10 step 7, the one unbuilt
+  step). `SYS_SET_ROBUST_LIST` registers the Linux-shaped
   per-thread list; the parent walks it during reap, sets
   `FUTEX_OWNER_DIED` in each word, and wakes one waiter. Doing this in
   userspace avoids Linux's faulting reads from the exit path and lets
-  the parent implement recovery policy. Its coverage is exactly Linux's:
+  the parent implement recovery policy. The *per-word rule* is Linux's —
   the walk only acts on words in the owner-TID encoding
   (`(uval & FUTEX_TID_MASK) == dying tid`), so it reaches robust mutexes
-  and nothing else — not condvar sequences, not ring `cq_count`, not
-  semaphores. Two further limits, both below Linux and accepted for v1:
+  and nothing else: not condvar sequences, not ring `cq_count`, not
+  semaphores. Overall coverage is **below** Linux's, in two ways
+  accepted for v1:
   the walk reaches only words the parent can *view* — the child's owned
   blocks (claimed via `VM_MOVE`) and blocks the parent itself shares;
   a robust word in a third party's block that the child merely shared
@@ -666,20 +697,25 @@ fault the deadline saved it from. The cheap revalidation is re-entering
 own check, and that error, not a userspace load, is the recovery
 signal.
 
-### `SYS_PROC_REAP` narrows to process and thread state
+### `SYS_PROC_REAP` — narrowing deferred on the enumeration TODO
 
-Reap handles only what userspace cannot: the child's TCBs (including
-removing their futex tree nodes), its share edges, its address space,
-its registry entry, and its process struct. Blocks the zombie *owned*
-must be claimed by the parent with `VM_MOVE` before reap can finish;
-reap reports how many remain rather than freeing them.
+The intended end state: reap handles only what userspace cannot — the
+child's TCBs (including removing their futex tree nodes), its share
+edges, its address space, its registry entry, and its process struct —
+and blocks the zombie *owned* must be claimed by the parent with
+`VM_MOVE` before reap can finish. That keeps memory reclamation on the
+same userspace-driven path as every other free and makes accounting
+honest: a parent that takes over a dead child's memory is charged for
+it, and one that declines leaks only within its own subtree.
 
-This keeps the one continuation the system genuinely needs in the one
-place it cannot be avoided, and it puts memory reclamation — with all
-its sharer, pin, and grant entanglement — on the same userspace-driven
-path as every other free. It also makes accounting honest: a parent that
-takes over a dead child's memory is charged for it, and a parent that
-declines to reclaim leaks only within its own subtree.
+**As implemented, reap still frees the zombie's owned blocks** (one
+single-shot release per step now that the waiter drain is gone; the
+`VM_MOVE` claim remains available before reap for parents that want the
+memory). The narrowing is blocked on the block/sharer enumeration
+syscalls recorded as TODOs in [memory-design.md](memory-design.md): a
+parent cannot claim blocks it cannot name — a child's own allocations
+(heap, kring blocks) are invisible to it — so a reap that refuses while
+they remain would simply never finish. Narrow when enumeration lands.
 
 ### Thread reap must remove futex nodes
 
@@ -690,10 +726,11 @@ recycling — the block returns to the buddy, is reallocated to another
 process at the same address, and that process's `FUTEX_WAKE` finds a
 stale node. The batched blocked-TCB reap path claims each thread with
 the `PARKED -> CLAIMED` CAS, removes its futex node by `wait_key` and
-its deadline entry, and then frees the TCB. A thread observed `CLAIMED`
-or `MOVING` belongs to someone else for the moment: reap skips it and
-reports progress through its existing retry contract rather than
-freeing (§6).
+its deadline entry, and then frees the TCB; a `REAPABLE` thread — one a
+winner already cleaned up — it frees directly, no removal needed. A
+thread observed `CLAIMED` or `MOVING` belongs to someone else for the
+moment: reap skips it and reports progress through its existing retry
+contract rather than freeing (§6).
 
 The useful framing: **thread death, not block death, carries the
 memory-safety obligation.** Block death only ever carried a
@@ -749,8 +786,8 @@ win the CAS  PARKED -> CLAIMED   (the claim is a lifetime pin)
 remove the futex node            (bucket lock, by wait_key)
 remove the deadline entry        (deadline_cpu's timer lock, if armed)
 clear deadline to 0
-live process:  write the result into the saved frame; thread_unblock()
-dead process:  leave the TCB detached — reap frees it
+live process:  write the result; thread_unblock_claimed()
+dead process:  wake_state = REAPABLE — reap frees it
 reap itself:   free the TCB directly; no unblock
 ```
 
@@ -761,19 +798,44 @@ walks the timer tree — so `CLAIMED` must be a reap-visible pin: reap
 skips a `CLAIMED` or `MOVING` thread and reports progress through its
 existing retry contract, and only a reap that itself wins
 `PARKED -> CLAIMED` may free. Off-CPU-and-blocked alone is no longer a
-licence to free. Symmetrically, a waker that claimed a thread of a
-since-dead process must not make it runnable; it leaves the TCB
-detached for reap. Clearing `deadline` keeps "zero means unarmed" true
-for the thread's next untimed wait.
+licence to free.
+
+The claim must also end, in exactly one of two ways. A winner whose
+thread's process is dead must not make it runnable; it publishes
+`CLAIMED -> REAPABLE`, the terminal state reap *does* free directly
+(cleanup is already done — a `REAPABLE` thread is in no tree). A winner
+whose thread lives releases through one helper,
+`thread_unblock_claimed()`: spin on `on_cpu` until the target's context
+save completes — a claim can be won in the window between the bucket
+drop and the deschedule, and dispatching a thread whose save is still
+in flight would run one context on two CPUs — then flip `status`
+`BLOCKED -> RUNNABLE`, then release `CLAIMED -> IDLE`, then enqueue.
+In that order, because the claim is what protects the TCB while it
+still looks blocked, and it must be gone before another CPU can
+dispatch the thread (after the enqueue, the winner may not touch the
+TCB at all: the thread can run, exit, and be destroyed). One helper
+rather than open-coded transitions, so the ordering cannot be gotten
+wrong at some call sites. Two asymmetries worth recording: same-CPU
+expiry can never observe `on_cpu` true, because syscalls run IRQs-off
+and the timer interrupt cannot land mid-park; and the `REAPABLE` path
+needs no spin at all, because reap's own `on_cpu` check already gates
+the free. Clearing
+`deadline` keeps "zero means unarmed" true for the thread's next
+untimed wait.
 
 Each cleanup step is idempotent against the others' partial progress:
-expiry has already popped its own entry by the time it wins, so a
-winner's keyed removal finding nothing is normal — the per-CPU timer
-lock serializes the two. An observed `MOVING` (§2's requeue state)
-means spin briefly and retry the CAS; after a won CAS both keys are
-stable. A wake landing between the bucket drop and the deschedule is
-carried by `thread_unblock`'s `on_cpu` spin — which is why the park
-after a successful publish is unconditional.
+expiry claims a due waiter *while its entry is still in the tree*, under
+the timer lock, and pops the entry only on a won claim — an entry in the
+tree means no winner has finished cleanup, so the TCB is alive for the
+CAS (popping first would let a racing reap free the TCB between the pop
+and the claim attempt). A lost claim leaves the entry for its winner,
+whose keyed removal under the same lock is what serializes the two; a
+winner's removal finding nothing popped already is normal. An observed
+`MOVING` (§2's requeue state) means spin briefly and retry the CAS;
+after a won CAS both keys are stable. A wake landing between the bucket
+drop and the deschedule is carried by `thread_unblock_claimed`'s
+`on_cpu` spin — which is why the park after a successful publish is
+unconditional.
 
 **No deadline entry outlives its wait.** Nothing stale ever fires, a
 re-park can never receive a previous park's timeout, and reap never
@@ -891,7 +953,10 @@ handling — the robust-list registration and the parent-side walk are
 - **A per-CPU slab allocator for the wait nodes** — the first thing to
   fix, and the reason §3 accepts a global lock on the interrupt path.
   Every device interrupt that wakes a ring waiter currently frees a node
-  through `g_allocator_lock`, the one heap lock for the whole kernel.
+  through `g_allocator_lock`, the one heap lock for the whole kernel —
+  and timer expiry frees up to *two* nodes per expired thread (futex
+  node and deadline entry), batch-capped but on the same lock, which
+  keeps the latency concern alive even off the device-interrupt path.
   The requirement is specifically a **remote-free** path: a node is
   allocated on the parking thread's CPU and freed on whichever CPU takes
   the interrupt, so per-CPU magazines alone do not help — the free must

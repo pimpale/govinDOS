@@ -8,6 +8,7 @@
 #include "cpu_setup.h"
 #include "debug.h"
 #include "espfile.h"
+#include "futex.h"
 #include "get_mmap.h"
 #include "iommu.h"
 #include "paging.h"
@@ -111,10 +112,16 @@ static void umem_selftest(void) {
   asserts(user_range_ok(b, (uint64_t)blk, PAGE_SIZE, false),
           "umem selftest: owner's protect leaked into sharer view");
 
-  // Owner free revokes the sharer and restores pristine everywhere.
-  asserts(umem_free(a, (uint64_t)blk) == 0, "umem selftest: free failed");
+  // The single-transaction free refuses while the edge remains; the
+  // owner's per-edge revoke (the teardown coercion path) drains it, then
+  // the free succeeds and restores pristine everywhere.
+  asserts(umem_free(a, (uint64_t)blk) == (int)SYSERR_EXIST,
+          "umem selftest: free ignored attached sharer");
+  asserts(umem_unshare_from(a, (uint64_t)blk, b->pid) == 0,
+          "umem selftest: unshare failed");
   asserts(!user_range_ok(b, (uint64_t)blk, PAGE_SIZE, false),
-          "umem selftest: revoke left sharer access");
+          "umem selftest: unshare left sharer access");
+  asserts(umem_free(a, (uint64_t)blk) == 0, "umem selftest: free failed");
   asserts(!user_range_ok(a, (uint64_t)blk, PAGE_SIZE, false),
           "umem selftest: free left owner access");
 
@@ -170,8 +177,8 @@ static void device_block_selftest(const struct acpi_rsdp *rsdp,
     asserts(as_getinfo(b->as, mmio, &f, &present) == 0 && present &&
                 (f & (PAGE_U | PAGE_UC)) == (PAGE_U | PAGE_UC) && !(f & PAGE_W),
             "devmem selftest: shared cache/rights not inherited");
-    asserts(umem_unshare(b, mmio) == 0,
-            "devmem selftest: BAR-style unshare failed");
+    asserts(umem_dropshare(b, mmio) == 0,
+            "devmem selftest: BAR-style dropshare failed");
     asserts(umem_free(a, mmio) == 0, "devmem selftest: device free failed");
   }
 
@@ -480,6 +487,8 @@ efi_status_t efi_main(efi_handle_t handle, struct efi_system_table *system) {
 
   // User-memory bookkeeping (ublock registry).
   umem_init();
+  // Futex bucket table — before the first user process can park.
+  futex_init();
   capability_init();
 
   // Guard punch + revert must return the kernel tree to its exact shape.

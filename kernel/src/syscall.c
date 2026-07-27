@@ -6,9 +6,11 @@
 #include "capability.h"
 #include "cpu_state.h"
 #include "debug.h"
+#include "futex.h"
 #include "irq.h"
 #include "process.h"
 #include "thread.h"
+#include "timer.h"
 #include "trap_frame.h"
 #include "uaccess.h"
 #include "umem.h"
@@ -74,8 +76,6 @@ static uint64_t sys_vm_free(struct thread *curr, uint64_t base) {
   int rc = umem_free(curr->proc, base);
   if (rc == (int)SYSERR_EXIST)
     return SYSERR_EXIST;
-  if (rc == 1)
-    return SYSERR_AGAIN;
   if (rc != 0) {
     return SYSERR_PERM;
   }
@@ -130,7 +130,7 @@ void syscall_entry(struct trap_frame *tf) {
   asserts(curr != nullptr, "syscall: no current thread");
 
   // Death checkpoint: direct or inherited death takes effect at the next
-  // kernel entry. channel_block_wait repeats it before installing a slot.
+  // kernel entry. futex_sys_wait repeats it before installing a waiter.
   if (process_is_dead(curr->proc)) {
     uthread_park_exit();
   }
@@ -167,8 +167,12 @@ void syscall_entry(struct trap_frame *tf) {
     tf->rax = sys_vm_share(curr, a0, a1, a2);
     return;
 
+  case SYS_VM_DROPSHARE:
+    tf->rax = umem_dropshare(curr->proc, a0) == 0 ? 0 : SYSERR_PERM;
+    return;
+
   case SYS_VM_UNSHARE:
-    tf->rax = umem_unshare(curr->proc, a0) == 0 ? 0 : SYSERR_PERM;
+    tf->rax = umem_unshare_from(curr->proc, a0, a1);
     return;
 
   case SYS_VM_MOVE:
@@ -183,17 +187,25 @@ void syscall_entry(struct trap_frame *tf) {
     tf->rax = sys_vm_size(curr, a0);
     return;
 
-  case SYS_BLOCK_DOORBELL:
-    tf->rax = channel_block_doorbell(curr, a0);
+  case SYS_GETTIME:
+    tf->rax = timer_now_ns();
     return;
 
-  case SYS_BLOCK_WAIT:
+  case SYS_FUTEX_WAKE:
+    tf->rax = futex_sys_wake(curr, a0, a1);
+    return;
+
+  case SYS_FUTEX_WAIT:
     // May park (frame saved first, success value 0 baked in — a waker
     // that isn't plain success overwrites the saved rax) or return
     // immediately through the live frame.
     tf->rax = 0;
     arch_uthread_save_frame(curr, tf);
-    tf->rax = channel_block_wait(curr, a0, a1);
+    tf->rax = futex_sys_wait(curr, a0, a1, a2, a3);
+    return;
+
+  case SYS_FUTEX_REQUEUE:
+    tf->rax = futex_sys_requeue(curr, a0, a1, a2, a3);
     return;
 
   case SYS_PROC_CREATE:

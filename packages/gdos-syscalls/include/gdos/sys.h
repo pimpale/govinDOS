@@ -62,13 +62,17 @@ static inline uint64_t sys_debug_write(const void *buf, uint64_t len) {
 static inline void sys_yield(void) { sys0(SYS_YIELD); }
 static inline uint64_t sys_getpid(void) { return sys0(SYS_GETPID); }
 static inline uint64_t sys_gettid(void) { return sys0(SYS_GETTID); }
+// Monotonic nanoseconds since an unspecified boot epoch; the domain of
+// sys_futex_wait deadlines.
+static inline uint64_t sys_gettime(void) { return sys0(SYS_GETTIME); }
 
 // Blocks are the allocation unit (power-of-two pages); returns the base.
 static inline uint64_t sys_vm_alloc(uint64_t len, uint64_t prot) {
   return sys2(SYS_VM_ALLOC, len, prot);
 }
-// base alone names the block. SYSERR_AGAIN means a bounded waiter batch was
-// notified and the still-mapped block must be passed to VM_FREE again.
+// base alone names the block. A single bounded transaction: SYSERR_EXIST
+// while anything is still attached (sharers, pins) — drive teardown
+// choreography first (sentinel -> wake -> peers dropshare / unshare).
 static inline uint64_t sys_vm_free(uint64_t base) {
   return sys1(SYS_VM_FREE, base);
 }
@@ -93,8 +97,13 @@ static inline uint64_t sys_vm_share(uint64_t base, int64_t target,
                                     uint64_t prot) {
   return sys3(SYS_VM_SHARE, base, (uint64_t)target, prot);
 }
-static inline uint64_t sys_vm_unshare(uint64_t base) {
-  return sys1(SYS_VM_UNSHARE, base);
+// Sharer side: drop our own shared-in view (the teardown ack).
+static inline uint64_t sys_vm_dropshare(uint64_t base) {
+  return sys1(SYS_VM_DROPSHARE, base);
+}
+// Owner side: revoke one sharer's view (the teardown coercion path).
+static inline uint64_t sys_vm_unshare(uint64_t base, uint64_t pid) {
+  return sys2(SYS_VM_UNSHARE, base, pid);
 }
 static inline uint64_t sys_vm_move(uint64_t base, uint64_t pid) {
   return sys2(SYS_VM_MOVE, base, pid);
@@ -104,14 +113,33 @@ static inline uint64_t sys_vm_map_device(const struct cap_token *token,
   return sys3(SYS_VM_MAP_DEVICE, (uint64_t)token, CAP_TOKEN_SIZE, flags);
 }
 
-static inline uint64_t sys_block_doorbell(uint64_t address) {
-  return sys1(SYS_BLOCK_DOORBELL, address);
+// Wake up to min(count, FUTEX_WAKE_BATCH) threads parked on exactly
+// addr (FIFO; returns how many). On a kernel channel this is the
+// doorbell: the SQ drains in the caller's context and count is ignored.
+static inline uint64_t sys_futex_wake(const volatile void *addr,
+                                      uint64_t count) {
+  return sys2(SYS_FUTEX_WAKE, (uint64_t)addr, count);
 }
 // Parks while the 32-bit word at addr equals expected; addr must sit in
-// a block the caller has a view of.
-static inline uint64_t sys_block_wait(const volatile void *addr,
-                                      uint32_t expected) {
-  return sys2(SYS_BLOCK_WAIT, (uint64_t)addr, expected);
+// a block the caller has a view of. wake_addr != 0 fuses a one-shot
+// FUTEX_WAKE(wake_addr, 1) (or ring drain) before the compare; deadline
+// is absolute sys_gettime() nanoseconds, 0 = none. Returns 0 on wake,
+// SYSERR_AGAIN on compare mismatch, SYSERR_TIMEDOUT on deadline.
+static inline uint64_t sys_futex_wait(const volatile void *addr,
+                                      uint32_t expected,
+                                      const volatile void *wake_addr,
+                                      uint64_t deadline) {
+  return sys4(SYS_FUTEX_WAIT, (uint64_t)addr, expected, (uint64_t)wake_addr,
+              deadline);
+}
+// Move up to min(count, FUTEX_REQUEUE_BATCH) waiters from `from` to `to`
+// (FIFO, deadlines kept) if the word at `from` equals expected. Returns
+// how many moved, or SYSERR_AGAIN on compare mismatch.
+static inline uint64_t sys_futex_requeue(const volatile void *from,
+                                         const volatile void *to,
+                                         uint32_t expected, uint64_t count) {
+  return sys4(SYS_FUTEX_REQUEUE, (uint64_t)from, (uint64_t)to, expected,
+              count);
 }
 
 static inline uint64_t sys_proc_create(void) { return sys0(SYS_PROC_CREATE); }

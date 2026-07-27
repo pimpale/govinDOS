@@ -19,13 +19,10 @@
 #define VECTOR_RESCHED 0xFC
 
 // IDT vector for the per-CPU LAPIC one-shot shared by scheduling quanta and
-// scheme -5 timers. The earliest absolute deadline wins. Kernel code runs
-// IRQs-off, so delivery normally lands in ring 3 or the scheduler idle path.
+// parked threads' futex deadlines. The earliest absolute deadline wins.
+// Kernel code runs IRQs-off, so delivery normally lands in ring 3 or the
+// scheduler idle path.
 #define VECTOR_TIMER 0xFB
-
-// Cross-CPU request to recompute a CPU's LAPIC shot after a remote operation
-// inserted a new earliest ring deadline.
-#define VECTOR_TIMER_REPROGRAM 0xF9
 
 // Length of one dispatch quantum. A thread that neither parks nor blocks
 // for this long is preempted as if it had called SYS_YIELD.
@@ -53,10 +50,12 @@ struct scheduler {
   _Atomic bool idle;
 
   // One local-APIC timer is multiplexed between this CPU's scheduling
-  // quantum and one earliest-deadline entry per assigned timer ring.
+  // quantum and the earliest parked-thread deadline (timer.c). The tree
+  // holds parked threads and nothing else; arming is always local, and
+  // the lock nests inside futex buckets (bucket -> timer everywhere).
   // timer_lock is never held while scheduler.lock is held.
   struct spinlock timer_lock;
-  llrb_ring_deadline *timer_rings;
+  llrb_tdeadline *deadlines;
   uint64_t quantum_deadline_ns; // zero outside a dispatched quantum
 };
 

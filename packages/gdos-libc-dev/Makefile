@@ -28,6 +28,7 @@ C_SOURCES := \
 	source/stdio.c \
 	source/stdlib.c \
 	source/string.c \
+	source/time.c \
 	source/tls.c \
 	source/unistd.c \
 	vendor/printf/printf.c

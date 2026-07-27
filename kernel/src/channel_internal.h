@@ -53,17 +53,13 @@ static inline bool cqe_consumed(struct ring *ring, uint32_t ev_index) {
   return (int32_t)(consumed - ev_index) > 0;
 }
 
-static inline struct thread **side_waiter(ublock *b, bool owner) {
-  return owner ? &b->owner_waiter : &b->sharer_waiter;
-}
-
 // ---------------------------------------------------------------------------
 // channel.c core, used by the scheme files
 // ---------------------------------------------------------------------------
 
 // Post one CQE; caller holds stripe(ring->block->base). False if the CQ
 // is full (leave the event in its level state). On success the post wakes
-// the ring owner's parked thread, if any.
+// exactly one thread parked on the ring's cq_count word, if any.
 bool ring_post_locked(struct ring *ring, uint64_t type, uint64_t a,
                       uint64_t b, uint64_t status);
 
@@ -102,16 +98,6 @@ uint64_t irq_exec(struct thread *curr, struct ring *ring,
                   struct ksqe *sqe);
 void irq_replay(struct ring *ring);
 void irq_endpoint_destroy(struct ring *ring);
-
-// ---------------------------------------------------------------------------
-// schemes/timer.c — scheme -5
-// ---------------------------------------------------------------------------
-
-uint64_t timer_endpoint_init(struct ring *ring);
-uint64_t timer_exec(struct thread *curr, struct ring *ring,
-                    struct ksqe *sqe);
-void timer_replay(struct ring *ring);
-void timer_endpoint_destroy(struct ring *ring);
 
 // iommu.c — scheme -6
 uint64_t iommu_exec(struct thread *curr, struct ring *ring,

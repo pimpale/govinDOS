@@ -34,6 +34,7 @@
 #include <pthread.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
 
 #include <gdosabi/kring_shares.h>
 #include <gdosabi/kring_tree.h>
@@ -109,8 +110,10 @@ static void test_memory(void) {
   print_hex(sys_vm_share(blk, 0xdead, VM_PROT_READ));
   print("pe: vm_share to self rc=");
   print_hex(sys_vm_share(blk, (int64_t)sys_getpid(), VM_PROT_READ));
-  print("pe: vm_unshare of owned block rc=");
-  print_hex(sys_vm_unshare(blk));
+  print("pe: vm_dropshare of owned block rc=");
+  print_hex(sys_vm_dropshare(blk));
+  print("pe: vm_unshare with no edge rc=");
+  print_hex(sys_vm_unshare(blk, 0xdead));
   print("pe: cleanup vm_free rc=");
   print_hex(sys_vm_free(blk));
 
@@ -321,66 +324,167 @@ static void test_pthreads(void) {
   for (unsigned i = 0; i < 8; i++)
     sys_yield();
 
+  // Timed waits route through the futex deadline: a never-signalled
+  // condvar times out, and a free mutex timedlocks without parking even
+  // when the deadline has already passed.
+  pthread_mutex_t timed_mutex = PTHREAD_MUTEX_INITIALIZER;
+  pthread_cond_t timed_cond = PTHREAD_COND_INITIALIZER;
+  struct timespec abstime;
+  ok &= clock_gettime(CLOCK_MONOTONIC, &abstime) == 0;
+  abstime.tv_nsec += 3000000;
+  if (abstime.tv_nsec >= 1000000000L) {
+    abstime.tv_sec++;
+    abstime.tv_nsec -= 1000000000L;
+  }
+  ok &= pthread_mutex_lock(&timed_mutex) == 0 &&
+        pthread_cond_timedwait(&timed_cond, &timed_mutex, &abstime) ==
+            ETIMEDOUT &&
+        pthread_mutex_unlock(&timed_mutex) == 0 &&
+        pthread_mutex_timedlock(&timed_mutex, &abstime) == 0 &&
+        pthread_mutex_unlock(&timed_mutex) == 0;
+
   print(ok ? "tests: pthread lifecycle/TLS/synchronization ok\n"
            : "tests: PTHREAD IMPLEMENTATION FAILED\n");
 }
 
-#define FREE_WAITER_COUNT (BLOCK_WAKE_BATCH + 4)
+#define FUTEX_WAITER_COUNT (FUTEX_WAKE_BATCH + 4)
 
-struct free_waiter_arg {
-  uint64_t event;
+struct futex_waiter_arg {
+  uint64_t word;
+  uint64_t deadline;
   uint64_t result;
 };
 
-static _Atomic uint32_t g_free_waiters_ready;
-static struct free_waiter_arg g_free_waiter_args[FREE_WAITER_COUNT];
+static _Atomic uint32_t g_futex_ready;
+static struct futex_waiter_arg g_futex_args[FUTEX_WAITER_COUNT];
 
-static void *free_waiter(void *argument) {
-  struct free_waiter_arg *arg = argument;
-  atomic_fetch_add_explicit(&g_free_waiters_ready, 1, memory_order_release);
-  arg->result = sys_block_wait((const volatile void *)arg->event, 0);
+static void *futex_waiter(void *argument) {
+  struct futex_waiter_arg *arg = argument;
+  atomic_fetch_add_explicit(&g_futex_ready, 1, memory_order_release);
+  arg->result = sys_futex_wait((const volatile void *)arg->word, 0, nullptr,
+                               arg->deadline);
   return nullptr;
 }
 
-static void test_bounded_multiwait_free(void) {
-  uint64_t event = sys_vm_alloc(4096, VM_PROT_READ | VM_PROT_WRITE);
-  pthread_t threads[FREE_WAITER_COUNT] = {0};
-  bool allocated = !sys_iserr(event);
-  bool ok = allocated;
+// Direct exercise of the futex surface: compare mismatch, deadline
+// expiry, view gating, count-capped FIFO wakes past the batch bound,
+// requeue, and the no-notification revocation story (waiters parked
+// across VM_FREE recover via their deadlines; the view check reports
+// SYSERR_INVAL afterwards).
+static void test_futex(void) {
+  uint64_t blk = sys_vm_alloc(4096, VM_PROT_READ | VM_PROT_WRITE);
+  bool ok = !sys_iserr(blk);
+  volatile uint32_t *word = (volatile uint32_t *)blk;
+
+  // The word is compared, never interpreted: a mismatch reports AGAIN.
+  ok &= sys_futex_wait(word, 123, nullptr, 0) == SYSERR_AGAIN;
+  // A deadline already behind us parks and promptly times out.
+  ok &= sys_futex_wait(word, 0, nullptr, sys_gettime() + 1) ==
+        SYSERR_TIMEDOUT;
+  // The wake and wait namespaces are gated by view membership.
+  ok &= sys_futex_wait((const volatile void *)0x1000, 0, nullptr, 0) ==
+        SYSERR_INVAL;
+  ok &= sys_iserr(sys_futex_wake((const volatile void *)0x1000, 1));
+  // Waking a word nobody waits on wakes nobody.
+  ok &= sys_futex_wake(word, UINT64_MAX) == 0;
+
+  // More waiters than one wake batch: the count-capped wake returns its
+  // count and the caller loops.
+  pthread_t threads[FUTEX_WAITER_COUNT] = {0};
   unsigned created = 0;
-  for (unsigned i = 0; allocated && i < FREE_WAITER_COUNT; i++) {
-    g_free_waiter_args[i] = (struct free_waiter_arg){.event = event};
-    if (pthread_create(&threads[i], nullptr, free_waiter,
-                       &g_free_waiter_args[i]) != 0)
+  for (unsigned i = 0; ok && i < FUTEX_WAITER_COUNT; i++) {
+    g_futex_args[i] = (struct futex_waiter_arg){.word = blk};
+    if (pthread_create(&threads[i], nullptr, futex_waiter,
+                       &g_futex_args[i]) != 0)
       break;
-    else
-      created++;
+    created++;
   }
-  ok &= created == FREE_WAITER_COUNT;
-  while (atomic_load_explicit(&g_free_waiters_ready, memory_order_acquire) !=
+  ok &= created == FUTEX_WAITER_COUNT;
+  while (atomic_load_explicit(&g_futex_ready, memory_order_acquire) !=
          created)
     sys_yield();
-  // Once each worker has published readiness it immediately enters WAIT;
-  // let every runnable worker finish that adjacent syscall before freeing.
-  for (unsigned i = 0; allocated && i < 256; i++)
-    sys_yield();
-
-  uint64_t first = allocated ? sys_vm_free(event) : SYSERR_INVAL;
-  ok &= first == SYSERR_AGAIN && sys_vm_size(event) == 4096;
-  uint64_t rc = first;
-  unsigned steps = 1;
-  while (rc == SYSERR_AGAIN) {
-    rc = sys_vm_free(event);
-    steps++;
+  uint64_t woken = 0;
+  unsigned batches = 0;
+  for (unsigned spin = 0; woken < created && spin < 100000; spin++) {
+    uint64_t rc = sys_futex_wake(word, UINT64_MAX);
+    if (sys_iserr(rc)) {
+      break;
+    }
+    woken += rc;
+    if (rc != 0)
+      batches++;
+    else
+      sys_yield(); // a ready worker may not have parked yet
   }
-  ok &= rc == 0 && steps >= 2 && sys_vm_size(event) == SYSERR_PERM;
-
+  ok &= woken == created && batches >= 2;
   for (unsigned i = 0; i < created; i++) {
     ok &= pthread_join(threads[i], nullptr) == 0;
-    ok &= g_free_waiter_args[i].result == SYSERR_DEAD;
+    ok &= g_futex_args[i].result == 0;
   }
-  print(ok ? "tests: bounded multi-waiter VM_FREE continuation ok\n"
-           : "tests: BOUNDED MULTI-WAITER VM_FREE FAILED\n");
+
+  // Requeue: waiters move from one word to another without waking, keep
+  // FIFO order, and the compare guard rejects a stale expected value.
+  volatile uint32_t *to = (volatile uint32_t *)(blk + 64);
+  pthread_t movers[4] = {0};
+  atomic_store_explicit(&g_futex_ready, 0, memory_order_relaxed);
+  for (unsigned i = 0; ok && i < 4; i++) {
+    g_futex_args[i] = (struct futex_waiter_arg){.word = blk};
+    ok &= pthread_create(&movers[i], nullptr, futex_waiter,
+                         &g_futex_args[i]) == 0;
+  }
+  while (atomic_load_explicit(&g_futex_ready, memory_order_acquire) != 4)
+    sys_yield();
+  ok &= sys_futex_requeue(word, to, 999, UINT64_MAX) == SYSERR_AGAIN;
+  uint64_t moved = 0;
+  for (unsigned spin = 0; moved < 4 && spin < 100000; spin++) {
+    uint64_t rc = sys_futex_requeue(word, to, 0, UINT64_MAX);
+    if (sys_iserr(rc))
+      break;
+    moved += rc;
+    if (rc == 0)
+      sys_yield();
+  }
+  ok &= moved == 4;
+  ok &= sys_futex_wake(word, UINT64_MAX) == 0; // nobody left on `from`
+  woken = 0;
+  for (unsigned spin = 0; woken < 4 && spin < 100000; spin++) {
+    uint64_t rc = sys_futex_wake(to, UINT64_MAX);
+    if (sys_iserr(rc))
+      break;
+    woken += rc;
+    if (rc == 0)
+      sys_yield();
+  }
+  ok &= woken == 4;
+  for (unsigned i = 0; i < 4; i++) {
+    ok &= pthread_join(movers[i], nullptr) == 0 &&
+          g_futex_args[i].result == 0;
+  }
+
+  // Revocation notifies nobody: waiters parked across the free recover
+  // via their deadlines, and the freed address stops being waitable.
+  pthread_t parked[2] = {0};
+  atomic_store_explicit(&g_futex_ready, 0, memory_order_relaxed);
+  uint64_t deadline = sys_gettime() + 50ull * 1000 * 1000;
+  for (unsigned i = 0; ok && i < 2; i++) {
+    g_futex_args[i] =
+        (struct futex_waiter_arg){.word = blk, .deadline = deadline};
+    ok &= pthread_create(&parked[i], nullptr, futex_waiter,
+                         &g_futex_args[i]) == 0;
+  }
+  while (atomic_load_explicit(&g_futex_ready, memory_order_acquire) != 2)
+    sys_yield();
+  for (unsigned i = 0; i < 64; i++)
+    sys_yield(); // let both actually park
+  ok &= sys_vm_free(blk) == 0 && sys_vm_size(blk) == SYSERR_PERM;
+  for (unsigned i = 0; i < 2; i++) {
+    ok &= pthread_join(parked[i], nullptr) == 0 &&
+          g_futex_args[i].result == SYSERR_TIMEDOUT;
+  }
+  ok &= sys_futex_wait(word, 0, nullptr, 0) == SYSERR_INVAL;
+
+  print(ok ? "tests: futex wait/wake/requeue/timeout ok\n"
+           : "tests: FUTEX SURFACE FAILED\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -393,6 +497,7 @@ static void test_bounded_multiwait_free(void) {
 #define CH_RESP_OFF 4
 #define CH_MSG_OFF 8
 #define CH_MSG_MAX 64
+#define CH_REQ_CLOSE 2u // owner's close sentinel in the req word
 
 // First thread of the served child. Runs on init's image (read-execute
 // view — stack locals only!) with the bootstrap-channel base as its
@@ -427,10 +532,11 @@ static void child_main(uint64_t boot_ch) {
               : "child: BOOTSTRAP SHARE MISSING\n");
 
   // Serve one request on the bootstrap block (we are the sharer side).
+  // Both peers name the words they park on — role inference is gone.
   volatile uint32_t *req = (volatile uint32_t *)(boot_ch + CH_REQ_OFF);
   volatile uint32_t *resp = (volatile uint32_t *)(boot_ch + CH_RESP_OFF);
   volatile char *msg = (volatile char *)(boot_ch + CH_MSG_OFF);
-  sys_block_wait(req, 0);
+  sys_futex_wait(req, 0, nullptr, 0);
   while (__atomic_load_n(req, __ATOMIC_ACQUIRE) == 0) {
     sys_yield();
   }
@@ -440,13 +546,18 @@ static void child_main(uint64_t boot_ch) {
     }
   }
   __atomic_store_n(resp, 1, __ATOMIC_RELEASE);
-  sys_block_doorbell(boot_ch);
+  sys_futex_wake(resp, 1);
 
-  // Park until init frees the bootstrap block: the revoke path must wake
-  // us with SYSERR_DEAD. Don't touch the block afterwards.
-  uint64_t rc = sys_block_wait(req, 1);
-  print(rc == SYSERR_DEAD ? "child: revoke wake ok, exiting\n"
-                          : "child: REVOKE WAKE WRONG\n");
+  // Orderly teardown (futex-design.md §5): park until the owner writes
+  // the close sentinel and wakes us. Our VM_DROPSHARE is the ack that
+  // lets the owner's VM_FREE succeed; after it we never touch the block.
+  uint64_t rc = sys_futex_wait(req, 1, nullptr, 0);
+  bool sentinel = (rc == 0 || rc == SYSERR_AGAIN) &&
+                  __atomic_load_n(req, __ATOMIC_ACQUIRE) == CH_REQ_CLOSE;
+  print(sentinel ? "child: close sentinel ok, dropping share\n"
+                 : "child: CLOSE SENTINEL WRONG\n");
+  print("child: vm_dropshare(boot_ch) rc=");
+  print_hex(sys_vm_dropshare(boot_ch));
   sys_proc_exit(0);
 }
 
@@ -465,8 +576,8 @@ static void child_spin_main(uint64_t arg) {
 static void child_park_main(uint64_t boot_ch) {
   volatile uint32_t *ready = (volatile uint32_t *)boot_ch;
   __atomic_store_n(ready, 1, __ATOMIC_RELEASE);
-  sys_block_doorbell(boot_ch);
-  sys_block_wait(ready, 1);
+  sys_futex_wake(ready, 1);
+  sys_futex_wait(ready, 1, nullptr, 0);
   print("parked victim: RETURNED AFTER KILL\n");
   sys_proc_exit(0);
 }
@@ -609,7 +720,7 @@ static void lifecycle_worker(uint64_t event_base) {
   g_tls_initialized = 0x574f524b4552544cull;
   sys_yield();
   event->tls_after_yield = g_tls_initialized;
-  sys_block_wait(&event->release, 0);
+  sys_futex_wait(&event->release, 0, nullptr, 0);
   sys_thread_exit();
 }
 
@@ -650,9 +761,9 @@ static void test_thread_lifecycle(void) {
             : "tests: COMPLETION PIN FAILED\n");
 
   atomic_store_explicit(&event->release, 1, memory_order_release);
-  sys_block_doorbell(event_base);
+  sys_futex_wake(&event->release, 1);
   while (atomic_load_explicit(&event->complete, memory_order_acquire) == 0) {
-    sys_block_wait(&event->complete, 0);
+    sys_futex_wait(&event->complete, 0, nullptr, 0);
   }
 
   bool state_ok = tid == event->tid && tid != main_tid &&
@@ -671,128 +782,33 @@ static void test_thread_lifecycle(void) {
                    : "tests: POST-DESCHEDULE RECLAIM FAILED\n");
 }
 
-static bool timer_take(struct kring *timer, struct kcqe *out) {
-  uint64_t rc = kring_wait_cqe(timer, out);
-  if (rc != 0) {
-    print("tests: TIMER WAIT FAILED rc=");
-    print_hex(rc);
-    return false;
-  }
-  kring_ack(timer);
-  return true;
-}
+// The timer scheme is gone (timer-design.md): SYS_GETTIME is the clock
+// and every timed wait is a futex deadline. The thread blocks with no
+// polling; on an otherwise-idle CPU the deadline must stay armed even
+// though the scheduling quantum is removed.
+static void test_time(void) {
+  uint64_t t0 = sys_gettime();
+  uint64_t t1 = sys_gettime();
+  bool ok = t0 != 0 && t1 >= t0;
 
-static bool timer_command(struct kring *timer, uint64_t op,
-                          struct kcqe *out) {
-  struct kcqe cqe;
-  if (!timer_take(timer, &cqe))
-    return false;
-  if (cqe.type != op) {
-    print("tests: TIMER COMMAND ORDER FAILED type=");
-    print_hex(cqe.type);
-    return false;
-  }
-  if (out != nullptr)
-    *out = cqe;
-  return true;
-}
+  uint32_t parked_word = 0;
+  uint64_t deadline = t1 + 5ull * 1000 * 1000;
+  uint64_t rc = sys_futex_wait(&parked_word, 0, nullptr, deadline);
+  uint64_t after = sys_gettime();
+  ok &= rc == SYSERR_TIMEDOUT && after >= deadline;
 
-static void test_timer_scheme(void) {
-  struct kring timer;
-  uint64_t rc = kring_create(&timer, KSCHEME_TIMER, 4096);
-  if (rc != 0) {
-    print("tests: TIMER CREATE FAILED rc=");
-    print_hex(rc);
-    return;
-  }
+  // libc surface over the same mechanism.
+  struct timespec req = {.tv_sec = 0, .tv_nsec = 2000000};
+  uint64_t before_sleep = sys_gettime();
+  ok &= nanosleep(&req, nullptr) == 0 &&
+        sys_gettime() >= before_sleep + 2000000ull;
+  struct timespec now;
+  ok &= clock_gettime(CLOCK_MONOTONIC, &now) == 0 &&
+        (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec >=
+            before_sleep;
 
-  struct kcqe cqe = {0};
-  bool ok = kring_timer_now(&timer) == 0 &&
-            timer_command(&timer, KTIMER_NOW, &cqe) && cqe.status == 0;
-  uint64_t before = cqe.a;
-
-  // The thread blocks with no polling. On an otherwise-idle owner CPU the
-  // timer must remain armed even though the scheduling quantum is removed.
-  uint64_t deadline = before + 5 * 1000 * 1000;
-  ok &= kring_timer_arm_abs(&timer, 1, deadline, 0x54494d455231ull) == 0 &&
-        timer_command(&timer, KTIMER_ARM_ABS, &cqe) && cqe.status == 0;
-  ok &= timer_take(&timer, &cqe) && cqe.type == KEV_TIMER && cqe.a == 1 &&
-        cqe.b == 0x54494d455231ull;
-
-  ok &= kring_timer_now(&timer) == 0 &&
-        timer_command(&timer, KTIMER_NOW, &cqe) && cqe.status == 0 &&
-        cqe.a >= deadline && cqe.a >= before;
-  uint64_t now = cqe.a;
-
-  // Equal deadlines are distinct in the deadline tree and expire in arm
-  // order (the tree's sequence-number tiebreaker).
-  uint64_t shared_deadline = now + 20 * 1000 * 1000;
-  ok &= kring_timer_arm_abs(&timer, 5, shared_deadline, 0x55) == 0 &&
-        timer_command(&timer, KTIMER_ARM_ABS, &cqe) && cqe.status == 0;
-  ok &= kring_timer_arm_abs(&timer, 6, shared_deadline, 0x66) == 0 &&
-        timer_command(&timer, KTIMER_ARM_ABS, &cqe) && cqe.status == 0;
-  ok &= timer_take(&timer, &cqe) && cqe.type == KEV_TIMER && cqe.a == 5 &&
-        cqe.b == 0x55;
-  ok &= timer_take(&timer, &cqe) && cqe.type == KEV_TIMER && cqe.a == 6 &&
-        cqe.b == 0x66;
-
-  // Duplicate live ids are rejected. Cancellation removes the original and
-  // endpoint teardown below must also cancel a different outstanding timer.
-  ok &= kring_timer_arm_abs(&timer, 2, now + 1000000000ull, 0x22) == 0 &&
-        timer_command(&timer, KTIMER_ARM_ABS, &cqe) && cqe.status == 0;
-  ok &= kring_timer_arm_abs(&timer, 2, now + 2000000000ull, 0x23) == 0 &&
-        timer_command(&timer, KTIMER_ARM_ABS, &cqe) &&
-        cqe.status == SYSERR_EXIST;
-  ok &= kring_timer_cancel(&timer, 2) == 0 &&
-        timer_command(&timer, KTIMER_CANCEL, &cqe) && cqe.status == 0;
-  ok &= kring_timer_arm_abs(&timer, 3, now + 2000000000ull, 0x33) == 0 &&
-        timer_command(&timer, KTIMER_ARM_ABS, &cqe) && cqe.status == 0;
-
-  // Fill another timer CQ with command completions before its deadline. The
-  // expiration must move to durable pending state and replay on our ack.
-  ok &= kring_timer_now(&timer) == 0 &&
-        timer_command(&timer, KTIMER_NOW, &cqe) && cqe.status == 0;
-  uint64_t full_now = cqe.a;
-  struct kring full;
-  bool full_ok = kring_create(&full, KSCHEME_TIMER, 4096) == 0;
-  if (full_ok) {
-    full_ok &= kring_timer_arm_abs(&full, 9, full_now + 5000000ull, 0x99) ==
-                   0 &&
-               timer_command(&full, KTIMER_ARM_ABS, &cqe) && cqe.status == 0;
-    for (uint32_t i = 0; full_ok && i < full.nslots; i++) {
-      struct ksqe *sqe = kring_get_sqe(&full);
-      full_ok &= sqe != nullptr;
-      if (sqe != nullptr)
-        *sqe = (struct ksqe){.op = KTIMER_NOW};
-    }
-    full_ok &= kring_submit(&full) == 0;
-
-    // A later timer on the ordinary ring gives the CQ-full expiration time to
-    // occur without iteration-count timing or polling.
-    full_ok &=
-        kring_timer_arm_abs(&timer, 4, full_now + 20000000ull, 0x44) == 0 &&
-        timer_command(&timer, KTIMER_ARM_ABS, &cqe) && cqe.status == 0;
-    full_ok &= timer_take(&timer, &cqe) && cqe.type == KEV_TIMER &&
-               cqe.a == 4 && cqe.b == 0x44;
-
-    for (uint32_t i = 0; full_ok && i < full.nslots; i++) {
-      const struct kcqe *queued = kring_peek_cqe(&full);
-      full_ok &= queued != nullptr && queued->type == KTIMER_NOW &&
-                 queued->status == 0;
-      if (queued != nullptr)
-        kring_cqe_seen(&full);
-    }
-    full_ok &= kring_ack(&full) == 0;
-    full_ok &= timer_take(&full, &cqe) && cqe.type == KEV_TIMER &&
-               cqe.a == 9 && cqe.b == 0x99;
-    full_ok &= kring_destroy(&full) == 0;
-  }
-  ok &= full_ok;
-
-  uint64_t destroy_rc = kring_destroy(&timer);
-  ok &= destroy_rc == 0;
-  print(ok ? "tests: monotonic timer scheme ok\n"
-           : "tests: MONOTONIC TIMER SCHEME FAILED\n");
+  print(ok ? "tests: gettime + futex deadline sleep ok\n"
+           : "tests: TIME/DEADLINE FAILED\n");
 }
 
 struct cpuid_result {
@@ -888,8 +904,8 @@ static void test_process_tree(struct kring *tch) {
 
   // Request/response over the pre-seeded channel (we own the block).
   __atomic_store_n(req, 1, __ATOMIC_RELEASE);
-  sys_block_doorbell(boot_ch);
-  sys_block_wait(resp, 0);
+  sys_futex_wake(req, 1);
+  sys_futex_wait(resp, 0, nullptr, 0);
   while (__atomic_load_n(resp, __ATOMIC_ACQUIRE) == 0) {
     sys_yield();
   }
@@ -902,14 +918,21 @@ static void test_process_tree(struct kring *tch) {
   print("\n");
 
   // Give the child time to park on the block again (we want to exercise
-  // the woken-from-park path, not just the fail-fast one) ...
+  // the woken-from-park path, not just the racing one) ...
   for (int i = 0; i < 64; i++) {
     sys_yield();
   }
-  // ... then free the channel block: the child wakes SYSERR_DEAD and
-  // exits; its death shows up on our tree channel; then we reap it.
-  print("tests: vm_free(boot_ch) rc=");
-  print_hex(sys_vm_free(boot_ch));
+  // ... then run the orderly teardown choreography (futex-design.md §5):
+  // close sentinel, wake, the child's VM_DROPSHARE is the ack, and
+  // VM_FREE is the drain gate — SYSERR_EXIST until the share edge drains.
+  __atomic_store_n(req, CH_REQ_CLOSE, __ATOMIC_RELEASE);
+  sys_futex_wake(req, 1);
+  uint64_t free_rc;
+  while ((free_rc = sys_vm_free(boot_ch)) == SYSERR_EXIST) {
+    sys_yield();
+  }
+  print("tests: vm_free(boot_ch) after dropshare rc=");
+  print_hex(free_rc);
   await_child_death(tch);
   reap_child(c1);
 
@@ -942,21 +965,28 @@ static void test_process_tree(struct kring *tch) {
   await_child_death(tch);
   reap_child(c3);
 
-  // --- Child 4: kill a thread parked in a channel ----------------------
+  // --- Child 4: kill a thread parked on a revoked block -----------------
   uint64_t park_ch = sys_vm_alloc(4096, VM_PROT_READ | VM_PROT_WRITE);
   volatile uint32_t *ready = (volatile uint32_t *)park_ch;
   uint64_t c4 = spawn_child(child_park_main, park_ch);
-  sys_block_wait(ready, 0);
+  while (__atomic_load_n(ready, __ATOMIC_ACQUIRE) == 0) {
+    sys_futex_wait(ready, 0, nullptr, 0);
+  }
   for (int i = 0; i < 64; i++) {
     sys_yield();
   }
+  // Owner-side coercion: revoke the (unresponsive) peer's edge, then the
+  // free succeeds with the peer's thread still parked on the word — the
+  // kernel never wakes waiters on revocation.
+  print("tests: vm_unshare(park_ch, c4) rc=");
+  print_hex(sys_vm_unshare(park_ch, c4));
+  print("tests: vm_free(park_ch) rc=");
+  print_hex(sys_vm_free(park_ch));
   print("tests: proc_kill(parked) rc=");
   print_hex(sys_proc_kill(c4));
   await_child_death(tch);
-  // Revocation clears the dead child's waiter slot without enqueueing it;
-  // bounded reap subsequently owns the detached blocked TCB.
-  print("tests: vm_free(park_ch) rc=");
-  print_hex(sys_vm_free(park_ch));
+  // Reap claims the parked TCB (PARKED -> CLAIMED), removes its futex
+  // node, and frees it.
   reap_child(c4);
 
   // --- Child 5: one thread exits the whole multithreaded process ----------
@@ -990,9 +1020,9 @@ void _start(uint64_t arg) {
   test_realloc();
   test_libc_surface();
   test_pthreads();
-  test_bounded_multiwait_free();
+  test_futex();
   test_thread_lifecycle();
-  test_timer_scheme();
+  test_time();
   test_arch_context();
 
   // Tree channel: our children's deaths arrive here (we are a mid-tree

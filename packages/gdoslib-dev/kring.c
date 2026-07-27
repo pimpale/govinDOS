@@ -59,15 +59,17 @@ struct ksqe *kring_get_sqe(struct kring *r) {
 
 uint64_t kring_submit(struct kring *r) {
   atomic_store_explicit(&r->hdr->sq_tail, r->sq_tail, memory_order_release);
-  // Each doorbell drains at most RING_SQ_BATCH SQEs; re-ring until the
-  // kernel's consumption mirror catches up to what we published. Bounded:
-  // every doorbell on an honest tail makes progress.
+  // A futex wake on the ring base is the doorbell: the kernel drains at
+  // most RING_SQ_BATCH SQEs per wake, so re-ring until its consumption
+  // mirror catches up to what we published. Bounded: every wake on an
+  // honest tail makes progress.
   uint64_t rc;
   do {
-    rc = sys_block_doorbell(r->base);
-  } while (rc == 0 && atomic_load_explicit(&r->hdr->sq_head,
-                                           memory_order_acquire) != r->sq_tail);
-  return rc;
+    rc = sys_futex_wake((const void *)r->base, 1);
+  } while (!sys_iserr(rc) &&
+           atomic_load_explicit(&r->hdr->sq_head, memory_order_acquire) !=
+               r->sq_tail);
+  return sys_iserr(rc) ? rc : 0;
 }
 
 const struct kcqe *kring_peek_cqe(struct kring *r) {
@@ -89,11 +91,14 @@ uint64_t kring_wait_cqe(struct kring *r, struct kcqe *cqe) {
       kring_cqe_seen(r);
       return 0;
     }
-    // Parks while cq_count still equals our consumed head; a post wakes
-    // us (the kernel bumps the mirror before the wake). Spurious wakes
-    // just loop back into the peek.
-    uint64_t rc = sys_block_wait(&r->hdr->cq_count, r->cq_head);
-    if (rc != 0) {
+    // The fused wake on the ring base drains any published SQEs (kernel
+    // channel) or wakes the peer (user channel) before the park, which
+    // is what keeps this one loop correct against both far ends. Parks
+    // while cq_count still equals our consumed head; SYSERR_AGAIN means
+    // the count already moved — loop back into the peek.
+    uint64_t rc = sys_futex_wait(&r->hdr->cq_count, r->cq_head,
+                                 (const void *)r->base, 0);
+    if (rc != 0 && rc != SYSERR_AGAIN) {
       return rc;
     }
   }
@@ -101,29 +106,11 @@ uint64_t kring_wait_cqe(struct kring *r, struct kcqe *cqe) {
 
 uint64_t kring_ack(struct kring *r) {
   atomic_store_explicit(&r->hdr->cq_head, r->cq_head, memory_order_release);
-  return sys_block_doorbell(r->base);
-}
-
-static uint64_t timer_submit(struct kring *r, uint64_t op, uint64_t a,
-                             uint64_t b, uint64_t c) {
-  struct ksqe *sqe = kring_get_sqe(r);
-  if (sqe == nullptr)
-    return SYSERR_AGAIN;
-  *sqe = (struct ksqe){.op = op, .a = a, .b = b, .c = c};
-  return kring_submit(r);
-}
-
-uint64_t kring_timer_now(struct kring *r) {
-  return timer_submit(r, KTIMER_NOW, 0, 0, 0);
-}
-
-uint64_t kring_timer_arm_abs(struct kring *r, uint64_t id,
-                             uint64_t deadline_ns, uint64_t cookie) {
-  return timer_submit(r, KTIMER_ARM_ABS, id, deadline_ns, cookie);
-}
-
-uint64_t kring_timer_cancel(struct kring *r, uint64_t id) {
-  return timer_submit(r, KTIMER_CANCEL, id, 0, 0);
+  // Count 1, not 0: a kernel channel ignores the count (the wake is the
+  // doorbell either way), but against a user peer a count of 0 wakes
+  // nobody — and one loop must serve both far ends.
+  uint64_t rc = sys_futex_wake((const void *)r->base, 1);
+  return sys_iserr(rc) ? rc : 0;
 }
 
 static uint64_t irq_submit(struct kring *r, uint64_t op, uint64_t a,

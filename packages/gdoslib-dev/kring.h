@@ -13,11 +13,15 @@
 //   kring_create(&g, KSCHEME_IRQ, 4096);
 //   struct ksqe *sqe = kring_get_sqe(&g);
 //   sqe->op = KIRQ_CLAIM; sqe->a = gsi; sqe->b = cookie;
-//   kring_submit(&g);                  // publish sq_tail + doorbell
+//   kring_submit(&g);                  // publish sq_tail + futex wake (drain)
 //   struct kcqe cqe;
 //   kring_wait_cqe(&g, &cqe);          // park until one lands, consume it
 //   kring_ack(&g);                     // consumption ack: publish cq_head
-//                                      // + doorbell, so level state replays
+//                                      // + wake, so level state replays
+//
+// The same loop serves a user peer at the far end: the wait parks on
+// cq_count with a fused wake of the ring base, and the ack's wake-one
+// reaches whoever the peer parked there (futex-design.md §8).
 //
 // One thread per ring (SPSC is the kernel's rule too). Consumed CQEs
 // are invisible to later peeks but only freed for the kernel by the
@@ -29,7 +33,6 @@
 #include <gdosabi/kring_cap.h>
 #include <gdosabi/kring_irq.h>
 #include <gdosabi/kring_iommu.h>
-#include <gdosabi/kring_timer.h>
 
 struct kring {
   uint64_t base; // block base — the channel's name to the syscalls
@@ -64,9 +67,9 @@ uint64_t kring_destroy(struct kring *r);
 // Batching: every get_sqe since the last submit is published together.
 struct ksqe *kring_get_sqe(struct kring *r);
 
-// Publish the SQEs taken so far and ring the doorbell. The kernel
-// drains at most RING_SQ_BATCH per doorbell, so re-rings until its
-// sq_head mirror catches up. Returns 0 or the doorbell's SYSERR_*.
+// Publish the SQEs taken so far and wake the ring (the doorbell). The
+// kernel drains at most RING_SQ_BATCH per wake, so re-rings until its
+// sq_head mirror catches up. Returns 0 or the wake's SYSERR_*.
 uint64_t kring_submit(struct kring *r);
 
 // The next unconsumed CQE, or nullptr if none. The slot stays valid
@@ -76,24 +79,15 @@ const struct kcqe *kring_peek_cqe(struct kring *r);
 // Mark the last-peeked CQE consumed (advances the local head only).
 void kring_cqe_seen(struct kring *r);
 
-// Park until a CQE is available, copy it out, and consume it. Returns 0,
-// or SYSERR_* from the underlying SYS_BLOCK_WAIT (notably SYSERR_DEAD
-// when the block is revoked, SYSERR_EXIST when the side already has a
-// parked thread). Does not ack; do that after
+// Park until a CQE is available, copy it out, and consume it. Returns 0
+// or SYSERR_* from the underlying SYS_FUTEX_WAIT (SYSERR_INVAL when the
+// block was revoked out of our view). Does not ack; do that after
 // draining what you came for.
 uint64_t kring_wait_cqe(struct kring *r, struct kcqe *cqe);
 
-// Consumption ack: publish cq_head and ring the doorbell so the kernel
+// Consumption ack: publish cq_head and wake the ring so the kernel
 // replays pending level-state events into the freed slots.
 uint64_t kring_ack(struct kring *r);
-
-// Timer commands are asynchronous like the other ring commands: these submit
-// an SQE and return the doorbell result. The caller consumes the ordinary
-// command completion and any KEV_TIMER events from the same CQ.
-uint64_t kring_timer_now(struct kring *r);
-uint64_t kring_timer_arm_abs(struct kring *r, uint64_t id,
-                             uint64_t deadline_ns, uint64_t cookie);
-uint64_t kring_timer_cancel(struct kring *r, uint64_t id);
 
 uint64_t kring_cap_subgrant(struct kring *r, const struct cap_token *parent,
                             uint64_t p0, uint64_t p1, uint64_t p2,

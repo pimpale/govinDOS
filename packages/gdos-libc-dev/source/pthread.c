@@ -70,22 +70,37 @@ static void spin_unlock(atomic_flag *lock) {
   atomic_flag_clear_explicit(lock, memory_order_release);
 }
 
-// Doorbells are block-scoped. Waking a waiter for another predicate in the
-// same allocation is harmless because every pthread wait rechecks atomically;
-// drain all bounded batches so the waiter interested in this transition is
-// guaranteed to run as well.
-static void wake_private_block(const volatile void *address) {
-  uint64_t rc;
-  do {
-    rc = sys_block_doorbell((uint64_t)address);
-    if (rc == SYSERR_AGAIN)
-      sys_yield();
-  } while (rc == SYSERR_AGAIN);
+// Every primitive is keyed on its own word (futex-design.md §8): a wake
+// reaches exactly the waiters parked on that address, never the rest of
+// the allocation. Wakes are count-capped; drain the cap for broadcasts.
+static void futex_wake_all(const volatile void *address) {
+  while (sys_futex_wake(address, UINT64_MAX) == FUTEX_WAKE_BATCH) {
+  }
 }
 
-static int wait_u32(const volatile _Atomic uint32_t *address,
-                    uint32_t expected) {
-  return sys_block_wait(address, expected) == 0 ? 0 : EINVAL;
+// Park while *address == expected. 0 covers both a wake and a value
+// mismatch (the caller's recheck loop disambiguates); ETIMEDOUT and
+// EINVAL are real outcomes.
+static int futex_wait(const volatile _Atomic uint32_t *address,
+                      uint32_t expected, uint64_t deadline) {
+  uint64_t rc = sys_futex_wait(address, expected, nullptr, deadline);
+  if (rc == 0 || rc == SYSERR_AGAIN)
+    return 0;
+  return rc == SYSERR_TIMEDOUT ? ETIMEDOUT : EINVAL;
+}
+
+// Absolute timespec -> SYS_GETTIME-domain deadline. No realtime clock
+// exists yet, so CLOCK_REALTIME waits are interpreted in the monotonic
+// domain (clock_gettime reports it for both clock ids).
+static int abstime_to_deadline(const struct timespec *abstime,
+                               uint64_t *deadline) {
+  if (abstime == nullptr || abstime->tv_sec < 0 || abstime->tv_nsec < 0 ||
+      abstime->tv_nsec >= 1000000000L)
+    return EINVAL;
+  uint64_t ns =
+      (uint64_t)abstime->tv_sec * 1000000000ull + (uint64_t)abstime->tv_nsec;
+  *deadline = ns == 0 ? 1 : ns; // 0 means "no deadline" to the kernel
+  return 0;
 }
 
 static uint64_t page_ceil(uint64_t value) {
@@ -103,11 +118,16 @@ static void reclaim_thread(struct __gdos_pthread *thread) {
 static void wait_for_completion(struct __gdos_pthread *thread) {
   while (atomic_load_explicit(&thread->complete, memory_order_acquire) !=
          GDOS_THREAD_COMPLETE) {
-    uint64_t rc = sys_block_wait(&thread->complete, GDOS_THREAD_PENDING);
-    if (sys_iserr(rc)) {
+    uint64_t rc = sys_futex_wait(&thread->complete, GDOS_THREAD_PENDING,
+                                 nullptr, 0);
+    if (sys_iserr(rc) && rc != SYSERR_AGAIN) {
       sys_yield();
     }
   }
+  // Chain-wake: the kernel wakes exactly one waiter per completion, so a
+  // waiter that observes the durable transition hands the wake along for
+  // any raw multi-waiter user of the completion ABI (futex-design.md §4).
+  sys_futex_wake(&thread->complete, 1);
 }
 
 [[noreturn]] static void reaper_entry(uint64_t ignored) {
@@ -139,7 +159,7 @@ static void wait_for_completion(struct __gdos_pthread *thread) {
       reclaim_thread(victim);
       continue;
     }
-    sys_block_wait(&g_reaper_event->sequence, observed);
+    sys_futex_wait(&g_reaper_event->sequence, observed, nullptr, 0);
   }
 }
 
@@ -218,7 +238,7 @@ static void notify_reaper(struct __gdos_pthread *thread) {
   }
   atomic_fetch_add_explicit(&g_reaper_event->sequence, 1,
                             memory_order_release);
-  sys_block_doorbell((uint64_t)g_reaper_event);
+  sys_futex_wake(&g_reaper_event->sequence, 1);
 }
 
 static void run_tsd_destructors(void) {
@@ -554,7 +574,7 @@ int pthread_mutex_trylock(pthread_mutex_t *mutex) {
   if (mutex == nullptr)
     return EINVAL;
   uint64_t tid = sys_gettid();
-  if (atomic_load_explicit(&mutex->locked, memory_order_relaxed) &&
+  if (atomic_load_explicit(&mutex->locked, memory_order_relaxed) != 0 &&
       atomic_load_explicit(&mutex->owner, memory_order_relaxed) == tid) {
     if (mutex->type == PTHREAD_MUTEX_RECURSIVE) {
       if (mutex->recursion == UINT32_MAX)
@@ -574,20 +594,50 @@ int pthread_mutex_trylock(pthread_mutex_t *mutex) {
   return 0;
 }
 
-int pthread_mutex_lock(pthread_mutex_t *mutex) {
-  int rc;
-  while ((rc = pthread_mutex_trylock(mutex)) == EBUSY) {
-    if (wait_u32(&mutex->locked, 1) != 0)
-      return EINVAL;
+// The textbook three-state futex mutex: a contender publishes the
+// waiters state (2) before parking, and always acquires as 2 after a
+// wait so a later unlock keeps handing the wake along.
+static int mutex_lock_deadline(pthread_mutex_t *mutex, uint64_t deadline) {
+  int rc = pthread_mutex_trylock(mutex);
+  if (rc != EBUSY)
+    return rc;
+  for (;;) {
+    uint32_t state = atomic_load_explicit(&mutex->locked,
+                                          memory_order_relaxed);
+    if (state == 0) {
+      uint32_t expected = 0;
+      if (atomic_compare_exchange_strong_explicit(
+              &mutex->locked, &expected, 2, memory_order_acquire,
+              memory_order_relaxed)) {
+        atomic_store_explicit(&mutex->owner, sys_gettid(),
+                              memory_order_relaxed);
+        mutex->recursion = 1;
+        return 0;
+      }
+      continue;
+    }
+    if (state == 1) {
+      uint32_t expected = 1;
+      if (!atomic_compare_exchange_strong_explicit(
+              &mutex->locked, &expected, 2, memory_order_acq_rel,
+              memory_order_relaxed))
+        continue;
+    }
+    rc = futex_wait(&mutex->locked, 2, deadline);
+    if (rc != 0)
+      return rc;
   }
-  return rc;
+}
+
+int pthread_mutex_lock(pthread_mutex_t *mutex) {
+  return mutex_lock_deadline(mutex, 0);
 }
 
 int pthread_mutex_timedlock(pthread_mutex_t *restrict mutex,
                             const struct timespec *restrict abstime) {
-  (void)mutex;
-  (void)abstime;
-  return ENOTSUP;
+  uint64_t deadline;
+  int rc = abstime_to_deadline(abstime, &deadline);
+  return rc != 0 ? rc : mutex_lock_deadline(mutex, deadline);
 }
 
 int pthread_mutex_unlock(pthread_mutex_t *mutex) {
@@ -603,8 +653,9 @@ int pthread_mutex_unlock(pthread_mutex_t *mutex) {
   }
   mutex->recursion = 0;
   atomic_store_explicit(&mutex->owner, 0, memory_order_relaxed);
-  atomic_store_explicit(&mutex->locked, 0, memory_order_release);
-  wake_private_block(&mutex->locked);
+  // Zero syscalls unless a waiter marked itself; then wake exactly one.
+  if (atomic_exchange_explicit(&mutex->locked, 0, memory_order_release) == 2)
+    sys_futex_wake(&mutex->locked, 1);
   return 0;
 }
 
@@ -657,6 +708,7 @@ int pthread_cond_init(pthread_cond_t *restrict cond,
   if (attr != nullptr && attr->pshared != PTHREAD_PROCESS_PRIVATE)
     return ENOTSUP;
   atomic_init(&cond->sequence, 0);
+  atomic_init(&cond->mutex, 0);
   return 0;
 }
 
@@ -664,42 +716,99 @@ int pthread_cond_destroy(pthread_cond_t *cond) {
   return cond == nullptr ? EINVAL : 0;
 }
 
-int pthread_cond_wait(pthread_cond_t *restrict cond,
-                      pthread_mutex_t *restrict mutex) {
+static int cond_wait_deadline(pthread_cond_t *cond, pthread_mutex_t *mutex,
+                              uint64_t deadline) {
   if (cond == nullptr || mutex == nullptr)
     return EINVAL;
   uint32_t sequence =
       atomic_load_explicit(&cond->sequence, memory_order_acquire);
+  // Recorded so broadcast can requeue us onto the mutex word.
+  atomic_store_explicit(&cond->mutex, (uintptr_t)mutex,
+                        memory_order_relaxed);
   int rc = pthread_mutex_unlock(mutex);
   if (rc != 0)
     return rc;
+  int wait_rc = 0;
   while (atomic_load_explicit(&cond->sequence, memory_order_acquire) ==
          sequence) {
-    if (wait_u32(&cond->sequence, sequence) != 0)
-      return EINVAL;
+    // A broadcast-requeued waiter parks on the mutex word from here on;
+    // the wake that mutex_unlock hands it returns 0 and the sequence
+    // recheck exits the loop.
+    wait_rc = futex_wait(&cond->sequence, sequence, deadline);
+    if (wait_rc != 0)
+      break;
   }
-  return pthread_mutex_lock(mutex);
+  // POSIX: the mutex is re-acquired regardless of the wait's outcome.
+  rc = pthread_mutex_lock(mutex);
+  return rc != 0 ? rc : wait_rc;
+}
+
+int pthread_cond_wait(pthread_cond_t *restrict cond,
+                      pthread_mutex_t *restrict mutex) {
+  return cond_wait_deadline(cond, mutex, 0);
 }
 
 int pthread_cond_timedwait(pthread_cond_t *restrict cond,
                            pthread_mutex_t *restrict mutex,
                            const struct timespec *restrict abstime) {
-  (void)cond;
-  (void)mutex;
-  (void)abstime;
-  return ENOTSUP;
+  uint64_t deadline;
+  int rc = abstime_to_deadline(abstime, &deadline);
+  return rc != 0 ? rc : cond_wait_deadline(cond, mutex, deadline);
 }
 
 int pthread_cond_signal(pthread_cond_t *cond) {
   if (cond == nullptr)
     return EINVAL;
   atomic_fetch_add_explicit(&cond->sequence, 1, memory_order_release);
-  wake_private_block(&cond->sequence);
+  sys_futex_wake(&cond->sequence, 1);
   return 0;
 }
 
 int pthread_cond_broadcast(pthread_cond_t *cond) {
-  return pthread_cond_signal(cond);
+  if (cond == nullptr)
+    return EINVAL;
+  uint32_t sequence =
+      atomic_fetch_add_explicit(&cond->sequence, 1, memory_order_release) + 1;
+  pthread_mutex_t *mutex =
+      (pthread_mutex_t *)atomic_load_explicit(&cond->mutex,
+                                              memory_order_relaxed);
+  // Wake one to run now; requeue the rest onto the mutex so the unlock
+  // chain admits them one at a time instead of stampeding (futex-design
+  // §2). Without a recorded mutex, fall back to waking everyone.
+  sys_futex_wake(&cond->sequence, 1);
+  if (mutex == nullptr) {
+    futex_wake_all(&cond->sequence);
+    return 0;
+  }
+  uint64_t moved = 0;
+  uint64_t rc;
+  while ((rc = sys_futex_requeue(&cond->sequence, &mutex->locked, sequence,
+                                 UINT64_MAX)) == FUTEX_REQUEUE_BATCH) {
+    moved += rc;
+  }
+  if (!sys_iserr(rc))
+    moved += rc;
+  if (moved != 0) {
+    // The requeued waiters sit on the mutex word now: mark it contended
+    // so every unlock keeps waking, or hand one a wake if it turned out
+    // to be free.
+    for (;;) {
+      uint32_t state = atomic_load_explicit(&mutex->locked,
+                                            memory_order_relaxed);
+      if (state == 0) {
+        sys_futex_wake(&mutex->locked, 1);
+        break;
+      }
+      if (state == 2)
+        break;
+      uint32_t expected = 1;
+      if (atomic_compare_exchange_strong_explicit(
+              &mutex->locked, &expected, 2, memory_order_acq_rel,
+              memory_order_relaxed))
+        break;
+    }
+  }
+  return 0;
 }
 
 int pthread_once(pthread_once_t *once, void (*init_routine)(void)) {
@@ -713,12 +822,12 @@ int pthread_once(pthread_once_t *once, void (*init_routine)(void)) {
           once, &expected, 1, memory_order_acq_rel, memory_order_acquire)) {
     init_routine();
     atomic_store_explicit(once, 2, memory_order_release);
-    wake_private_block(once);
+    futex_wake_all(once);
     return 0;
   }
   while (atomic_load_explicit(once, memory_order_acquire) != 2) {
     uint32_t observed = atomic_load_explicit(once, memory_order_relaxed);
-    if (wait_u32(once, observed) != 0)
+    if (observed != 2 && futex_wait(once, observed, 0) != 0)
       return EINVAL;
   }
   return 0;
@@ -758,7 +867,8 @@ int pthread_rwlock_rdlock(pthread_rwlock_t *lock) {
   while ((rc = pthread_rwlock_tryrdlock(lock)) == EBUSY) {
     uint32_t observed = (uint32_t)atomic_load_explicit(
         &lock->state, memory_order_relaxed);
-    if (wait_u32((volatile _Atomic uint32_t *)&lock->state, observed) != 0)
+    if (futex_wait((volatile _Atomic uint32_t *)&lock->state, observed, 0) !=
+        0)
       return EINVAL;
   }
   return rc;
@@ -780,7 +890,8 @@ int pthread_rwlock_wrlock(pthread_rwlock_t *lock) {
   while ((rc = pthread_rwlock_trywrlock(lock)) == EBUSY) {
     uint32_t observed = (uint32_t)atomic_load_explicit(
         &lock->state, memory_order_relaxed);
-    if (wait_u32((volatile _Atomic uint32_t *)&lock->state, observed) != 0)
+    if (futex_wait((volatile _Atomic uint32_t *)&lock->state, observed, 0) !=
+        0)
       return EINVAL;
   }
   return rc;
@@ -792,13 +903,13 @@ int pthread_rwlock_unlock(pthread_rwlock_t *lock) {
   int32_t state = atomic_load_explicit(&lock->state, memory_order_relaxed);
   if (state == -1) {
     atomic_store_explicit(&lock->state, 0, memory_order_release);
-    wake_private_block(&lock->state);
+    futex_wake_all(&lock->state);
     return 0;
   }
   if (state <= 0)
     return EPERM;
   atomic_fetch_sub_explicit(&lock->state, 1, memory_order_release);
-  wake_private_block(&lock->state);
+  futex_wake_all(&lock->state);
   return 0;
 }
 
@@ -894,12 +1005,12 @@ int pthread_barrier_wait(pthread_barrier_t *barrier) {
   if (arrived == barrier->trip_count) {
     atomic_store_explicit(&barrier->count, 0, memory_order_relaxed);
     atomic_fetch_add_explicit(&barrier->generation, 1, memory_order_release);
-    wake_private_block(&barrier->generation);
+    futex_wake_all(&barrier->generation);
     return PTHREAD_BARRIER_SERIAL_THREAD;
   }
   while (atomic_load_explicit(&barrier->generation, memory_order_acquire) ==
          generation) {
-    if (wait_u32(&barrier->generation, generation) != 0)
+    if (futex_wait(&barrier->generation, generation, 0) != 0)
       return EINVAL;
   }
   return 0;

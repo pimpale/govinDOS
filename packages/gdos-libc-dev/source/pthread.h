@@ -25,6 +25,8 @@ typedef struct {
 } pthread_mutexattr_t;
 
 typedef struct {
+  // Futex word: 0 free, 1 locked, 2 locked with (possible) waiters.
+  // Uncontended lock and unlock make no syscalls.
   _Atomic uint32_t locked;
   _Atomic uint64_t owner;
   uint32_t recursion;
@@ -33,6 +35,9 @@ typedef struct {
 
 typedef struct {
   _Atomic uint32_t sequence;
+  // Last mutex waited with, recorded so broadcast can requeue waiters
+  // onto it instead of stampeding them (futex-design.md §2).
+  _Atomic uintptr_t mutex;
 } pthread_cond_t;
 
 typedef struct {

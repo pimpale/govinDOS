@@ -63,6 +63,22 @@ void LLRB_FN(_iter_begin)(const LLRB_T *tree, LLRB_ITER_T *iter);
 bool LLRB_FN(_iter_next)(LLRB_ITER_T *iter, LLRB_KEY *key,
                          LLRB_VALUE *value);
 
+// Position the iterator at the first node with key >= *key (the lower
+// bound), so a subsequent _iter_next starts there.
+void LLRB_FN(_iter_lower_bound)(const LLRB_T *tree, const LLRB_KEY *key,
+                                LLRB_ITER_T *iter);
+
+// Allocation-free relink pair. _extract removes *key like _remove but
+// hands back the unlinked node instead of freeing it; _insert_node
+// inserts key/value reusing that node's storage (no allocation, so it
+// cannot fail with OOM — false means duplicate key, and the node stays
+// the caller's). Together they move an entry between two same-typed
+// trees with strictly pointer work.
+bool LLRB_FN(_extract)(LLRB_T *tree, const LLRB_KEY *key,
+                       LLRB_VALUE *old_value, LLRB_NODE_T **node_out);
+bool LLRB_FN(_insert_node)(LLRB_T *tree, const LLRB_KEY *key,
+                           const LLRB_VALUE *value, LLRB_NODE_T *node);
+
 // Intended for tests and diagnostics: checks ordering, parent links, left
 // leaning, red adjacency, black height, and the recorded node count.
 bool LLRB_FN(_valid)(const LLRB_T *tree);

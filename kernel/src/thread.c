@@ -51,24 +51,29 @@ struct thread *thread_current(void) {
   return cpu_state_this()->scheduler.current_thread;
 }
 
-void thread_unblock(struct thread *t) {
+void thread_unblock_claimed(struct thread *t) {
   // A blocker sets status=BLOCKED *before* it has finished switching out
   // (its context save completes inside the park path's switch_context).
   // Spin until the scheduler has fully descheduled it — dispatching a
   // thread whose save is still in flight would run one context on two
   // CPUs. The release store of on_cpu=false in scheduler_loop makes the
-  // completed save visible to our acquire load.
+  // completed save visible to our acquire load. A claim can be won in
+  // the window between the bucket drop and the deschedule, which is why
+  // the spin sits here rather than in the claim.
   while (atomic_load_explicit(&t->on_cpu, memory_order_acquire)) {
     __asm__ volatile("pause");
   }
-  // A blocked thread has one intrusive wait node and the block stripe lets
-  // exactly one waker detach it, even though a private block may have many
-  // waiters. Death does not enqueue blocked victims; resource reap later
-  // detaches their nodes.
   asserts(atomic_load_explicit(&t->status, memory_order_acquire) ==
               THREAD_BLOCKED,
-          "thread_unblock: not blocked");
+          "thread_unblock_claimed: not blocked");
+  asserts(atomic_load_explicit(&t->wake_state, memory_order_acquire) ==
+              FUTEX_CLAIMED,
+          "thread_unblock_claimed: not claimed");
+  // Status first, then the claim release, then the enqueue: the claim is
+  // what protects the TCB while it still looks blocked, and it must be
+  // gone before another CPU can dispatch the thread.
   atomic_store_explicit(&t->status, THREAD_RUNNABLE, memory_order_release);
+  atomic_store_explicit(&t->wake_state, FUTEX_IDLE, memory_order_release);
   scheduler_enqueue(t);
 }
 

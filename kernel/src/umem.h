@@ -82,20 +82,14 @@ struct ublock {
   struct process *owner;
   vec_share_edge *sharers; // processes other than owner with a view
 
-  // Wait state (channel.c, under stripe(base)). Private event blocks use an
-  // intrusive FIFO with nodes embedded in TCBs. Shared and kernel endpoints
-  // retain one structural waiter per side; identity-changing operations can
-  // therefore remain one bounded transaction.
-  struct thread *private_wait_head;
-  struct thread *private_wait_tail;
-  struct thread *owner_waiter;
-  struct thread *sharer_waiter;
-  // First VM_FREE sets this before draining private waiters. The block stays
-  // mapped and owned so userspace can repeat VM_FREE; new waits/identity
-  // changes fail until the final call unlinks and reclaims it.
-  bool freeing;
+  // There is no per-block wait state: waiting is address-keyed
+  // (futex.c), and a parked thread holds no reference to its block. The
+  // kernel never wakes waiters on revocation; orderly teardown is
+  // userspace's choreography and disorderly teardown is the parent's
+  // (futex-design.md §5).
+  //
   // Non-null iff this block is a kernel channel; owned here, freed by the
-  // revoke path (channel_block_torn). Written under g_umem + stripe(base)
+  // revoke path (channel_ring_destroy). Written under g_umem + stripe(base)
   // like owner/sharers; ring *internals* are control-plane state (g_umem).
   struct ring *ring;
   uint32_t dma_pins; // g_umem: IOMMU leaves retaining this allocation
@@ -133,13 +127,14 @@ uint64_t umem_map_device(struct process *p, uint64_t base, uint64_t len,
 uint64_t umem_map_device_locked(struct process *p, uint64_t base, uint64_t len,
                                 uint32_t flags);
 
-// Free a block owned by `p`. base must be the exact block base. The first
-// call marks it freeing and wakes a bounded waiter batch; 1 means userspace
-// must call again, 0 means fully reclaimed, and -1 is an invalid request.
-// Once the waiter queue is empty, revokes every
-// sharer's view, restores all views to pristine, flushes every view in
-// one shootdown round (outside the control-plane lock), and only then
-// returns the block to the buddy. -1 if base isn't an owned block.
+// Free a block owned by `p`. base must be the exact block base. A single
+// bounded transaction: fails (SYSERR_EXIST as int) while anything is
+// still attached — sharers, DMA pins, thread pins, an undestroyable
+// endpoint — rather than driving their removal itself. On success
+// restores every view to pristine, flushes in one shootdown round
+// (outside the control-plane lock), and returns the block to the buddy.
+// Parked futex waiters are not an attachment and are not notified.
+// -1 if base isn't an owned block.
 int umem_free(struct process *p, uint64_t base);
 
 // Re-flag [base, base+len) — page-aligned, inside a single block `p` has
@@ -147,7 +142,7 @@ int umem_free(struct process *p, uint64_t base);
 // sub-range inaccessible (a user-placed guard); anything else is
 // sanitized to prot|PAGE_U. Per-view: sharers' mappings are unaffected.
 // Takes only p's list lock (the flag + flush run under it: that is what
-// makes SYS_BLOCK_WAIT's user-word load safe against a concurrent
+// makes SYS_FUTEX_WAIT's user-word load safe against a concurrent
 // guard). Callers targeting another process (the parent-sets-embryo-
 // views path) must pin the target — hold g_umem across the lookup+call.
 int umem_protect(struct process *p, uint64_t base, size_t len,
@@ -161,9 +156,17 @@ int umem_protect(struct process *p, uint64_t base, size_t len,
 uint64_t umem_share(struct process *p, uint64_t base, uint64_t target_pid,
                     paging_flags_t prot);
 
-// Drop `p`'s shared-in view of the block at `base` (restore pristine in
-// p's AS). The owner keeps the block. -1 if p has no such view.
-int umem_unshare(struct process *p, uint64_t base);
+// SYS_VM_DROPSHARE: drop `p`'s shared-in view of the block at `base`
+// (restore pristine in p's AS). The owner keeps the block. -1 if p has
+// no such view. In orderly teardown this is the peer's ack of the
+// owner's close sentinel.
+int umem_dropshare(struct process *p, uint64_t base);
+
+// SYS_VM_UNSHARE: the owner's per-edge revocation — remove `pid`'s view
+// of the owned block at `base`. The coercion path for a peer that never
+// acks; its later touch of the block is an ordinary revocation death.
+// SYSERR_INVAL if base isn't p's block or pid holds no edge.
+uint64_t umem_unshare_from(struct process *p, uint64_t base, uint64_t pid);
 
 // ---------------------------------------------------------------------------
 // Reap-step primitives and ownership transfer (process.c, which owns the
@@ -223,20 +226,17 @@ void umem_proc_unregister_locked(struct process *p);
 //      p->shared_in, reads included. Finding a block in a list you hold
 //      pins it: a freer unlinks from every list before tearing down.
 //   3. stripes (umem_stripe_*) — static lock array indexed by hash(block
-//      base). Guard the block's waiter slots and serialize park vs wake vs
-//      tear; the lock's storage outlives any block, which is what makes
-//      lock-then-look safe without the global lock.
+//      base). Guard CQ publication and the b->ring pointer; the lock's
+//      storage outlives any block, which is what makes lock-then-look
+//      safe without the global lock.
 //
-// The data plane (SYS_BLOCK_WAIT / SYS_BLOCK_DOORBELL on user channels and
-// private event blocks) takes list lock -> stripe and never touches g_umem:
-// unrelated blocks never contend.
-// Its soundness rules:
-//   - take the stripe BEFORE dropping the list lock that made the block
-//     reachable, and never touch the block after dropping the stripe;
-//   - never take a list lock while holding a stripe;
-//   - channel data-plane paths hold only the block's one stripe.
-// A future cross-block operation must pin both blocks and acquire their
-// stripes in ascending index order; no current channel path needs a pair.
+// Below the hierarchy sit the futex buckets (futex.c) — plain spinlocks,
+// never held across a flush: SYS_FUTEX_WAIT takes list lock -> bucket
+// (the interim paging discipline) and never touches g_umem; a CQ post
+// takes stripe -> bucket for its wake. Bucket holders take only the
+// per-CPU timer locks, g_allocator_lock, and the scheduler lock.
+//   - never take a list lock or a stripe while holding a bucket;
+//   - never touch a block after dropping the lock that pinned it.
 // ---------------------------------------------------------------------------
 
 void umem_lock(void);

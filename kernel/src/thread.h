@@ -32,6 +32,32 @@ enum thread_status {
   THREAD_DEAD,
 };
 
+// Futex wait arbitration (futex-design.md §6). Every party that wants a
+// parked thread — waker, requeue, deadline expiry, reap — goes through
+// wake_state:
+//   PARKED -> CLAIMED   the winner's claim; a reap-visible lifetime pin.
+//                       The winner removes both tree entries, then either
+//                       releases through thread_unblock_claimed (live
+//                       process) or publishes REAPABLE (dead process).
+//   PARKED -> MOVING    requeue's relink window: strictly pointer work,
+//                       spun on briefly by expiry, skipped by reap.
+//   REAPABLE            terminal; reap frees the TCB directly (the winner
+//                       already removed every tree entry).
+enum futex_state : uint32_t {
+  FUTEX_IDLE,
+  FUTEX_PARKED,
+  FUTEX_MOVING,
+  FUTEX_CLAIMED,
+  FUTEX_REAPABLE,
+};
+
+// Bucket-tree key: waiters on one address are contiguous and in FIFO
+// order via the global park sequence (futex.c).
+struct futex_key {
+  uint64_t address;
+  uint64_t seq;
+};
+
 typedef struct thread {
   uint64_t tid;
   struct process *proc; // never null
@@ -42,16 +68,22 @@ typedef struct thread {
 
   // True from just before the scheduler switches into this thread until
   // just after it has switched back out and its saved state is complete.
-  // Wakers must spin this false before re-enqueueing (thread_unblock does)
-  // — otherwise a thread that has set status=BLOCKED but not yet finished
-  // saving its context could be dispatched on another CPU.
+  // Wakers must spin this false before re-enqueueing
+  // (thread_unblock_claimed does) — otherwise a thread that has set
+  // status=BLOCKED but not yet finished saving its context could be
+  // dispatched on another CPU.
   _Atomic bool on_cpu;
 
-  // Intrusive private-event wait queue links. A thread can be blocked in at
-  // most one syscall, so its TCB supplies all queue storage; waiter growth
-  // never allocates kernel memory. Guarded by the waited block's stripe.
-  struct thread *wait_prev;
-  struct thread *wait_next;
+  // Futex wait state (futex.c). wait_key is written under the bucket at
+  // park (and rewritten under both buckets by requeue's MOVING window);
+  // it is how wakers, expiry, and reap find the tree node to remove.
+  // deadline/deadline_cpu name the armed entry in a per-CPU deadline
+  // tree (timer.c); deadline 0 means not armed. wake_state is the claim
+  // arbitration above.
+  struct futex_key wait_key;
+  uint64_t deadline;
+  uint32_t deadline_cpu;
+  _Atomic enum futex_state wake_state;
 
   // Optional join completion. A live-process exit consumes one pin and
   // publishes the word after on_cpu becomes false. Process death skips the
@@ -167,12 +199,15 @@ struct thread *thread_current(void);
 [[noreturn]] void uthread_park_yield(void);   // requeue on this CPU
 [[noreturn]] void uthread_park_blocked(void); // caller arranged a wake-up
 
-// Move a blocked thread back to the ready queue.
-void thread_unblock(struct thread *t);
+// Release a thread the caller has CLAIMED (futex-design.md §6): spin out
+// the in-flight context save, flip BLOCKED -> RUNNABLE, release the claim
+// (CLAIMED -> IDLE), then enqueue. After the enqueue the caller may not
+// touch the TCB at all — the thread can run, exit, and be destroyed.
+void thread_unblock_claimed(struct thread *t);
 
 // Deliver `v` as the wake-up payload for a blocked thread: it lands in
 // the saved frame's rax and becomes the syscall return value when the
-// thread irets back to ring 3. Call before thread_unblock.
+// thread irets back to ring 3. Call before thread_unblock_claimed.
 void thread_deliver_wait_result(struct thread *t, uint64_t v);
 
 #endif // thread_h_INCLUDED
