@@ -221,7 +221,7 @@ uint64_t channel_scheme_create(struct process *p, uint64_t base,
     return SYSERR_EXIST;
   }
 
-  struct ring *ring = calloc(1, sizeof(*ring));
+  struct ring *ring = slab_ring_zalloc(sizeof(*ring));
   asserts(ring != nullptr, "channel: ring alloc failed");
   ring->ops = ops;
   ring->block = b;
@@ -229,7 +229,7 @@ uint64_t channel_scheme_create(struct process *p, uint64_t base,
   if (ops->init != nullptr) {
     uint64_t init_status = ops->init(ring);
     if (init_status != 0) {
-      free(ring);
+      slab_ring_free(ring);
       umem_proc_unlock(p);
       umem_unlock();
       return init_status;
@@ -286,7 +286,7 @@ void channel_ring_destroy(ublock *b) {
   if (ring->ops->destroy != nullptr) {
     ring->ops->destroy(ring);
   }
-  free(ring);
+  slab_ring_free(ring);
 }
 
 bool channel_block_destroyable(ublock *b) {

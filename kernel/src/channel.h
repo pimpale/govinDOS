@@ -52,6 +52,12 @@ struct ring {
   uint32_t nclaims;
 };
 
+#define SLAB_NAME ring
+#define SLAB_TYPE struct ring
+#include <slab/slab.h>
+#undef SLAB_TYPE
+#undef SLAB_NAME
+
 // ---------------------------------------------------------------------------
 // Syscall backends (syscall.c / futex.c)
 // ---------------------------------------------------------------------------

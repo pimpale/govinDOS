@@ -4,8 +4,10 @@
 
 #include "channel_internal.h"
 #include "capability.h"
+#include "cpu_state.h"
 #include "debug.h"
 #include "iommu_internal.h"
+#include "paging.h"
 #include "process.h"
 #include "spinlock.h"
 #include "stdlib/stdio.h"
@@ -47,6 +49,42 @@ struct iommu_domain {
   struct iommu_device *devices;
   struct iommu_mapping *mappings;
 };
+
+#define SLAB_NAME iommu_domain
+#define SLAB_TYPE struct iommu_domain
+#define SLAB_PAGE_SIZE PAGE_SIZE
+#define SLAB_CACHELINE_SIZE 64
+#define SLAB_WHICH_CPU() cpu_state_whoami()
+#include <slab/slab_impl.h>
+#undef SLAB_WHICH_CPU
+#undef SLAB_CACHELINE_SIZE
+#undef SLAB_PAGE_SIZE
+#undef SLAB_TYPE
+#undef SLAB_NAME
+
+#define SLAB_NAME iommu_device
+#define SLAB_TYPE struct iommu_device
+#define SLAB_PAGE_SIZE PAGE_SIZE
+#define SLAB_CACHELINE_SIZE 64
+#define SLAB_WHICH_CPU() cpu_state_whoami()
+#include <slab/slab_impl.h>
+#undef SLAB_WHICH_CPU
+#undef SLAB_CACHELINE_SIZE
+#undef SLAB_PAGE_SIZE
+#undef SLAB_TYPE
+#undef SLAB_NAME
+
+#define SLAB_NAME iommu_mapping
+#define SLAB_TYPE struct iommu_mapping
+#define SLAB_PAGE_SIZE PAGE_SIZE
+#define SLAB_CACHELINE_SIZE 64
+#define SLAB_WHICH_CPU() cpu_state_whoami()
+#include <slab/slab_impl.h>
+#undef SLAB_WHICH_CPU
+#undef SLAB_CACHELINE_SIZE
+#undef SLAB_PAGE_SIZE
+#undef SLAB_TYPE
+#undef SLAB_NAME
 
 static struct iommu_domain *g_domains;
 static uint32_t g_ndomains, g_ndevices, g_nmappings;
@@ -97,9 +135,9 @@ static uint64_t domain_create(struct ring *ring, uint64_t cookie) {
     return SYSERR_EXIST;
   if (g_ndomains == IOMMU_MAX_DOMAINS)
     return SYSERR_NOMEM;
-  struct iommu_domain *d = calloc(1, sizeof(*d));
+  struct iommu_domain *d = slab_iommu_domain_zalloc(sizeof(*d));
   if (d == nullptr || !vtd_domain_init(&d->hw)) {
-    free(d);
+    slab_iommu_domain_free(d);
     return SYSERR_NOMEM;
   }
   d->ring = ring;
@@ -119,7 +157,7 @@ static uint64_t domain_destroy(struct ring *ring, uint64_t cookie) {
         return SYSERR_EXIST;
       *link = d->next;
       vtd_domain_destroy(&d->hw);
-      free(d);
+      slab_iommu_domain_free(d);
       g_ndomains--;
       return 0;
     }
@@ -148,11 +186,11 @@ static uint64_t device_attach(struct iommu_domain *d, uint64_t encoded,
         ring_devices++;
   if (2 * (ring_devices + 1) > d->ring->nslots)
     return SYSERR_NOMEM;
-  struct iommu_device *v = calloc(1, sizeof(*v));
+  struct iommu_device *v = slab_iommu_device_zalloc(sizeof(*v));
   if (v == nullptr)
     return SYSERR_NOMEM;
   if (!vtd_attach(&d->hw, id)) {
-    free(v);
+    slab_iommu_device_free(v);
     return SYSERR_INVAL;
   }
   *v = (struct iommu_device){.next = d->devices,
@@ -180,7 +218,7 @@ static uint64_t device_detach(struct iommu_domain *d, uint64_t encoded) {
       if (!vtd_detach(&d->hw, v->id))
         fatal("iommu: context invalidation failed\n");
       *link = v->next;
-      free(v);
+      slab_iommu_device_free(v);
       g_ndevices--;
       return 0;
     }
@@ -260,12 +298,12 @@ static uint64_t map_block(struct process *p, struct iommu_domain *d,
   }
   b->dma_pins++;
   umem_proc_unlock(p);
-  struct iommu_mapping *m = calloc(1, sizeof(*m));
+  struct iommu_mapping *m = slab_iommu_mapping_zalloc(sizeof(*m));
   if (m == nullptr || !vtd_map(&d->hw, base, base, pages, permissions)) {
     umem_proc_lock(p);
     b->dma_pins--;
     umem_proc_unlock(p);
-    free(m);
+    slab_iommu_mapping_free(m);
     return SYSERR_NOMEM;
   }
   *m = (struct iommu_mapping){.next = d->mappings,
@@ -287,7 +325,7 @@ static uint64_t unmap_block(struct iommu_domain *d, uint64_t base) {
       *link = m->next;
       asserts(m->block->dma_pins != 0, "iommu: lost DMA pin");
       m->block->dma_pins--;
-      free(m);
+      slab_iommu_mapping_free(m);
       g_nmappings--;
       return 0;
     }

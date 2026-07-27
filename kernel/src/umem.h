@@ -61,6 +61,12 @@ typedef struct share_edge {
 #undef LLRB_KEY
 #undef LLRB_NAME
 
+#define SLAB_NAME llrb_pid_process_node
+#define SLAB_TYPE llrb_pid_process_node
+#include <slab/slab.h>
+#undef SLAB_TYPE
+#undef SLAB_NAME
+
 struct ring;
 enum ublock_backing {
   UBLOCK_RAM,
@@ -97,6 +103,12 @@ struct ublock {
   // identity and writable mapping until the scheduler publishes completion.
   _Atomic uint32_t thread_pins;
 };
+
+#define SLAB_NAME ublock
+#define SLAB_TYPE ublock
+#include <slab/slab.h>
+#undef SLAB_TYPE
+#undef SLAB_NAME
 
 // One-time init (lock + registry). Call before the first user process.
 void umem_init(void);

@@ -9,6 +9,27 @@ struct process;
 struct ring;
 struct thread;
 struct ksqe;
+struct iommu_domain;
+struct iommu_device;
+struct iommu_mapping;
+
+#define SLAB_NAME iommu_domain
+#define SLAB_TYPE struct iommu_domain
+#include <slab/slab.h>
+#undef SLAB_TYPE
+#undef SLAB_NAME
+
+#define SLAB_NAME iommu_device
+#define SLAB_TYPE struct iommu_device
+#include <slab/slab.h>
+#undef SLAB_TYPE
+#undef SLAB_NAME
+
+#define SLAB_NAME iommu_mapping
+#define SLAB_TYPE struct iommu_mapping
+#include <slab/slab.h>
+#undef SLAB_TYPE
+#undef SLAB_NAME
 
 void iommu_init_required(const struct acpi_rsdp *rsdp);
 uint64_t iommu_exec(struct thread *curr, struct ring *ring,

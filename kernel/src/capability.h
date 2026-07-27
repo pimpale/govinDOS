@@ -22,6 +22,18 @@ typedef grant *grant_ptr;
 #undef LLRB_KEY
 #undef LLRB_NAME
 
+#define SLAB_NAME llrb_grant_id_node
+#define SLAB_TYPE llrb_grant_id_node
+#include <slab/slab.h>
+#undef SLAB_TYPE
+#undef SLAB_NAME
+
+#define SLAB_NAME grant
+#define SLAB_TYPE grant
+#include <slab/slab.h>
+#undef SLAB_TYPE
+#undef SLAB_NAME
+
 // Initializes the per-boot key and empty grant index. The allocator and
 // g_umem must already be initialized.
 void capability_init(void);

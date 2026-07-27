@@ -17,6 +17,7 @@
 #include "process.h"
 #include "scheduler.h"
 #include "serial.h"
+#include "slabs.h"
 #include "smp.h"
 #include "syscall.h"
 
@@ -469,6 +470,10 @@ efi_status_t efi_main(efi_handle_t handle, struct efi_system_table *system) {
 
   // now we can initialize the cpu state table.
   cpu_state_table_init(madt);
+
+  // Fixed-type allocators need the final CPU count before any slab-backed
+  // container can allocate.
+  slabs_init();
 
   // set up early boot processor stuff
   // allocates per-cpu kernel stacks for all cpus

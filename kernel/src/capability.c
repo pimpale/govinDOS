@@ -3,8 +3,10 @@
 #include <stddef.h>
 
 #include "channel_internal.h"
+#include "cpu_state.h"
 #include "debug.h"
 #include "irq_scheme.h"
+#include "paging.h"
 #include "sha256.h"
 #include "stdlib/stdio.h"
 #include "stdlib/stdlib.h"
@@ -34,6 +36,18 @@ struct grant {
   grant *creator_next;
   grant *creator_prev;
 };
+
+#define SLAB_NAME grant
+#define SLAB_TYPE grant
+#define SLAB_PAGE_SIZE PAGE_SIZE
+#define SLAB_CACHELINE_SIZE 64
+#define SLAB_WHICH_CPU() cpu_state_whoami()
+#include <slab/slab_impl.h>
+#undef SLAB_WHICH_CPU
+#undef SLAB_CACHELINE_SIZE
+#undef SLAB_PAGE_SIZE
+#undef SLAB_TYPE
+#undef SLAB_NAME
 
 static llrb_grant_id *g_grants;
 static uint64_t g_next_grant_id = 1;
@@ -120,7 +134,7 @@ uint64_t cap_verify_ring_locked(struct ring *ring, uint64_t off, uint64_t len,
 static grant *grant_new(struct process *creator, grant *parent, uint8_t type,
                         bool wildcard) {
   if (parent != nullptr && parent->depth >= KCAP_MAX_DEPTH) return nullptr;
-  grant *g = calloc(1, sizeof(*g));
+  grant *g = slab_grant_zalloc(sizeof(*g));
   if (g == nullptr) return nullptr;
   g->id = g_next_grant_id++;
   if (g->id == 0) fatal("capability: grant id exhausted");
@@ -155,7 +169,7 @@ static void grant_delete_leaf(grant *g) {
   grant *removed = nullptr;
   asserts(llrb_grant_id_remove(g_grants, &g->id, &removed) && removed == g,
           "capability: grant index removal failed");
-  free(g);
+  slab_grant_free(g);
 }
 
 static bool can_revoke(struct process *caller, const grant *target) {

@@ -63,7 +63,7 @@ void allocator_init(uint64_t n_mmap, const struct efi_memory_descriptor *mmap) {
   g_allocator = ba;
 }
 
-static void *malloc_unlocked(size_t size) {
+void *malloc_unlocked(size_t size) {
   allocator_require();
   if (size == 0) {
     return nullptr;
@@ -77,7 +77,7 @@ static void *malloc_unlocked(size_t size) {
   return p;
 }
 
-static void free_unlocked(void *ptr) {
+void free_unlocked(void *ptr) {
   allocator_require();
   if (ptr == nullptr) {
     return;

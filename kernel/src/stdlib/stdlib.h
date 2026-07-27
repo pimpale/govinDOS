@@ -6,6 +6,7 @@
 
 [[nodiscard]] void *malloc(size_t size);
 [[nodiscard]] void *calloc(size_t nmemb, size_t size);
+[[nodiscard]] void *aligned_alloc(size_t alignment, size_t size);
 [[nodiscard]] void *realloc(void *ptr, size_t size);
 void free(void *ptr);
 

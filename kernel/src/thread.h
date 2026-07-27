@@ -175,6 +175,18 @@ struct process {
   struct grant *created_grants;
 };
 
+#define SLAB_NAME thread
+#define SLAB_TYPE thread
+#include <slab/slab.h>
+#undef SLAB_TYPE
+#undef SLAB_NAME
+
+#define SLAB_NAME process
+#define SLAB_TYPE process
+#include <slab/slab.h>
+#undef SLAB_TYPE
+#undef SLAB_NAME
+
 // Spawn a user thread that starts at `entry` in ring 3 with `user_stack_pointer`
 // with `arg` in its first argument register (rcx under the Win64-flavored
 // ABI, so `entry` can be a plain `void f(uint64_t)`). Caller must have

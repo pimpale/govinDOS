@@ -36,6 +36,20 @@ void *calloc(size_t nmemb, size_t size) {
   return p;
 }
 
+void *aligned_alloc(size_t alignment, size_t size) {
+  // C requires size to be an exact multiple of alignment. This allocator can
+  // support every power-of-two alignment at least as strict as a pointer:
+  // asking the buddy for max(size, alignment) yields a power-of-two block at
+  // least that large, aligned to its own size.
+  if (alignment < alignof(void *) ||
+      (alignment & (alignment - 1)) != 0 || size == 0 ||
+      size % alignment != 0) {
+    return nullptr;
+  }
+
+  return malloc(max(size, alignment));
+}
+
 void *realloc(void *ptr, size_t size) {
   if (ptr == nullptr) {
     return malloc(size);

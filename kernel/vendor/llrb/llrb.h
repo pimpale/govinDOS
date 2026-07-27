@@ -8,8 +8,8 @@
 //
 // This declares llrb_pid_process and its operations. Keys and values are
 // copied into independently allocated nodes. The implementation
-// instantiation additionally defines LLRB_COMPARE and may override
-// LLRB_MALLOC / LLRB_FREE; see llrb_impl.h.
+// instantiation additionally defines LLRB_COMPARE and may override the
+// tree/node allocation hooks; see llrb_impl.h.
 //
 // LLRB_NAME must be a single identifier usable in token pasting. LLRB_KEY
 // and LLRB_VALUE must be complete types. This file intentionally has no
@@ -38,13 +38,24 @@
 typedef struct LLRB_T LLRB_T;
 typedef struct LLRB_NODE_T LLRB_NODE_T;
 
+// Publicly complete so an allocator template can be instantiated for the
+// generated node type. Callers must still treat these fields as private; the
+// only supported direct-node operations are _extract and _insert_node.
+struct LLRB_NODE_T {
+  LLRB_KEY key;
+  LLRB_VALUE value;
+  LLRB_NODE_T *left;
+  LLRB_NODE_T *right;
+  LLRB_NODE_T *parent;
+  bool red;
+};
+
 // Iterators are allocation-free. Mutating the tree invalidates all active
 // iterators; otherwise each call advances in ascending key order.
 typedef struct LLRB_ITER_T {
   const LLRB_NODE_T *node;
 } LLRB_ITER_T;
 
-// The allocation hooks are used for both the small tree object and nodes.
 // False means allocation failure. _insert also returns false for a duplicate
 // key and leaves the existing value unchanged.
 bool LLRB_FN(_new)(LLRB_T **tree);

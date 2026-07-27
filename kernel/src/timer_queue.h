@@ -22,4 +22,10 @@ struct tdeadline_key {
 #undef LLRB_KEY
 #undef LLRB_NAME
 
+#define SLAB_NAME llrb_tdeadline_node
+#define SLAB_TYPE llrb_tdeadline_node
+#include <slab/slab.h>
+#undef SLAB_TYPE
+#undef SLAB_NAME
+
 #endif // timer_queue_h_INCLUDED

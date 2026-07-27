@@ -8,13 +8,18 @@
 //   #include <llrb/llrb_impl.h>
 //
 // LLRB_COMPARE receives pointers to keys and returns negative, zero, or
-// positive. An instantiation may also define:
+// positive. The declaration header for this LLRB_NAME must already have been
+// included. An instantiation may also define:
 //
 //   #define LLRB_MALLOC(size) my_slab_malloc(size)
 //   #define LLRB_FREE(ptr) my_slab_free(ptr)
+//   #define LLRB_TREE_MALLOC(size) my_tree_malloc(size)
+//   #define LLRB_TREE_FREE(ptr) my_tree_free(ptr)
+//   #define LLRB_NODE_MALLOC(size) my_node_malloc(size)
+//   #define LLRB_NODE_FREE(ptr) my_node_free(ptr)
 //
-// Both hooks default to the kernel's malloc/free and cover the tree object as
-// well as every node. This keeps allocator policy at the instantiation site.
+// The split hooks default through LLRB_MALLOC/LLRB_FREE, which in turn default
+// to standard malloc/free.
 
 #ifndef LLRB_NAME
 #error "LLRB_NAME must be defined before including llrb_impl.h"
@@ -33,8 +38,6 @@
 #include <stddef.h>
 #include <stdlib.h>
 
-#include <llrb/llrb.h>
-
 #ifndef LLRB_MALLOC
 #define LLRB_MALLOC(size) malloc(size)
 #define LLRB_DEFAULT_MALLOC
@@ -42,6 +45,22 @@
 #ifndef LLRB_FREE
 #define LLRB_FREE(ptr) free(ptr)
 #define LLRB_DEFAULT_FREE
+#endif
+#ifndef LLRB_TREE_MALLOC
+#define LLRB_TREE_MALLOC(size) LLRB_MALLOC(size)
+#define LLRB_DEFAULT_TREE_MALLOC
+#endif
+#ifndef LLRB_TREE_FREE
+#define LLRB_TREE_FREE(ptr) LLRB_FREE(ptr)
+#define LLRB_DEFAULT_TREE_FREE
+#endif
+#ifndef LLRB_NODE_MALLOC
+#define LLRB_NODE_MALLOC(size) LLRB_MALLOC(size)
+#define LLRB_DEFAULT_NODE_MALLOC
+#endif
+#ifndef LLRB_NODE_FREE
+#define LLRB_NODE_FREE(ptr) LLRB_FREE(ptr)
+#define LLRB_DEFAULT_NODE_FREE
 #endif
 
 #define LLRB_PASTE_(a, b) a##b
@@ -51,15 +70,6 @@
 #define LLRB_ITER_T LLRB_PASTE(LLRB_T, _iter)
 #define LLRB_FN(suffix) LLRB_PASTE(LLRB_T, suffix)
 #define LLRB_LOCAL(suffix) LLRB_PASTE(LLRB_FN(_impl_), suffix)
-
-struct LLRB_NODE_T {
-  LLRB_KEY key;
-  LLRB_VALUE value;
-  LLRB_NODE_T *left;
-  LLRB_NODE_T *right;
-  LLRB_NODE_T *parent;
-  bool red;
-};
 
 struct LLRB_T {
   LLRB_NODE_T *root;
@@ -113,14 +123,15 @@ static LLRB_NODE_T *LLRB_LOCAL(fix_up)(LLRB_NODE_T *h) {
 }
 
 // `spare`, when non-NULL, supplies the new node's storage instead of
-// LLRB_MALLOC — the _insert_node path, which therefore cannot fail with
+// LLRB_NODE_MALLOC — the _insert_node path, which therefore cannot fail with
 // OOM (result -1).
 static LLRB_NODE_T *LLRB_LOCAL(insert)(LLRB_NODE_T *h, LLRB_NODE_T *parent,
                                        const LLRB_KEY *key,
                                        const LLRB_VALUE *value,
                                        LLRB_NODE_T *spare, int *result) {
   if (h == NULL) {
-    LLRB_NODE_T *n = spare != NULL ? spare : LLRB_MALLOC(sizeof(*n));
+    LLRB_NODE_T *n =
+        spare != NULL ? spare : LLRB_NODE_MALLOC(sizeof(*n));
     if (n == NULL) {
       *result = -1;
       return NULL;
@@ -198,7 +209,7 @@ static LLRB_NODE_T *LLRB_LOCAL(delete_min)(LLRB_NODE_T *h,
     if (keep != NULL)
       *keep = h;
     else
-      LLRB_FREE(h);
+      LLRB_NODE_FREE(h);
     return NULL;
   }
   if (!LLRB_LOCAL(is_red)(h->left) &&
@@ -226,7 +237,7 @@ static LLRB_NODE_T *LLRB_LOCAL(remove)(LLRB_NODE_T *h, const LLRB_KEY *key,
       if (keep != NULL)
         *keep = h;
       else
-        LLRB_FREE(h);
+        LLRB_NODE_FREE(h);
       return NULL;
     }
     if (!LLRB_LOCAL(is_red)(h->right) &&
@@ -251,11 +262,11 @@ static void LLRB_LOCAL(clear)(LLRB_NODE_T *h) {
     return;
   LLRB_LOCAL(clear)(h->left);
   LLRB_LOCAL(clear)(h->right);
-  LLRB_FREE(h);
+  LLRB_NODE_FREE(h);
 }
 
 bool LLRB_FN(_new)(LLRB_T **tree) {
-  LLRB_T *t = LLRB_MALLOC(sizeof(*t));
+  LLRB_T *t = LLRB_TREE_MALLOC(sizeof(*t));
   if (t == NULL) {
     *tree = NULL;
     return false;
@@ -276,7 +287,7 @@ void LLRB_FN(_delete)(LLRB_T **tree) {
   if (*tree == NULL)
     return;
   LLRB_FN(_clear)(*tree);
-  LLRB_FREE(*tree);
+  LLRB_TREE_FREE(*tree);
   *tree = NULL;
 }
 
@@ -442,6 +453,22 @@ bool LLRB_FN(_valid)(const LLRB_T *tree) {
   return v.valid && v.count == tree->len;
 }
 
+#ifdef LLRB_DEFAULT_NODE_FREE
+#undef LLRB_NODE_FREE
+#undef LLRB_DEFAULT_NODE_FREE
+#endif
+#ifdef LLRB_DEFAULT_NODE_MALLOC
+#undef LLRB_NODE_MALLOC
+#undef LLRB_DEFAULT_NODE_MALLOC
+#endif
+#ifdef LLRB_DEFAULT_TREE_FREE
+#undef LLRB_TREE_FREE
+#undef LLRB_DEFAULT_TREE_FREE
+#endif
+#ifdef LLRB_DEFAULT_TREE_MALLOC
+#undef LLRB_TREE_MALLOC
+#undef LLRB_DEFAULT_TREE_MALLOC
+#endif
 #ifdef LLRB_DEFAULT_FREE
 #undef LLRB_FREE
 #undef LLRB_DEFAULT_FREE

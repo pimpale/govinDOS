@@ -47,7 +47,7 @@ void process_set_init(struct process *p) {
 // ---------------------------------------------------------------------------
 
 struct process *process_create(struct process *parent) {
-  struct process *p = calloc(1, sizeof(*p));
+  struct process *p = slab_process_zalloc(sizeof(*p));
   asserts(p != nullptr, "process: alloc failed");
   p->pid = atomic_fetch_add(&g_next_pid, 1);
   // Same identity layout as every AS (SASOS), but a private tree cloned
@@ -181,7 +181,7 @@ void process_thread_exited(struct thread *t) {
   }
   remove_thread_ref(p, t);
   arch_thread_destroy(t);
-  free(t);
+  slab_thread_free(t);
   uint64_t left = atomic_fetch_sub(&p->nthreads, 1) - 1;
   if (left == 0 && !process_is_dead(p)) {
     // Natural death: the last thread exited. Cascades exactly like a
@@ -259,7 +259,7 @@ static uint64_t reap_step_locked(struct process *target,
     }
     remove_thread_ref(z, t);
     arch_thread_destroy(t);
-    free(t);
+    slab_thread_free(t);
     atomic_fetch_sub(&z->nthreads, 1);
     ntcbs++;
   }
@@ -311,7 +311,7 @@ static uint64_t reap_step_locked(struct process *target,
   umem_reap_finish_locked(z);
   vec_process_ptr_delete(&z->children);
   vec_thread_ptr_delete(&z->threads);
-  free(z);
+  slab_process_free(z);
   return done ? REAP_DONE : REAP_MORE;
 }
 

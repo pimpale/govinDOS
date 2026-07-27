@@ -36,7 +36,7 @@ struct thread *uthread_spawn(struct process *proc, uint64_t entry,
                              struct ublock *completion_block,
                              uint64_t completion_event) {
   asserts(proc != nullptr, "uthread_spawn: needs a user process");
-  struct thread *t = calloc(1, sizeof(*t));
+  struct thread *t = slab_thread_zalloc(sizeof(*t));
   asserts(t != nullptr, "thread: alloc failed");
   t->tid = atomic_fetch_add(&g_next_tid, 1);
   t->proc = proc;

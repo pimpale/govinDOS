@@ -24,6 +24,20 @@
 #undef LLRB_KEY
 #undef LLRB_NAME
 
+#define SLAB_NAME llrb_futex_node
+#define SLAB_TYPE llrb_futex_node
+#include <slab/slab.h>
+#undef SLAB_TYPE
+#undef SLAB_NAME
+
+// The bucket table holds FUTEX_NBUCKETS tree objects; on malloc each would
+// occupy a whole buddy page, so the trees get their own slab.
+#define SLAB_NAME llrb_futex
+#define SLAB_TYPE llrb_futex
+#include <slab/slab.h>
+#undef SLAB_TYPE
+#undef SLAB_NAME
+
 // One-time init (bucket locks + trees). Call before the first user process.
 void futex_init(void);
 

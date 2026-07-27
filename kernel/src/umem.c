@@ -6,6 +6,8 @@
 #include "buddy_allocator/buddy_allocator.h"
 #include "channel.h"
 #include "debug.h"
+#include "hash.h"
+#include "paging.h"
 #include "platform_mem.h"
 #include "process.h"
 #include "spinlock.h"
@@ -34,14 +36,15 @@ void umem_unlock(void) { svclock_unlock(&g_umem); }
 void umem_proc_lock(struct process *p) { svclock_lock(&p->ulock); }
 void umem_proc_unlock(struct process *p) { svclock_unlock(&p->ulock); }
 
-#define UMEM_NSTRIPES 64
+#define UMEM_NSTRIPES_LOG2 6
+#define UMEM_NSTRIPES (1u << UMEM_NSTRIPES_LOG2)
 
 static struct svclock g_stripes[UMEM_NSTRIPES];
 
 uint32_t umem_stripe(uint64_t base) {
-  // Fibonacci hash of the page number; blocks are buddy-aligned, so the
-  // low base bits alone would collide systematically.
-  return (uint32_t)(((base >> 12) * 0x9E3779B97F4A7C15ull) >> 58);
+  // Hash the page number; blocks are buddy-aligned, so the low base bits
+  // alone would collide systematically.
+  return hash_fib(base / PAGE_SIZE, UMEM_NSTRIPES_LOG2);
 }
 
 void umem_stripe_lock(uint32_t idx) { svclock_lock(&g_stripes[idx]); }
@@ -180,7 +183,7 @@ void *umem_alloc(struct process *p, size_t len, paging_flags_t prot) {
   // Mandatory: blocks recycle across processes and users.
   memset(base, 0, bytes);
 
-  ublock *b = calloc(1, sizeof(*b));
+  ublock *b = slab_ublock_zalloc(sizeof(*b));
   asserts(b != nullptr, "umem: ublock alloc failed");
   b->base = (uint64_t)base;
   b->order = order;
@@ -254,7 +257,7 @@ uint64_t umem_map_device_locked(struct process *p, uint64_t base, uint64_t len,
     as_flush(q->as);
   }
 
-  ublock *b = calloc(1, sizeof(*b));
+  ublock *b = slab_ublock_zalloc(sizeof(*b));
   if (b == nullptr) {
     return SYSERR_NOMEM;
   }
@@ -349,7 +352,7 @@ void umem_release_finish(struct umem_release *rel) {
   }
 
   vec_share_edge_delete(&b->sharers);
-  free(b);
+  slab_ublock_free(b);
   rel->b = nullptr;
 }
 

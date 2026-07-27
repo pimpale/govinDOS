@@ -5,6 +5,7 @@
 
 #include "channel.h"
 #include "debug.h"
+#include "hash.h"
 #include "process.h"
 #include "spinlock.h"
 #include "syscall.h"
@@ -26,7 +27,8 @@
 // take it to unlink the caller's view, so check-to-load cannot race a
 // revoke-and-recycle.
 
-#define FUTEX_NBUCKETS 1024
+#define FUTEX_NBUCKETS_LOG2 10
+#define FUTEX_NBUCKETS (1u << FUTEX_NBUCKETS_LOG2)
 
 struct futex_bucket {
   struct spinlock lock;
@@ -39,11 +41,9 @@ static struct futex_bucket g_futex[FUTEX_NBUCKETS];
 static _Atomic uint64_t g_futex_seq = 1;
 
 static struct futex_bucket *bucket_of(uint64_t addr) {
-  // Fibonacci hash of the word address; low bits alone would put every
-  // word of one block in one bucket.
-  uint32_t i =
-      (uint32_t)(((addr & ~3ull) * 0x9E3779B97F4A7C15ull) >> 54);
-  return &g_futex[i];
+  // Hash the word index; low bits alone would put every word of one
+  // block in one bucket.
+  return &g_futex[hash_fib(addr / 4, FUTEX_NBUCKETS_LOG2)];
 }
 
 void futex_init(void) {
