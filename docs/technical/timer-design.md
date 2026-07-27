@@ -32,12 +32,19 @@ TSC factors is the recorded alternative. Absolute deadlines passed to
 Each CPU owns one spinlock-guarded LLRB of deadline entries keyed
 `(absolute deadline, tid)`, value `struct thread *`. Parked threads with
 deadlines are the only entry kind ([futex-design.md](futex-design.md)
-§6): inserted at park, on the CPU the thread parks on, and removed on
-wake or expiry. Arming is therefore always local, and the scheme's
-remote-reprogram IPI is gone — nothing ever arms a deadline on another
-CPU's tree. A wake that beats the deadline leaves a stale entry whose
-`wake_state` CAS fails when it fires; nothing is cancelled, locally or
-remotely.
+§6): inserted at park under the futex bucket, on the CPU the thread
+parks on, and removed by whichever path wins the thread — waker,
+expiry, or reap — before it unblocks. **No entry outlives its wait.**
+Cleanup is always the winner's because a woken thread runs no kernel
+exit code: `uthread_park_blocked` never returns, and a resumed thread
+goes straight to ring 3 from its saved frame
+([futex-design.md](futex-design.md) §6 has the full ordering). Arming
+is always local, and the scheme's remote-reprogram IPI is gone —
+nothing ever arms a deadline on another CPU's tree. A winner on another
+CPU may remove an entry from the arming CPU's tree, but removal never
+makes a tree minimum earlier, so it never reprograms a LAPIC and never
+needs an IPI; a one-shot firing for an already-removed entry finds
+nothing due and rearms harmlessly.
 
 Each CPU's one-shot LAPIC deadline is:
 
@@ -56,9 +63,11 @@ An interrupt processes at most 64 expirations; if more are
 simultaneously due, the still-due tree minimum schedules another
 near-immediate shot, keeping IRQ work bounded independently of how many
 threads are parked. Expiry pops its due entries, drops the timer lock,
-and CASes each thread's `wake_state`; a winner removes the thread's
-futex node by its `wait_key` and unblocks it with `SYSERR_TIMEDOUT`
-(the arbitration is [futex-design.md](futex-design.md) §6's).
+and CASes each thread's `wake_state`; a winner claims the thread — the
+claim is a lifetime pin against reap — removes both its entries, and
+unblocks it with `SYSERR_TIMEDOUT`, or leaves a dead process's thread
+detached for reap (the arbitration is
+[futex-design.md](futex-design.md) §6's).
 
 ## What the deletion removes
 
@@ -70,8 +79,9 @@ the waiter-following migration TODO. That is most of
 `kernel/src/schemes/timer.c` (~350 lines), the `kring_timer.h` ABI, the
 timer helpers in `kring.c`, and their tests. Every one of those
 mechanisms existed to deliver a timer expiry through a ring as an event;
-with deadlines native to the wait call, no consumer needs a timer event
-at all.
+with deadlines native to the wait call, no *synchronous* consumer needs
+a timer event — every timed wait is its own deadline. Asynchronous
+consumers remain, and are userspace's (below).
 
 ## Userspace
 
@@ -79,5 +89,13 @@ at all.
 `clock_nanosleep`, and every timed wait are `SYS_FUTEX_WAIT` with a
 deadline — for pure sleeps, on a private word nothing wakes
 ([futex-design.md](futex-design.md) §8). The waitset helper threads that
-converted timer events into wakes are gone with the events. Civil and
-realtime clock policy remains a future userspace service.
+converted timer events into wakes are gone with the events.
+
+Asynchronous POSIX timers — `timer_create`, `alarm`, interval timers,
+`SIGEV_THREAD`/`SIGEV_SIGNAL` delivery — need a consumer that is not a
+blocked thread. The recipe is one lazy libc timer-manager thread per
+process, spawned on first use, multiplexing every armed timer into
+successive `SYS_FUTEX_WAIT` deadlines. Civil and realtime clock policy
+remains a future userspace service; until a kernel realtime clock
+exists, an absolute `CLOCK_REALTIME` wait converted to a monotonic
+deadline does not track realtime clock steps made while it sleeps.

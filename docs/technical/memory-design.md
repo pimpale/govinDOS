@@ -228,11 +228,27 @@ refcount for page-table pages; if that lands, that single field returns.)
 | `SYS_MEM_ALLOC(order, prot)` | buddy-alloc 2^order pages, **zero them**, `as_flag(p->as, …, prot\|PAGE_U)` + flush, return base |
 | `SYS_MEM_FLAG(base, len, prot)` | sub-range re-flag within a block the caller has a view of; applied to the **caller's AS only** |
 | `SYS_MEM_SHARE(base, pid, prot)` | owner only: map whole block `prot\|PAGE_U` into target's AS, add to `sharers` |
-| `SYS_MEM_UNSHARE(base[, pid])` | sharer drops its view / owner revokes one sharer: re-flag pristine in that AS + flush |
+| `SYS_MEM_DROPSHARE(base)` | sharer drops its own view: re-flag pristine in its AS + flush |
+| `SYS_MEM_UNSHARE(base, pid)` | owner only: revoke one sharer's view — same re-flag + flush, the per-edge inverse of `SYS_MEM_SHARE` |
 | `SYS_MEM_FREE(base)` | owner only: full teardown (below) |
 
 Notes:
 
+- **Two unshare verbs, split by actor (2026-07-26).** `DROPSHARE` is the
+  sharer's own drop and keeps syscall slot 9's existing semantics under the
+  clearer name; `UNSHARE` takes a mandatory pid and is the owner's per-edge
+  revoke, making `SHARE`/`UNSHARE` a symmetric owner pair (both name a peer).
+  The revoke verb is what lets `SYS_MEM_FREE` be a single transaction that
+  fails while attached (§5): `VM_MOVE` transfers ownership but never removes
+  a third party's edge, so without owner-side revoke a hung sharer holds
+  free hostage.
+- **Page-table pages must die like user frames (2026-07-26, required by
+  futex-design §3).** `as_flag`'s overwrite and merge paths currently
+  `free_table` during mutation, so a concurrent lock-free walker can chase a
+  freed-and-recycled table page. Freed sub-trees instead join the post-flush
+  release batch (`struct umem_release`), so no page-table page is recycled
+  before the shootdown completes. The futex wait path's view check depends on
+  this; until it lands, that path holds `p->ulock` instead.
 - **Flags are per-view.** A sharer restricting its view to `PAGE_R` or punching
   a guard sub-range (`prot == 0`) affects only its own tree. No shared flag
   state to reconcile, and each AS's fragmentation is collapsed independently

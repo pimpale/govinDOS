@@ -19,7 +19,8 @@ numbers, reused in place, plus `SYSERR_TIMEDOUT` and `SYSERR_INTR`),
 `kernel/src/channel.c` (waiter slots move from `ublock` to `struct
 ring`; `classify_side`, `channel_block_wait`, `channel_block_doorbell`
 delete), `kernel/src/umem.c` (`freeing` and the resumable free delete;
-`VM_UNSHARE` grows its `pid` form), `kernel/src/process.c` (reap narrows
+`VM_UNSHARE` becomes the owner-revoke verb `(base, pid)`, the sharer's
+drop renaming to `VM_DROPSHARE`), `kernel/src/process.c` (reap narrows
 to process and thread state), `kernel/src/thread.h` (park state,
 `park_control`, `parked_on`), `kernel/src/schemes/timer.c` (the scheme
 surface deletes — [timer-design.md](timer-design.md) — leaving the
@@ -451,13 +452,16 @@ owner asked, and an owner tearing down a channel knows what it is
 tearing down:
 
 ```
-enumerate sharers -> VM_UNSHARE(base, pid) each
-                  -> unpark the peers named in the protocol
-                  -> VM_FREE(base)
+write a close sentinel -> unpark the peers named in the protocol
+                       -> peers VM_DROPSHARE — their ack
+                       -> VM_FREE(base) once the sharers drain
+                          (VM_UNSHARE(base, pid) coerces a peer
+                           that never acks)
 ```
 
-`SYS_VM_UNSHARE` grows the optional `pid` argument that
-[memory-design.md](memory-design.md) §5 already specifies. `SYS_VM_FREE`
+`SYS_VM_UNSHARE(base, pid)` is the owner's per-edge revoke (the
+sharer's own drop renames to `SYS_VM_DROPSHARE` —
+[memory-design.md](memory-design.md) §5). `SYS_VM_FREE`
 becomes a single bounded transaction that fails while anything remains
 attached rather than driving removal itself, and `freeing` and the
 resumable free delete.
@@ -465,10 +469,10 @@ resumable free delete.
 **Difference from futex:** the owner wakes peers by tid, not by address.
 It must therefore know their tids and hints, which means the protocol
 carries them — which it already does, since that is how the queue works.
-An owner that has revoked a sharer's view can no longer *read* that
-sharer's queue nodes, so it must have captured the tids beforehand, or
-unpark before unsharing. Ordering the loop as *unpark, then unshare, then
-free* is the natural fix and should be the documented recipe.
+The recipe above unparks before any revoke for the same reason futex's
+does — a revoked peer can neither be read (its queue nodes) nor safely
+recheck anything — and `VM_UNSHARE` is only the coercion path for a
+peer that never acks.
 
 **Disorderly teardown is the parent's job**, with three populations
 handled by three parties: the dead process's own threads (culled at next
@@ -503,14 +507,19 @@ CPU owns a deadline LLRB and programs its LAPIC one-shot for
 entries keyed `(absolute deadline, tid)` with value `struct thread *`,
 inserted at park and removed on wake.
 
-The lock inversion — park wants to arm while holding its endpoint lock,
-expiry holds the timer lock and wants to unlink — is resolved by CAS
-arbitration rather than lock ordering, exactly as in §3.4: arm the
-deadline before taking any list lock; expiry pops its due entries, drops
-the timer lock, then CASes `park_state`; the winner unlinks and
-unblocks. A wake that beats its timer leaves a stale deadline entry
-whose CAS fails harmlessly, so nothing needs cancellation and no path
-holds two locks.
+The ordering and arbitration are [futex-design.md §6](futex-design.md)'s,
+adapted to the endpoint list: everything — the link, the deadline entry
+(timer lock nested inside the endpoint lock), and the published park
+state — exists before the endpoint lock drops, and the thread then
+parks unconditionally (a mismatch exits earlier with nothing armed and
+nothing linked). Whichever path wins the park — unparker, expiry, or
+reap — claims the thread, and the claim is a reap-visible lifetime pin:
+the winner removes the node and the deadline entry before unblocking
+(or, for a dead process's thread, leaves the TCB to reap), and reap
+frees only threads it claimed itself; a woken thread runs no kernel
+exit code, so cleanup is always the winner's. No entry outlives its park: nothing stale ever fires, a
+re-park cannot receive an earlier park's timeout, and reap never meets
+a freed TCB.
 
 One simplification over futex: because a park has at most one list to be
 unlinked from, and the back-pointer is in the TCB, expiry does not need
@@ -546,12 +555,14 @@ Adding: park and unpark including the descriptor read (~70), the
 `park_state` machine, deadline arming, expiry, and CAS arbitration
 (~120), the endpoint waiter list and its relocation into `struct ring`
 (~50), a tid→TCB lookup (~25), `park_control` registration and reads
-(~15), unlink at thread reap (~10), `VM_UNSHARE`'s `pid` form (~20),
+(~15), unlink at thread reap (~10), the `VM_UNSHARE` owner-revoke verb
+and `VM_DROPSHARE` rename (~20),
 `SYS_SET_ROBUST_LIST` registration (~10) — **~320.**
 
-**Net ≈ −30 in the kernel**, against futex's ≈ −55 (which now includes
-its requeue syscall). Roughly 25 lines worse, which is inside the error
-bars of both estimates and should not decide anything.
+**Net ≈ −30 in the kernel**, against futex's ≈ 0 (which includes its
+requeue syscall, the `MOVING` arbitration, and the template relink
+ops). Nominally ~30 lines better — inside the error bars of both
+estimates, and it should not decide anything.
 
 **Userspace grows by ~300 lines** that futex does not need: the wait-queue
 library of §8. So the honest summary is that park **does not reduce total
@@ -598,10 +609,10 @@ mutex's without waking them — what keeps `pthread_cond_broadcast` from
 stampeding the mutex — is a list splice between two structures this
 library already owns: zero syscalls and zero kernel involvement. Under
 futex the same operation is `FUTEX_CMP_REQUEUE`, which
-[futex-design.md §2](futex-design.md) provides as a third syscall — ~25
-lines of kernel work and the first path in the system to hold two bucket
-locks. Owning the queue costs the library its complexity and refunds
-some of it here.
+[futex-design.md §2](futex-design.md) provides as a third syscall — ~80
+lines including its `MOVING` arbitration and template relink ops, and
+the first path in the system to hold two bucket locks. Owning the queue costs the library its
+complexity and refunds some of it here.
 
 **Rings.** One loop for both kinds of far end:
 
@@ -711,7 +722,8 @@ opposite direction. This is a genuine and one-sided cost.
    pops one. Add the descriptor's `arm_base`/`arm_expected` and rewrite
    `kring.c` to one loop for both far ends.
 3. **Teardown** (§5): delete `freeing`, the resumable free, and the
-   waiter-drain steps of reap; add `VM_UNSHARE(base, pid)`; narrow
+   waiter-drain steps of reap; add owner-revoke `VM_UNSHARE(base, pid)`
+   (the sharer drop renames to `VM_DROPSHARE`); narrow
    `SYS_PROC_REAP` and make the parent claim blocks with `VM_MOVE`.
    Tests: a client parked on a server's ring across the server's death
    and across an explicit revoke; `VM_FREE` refusing while a sharer
@@ -745,7 +757,7 @@ Where the two designs actually differ, stated without hedging:
 | requeue (condvar → mutex) | `FUTEX_CMP_REQUEUE`, one syscall | userspace list splice, no syscall |
 | raw `futex(2)` emulation | direct | needs a userspace parking lot |
 | userspace burden | textbook futex primitives | a lock-free wait-queue library |
-| kernel LoC delta | ≈ −55 | ≈ −30 |
+| kernel LoC delta | ≈ 0 | ≈ −30 |
 | `EINTR` / `pthread_cancel` | needs a second thread-directed mechanism | the same mechanism, one flag |
 | priority inheritance later | needs ownership encoded in the word | owner tid already passed |
 
@@ -769,7 +781,7 @@ Three observations that carry the most weight:
    driver (§4), never a user thread that can re-enter. Where the queue
    lives does decide **requeue**: moving waiters from a condvar to a
    mutex without waking them is a userspace list splice here (§8), and
-   `FUTEX_CMP_REQUEUE` in [futex-design.md §2](futex-design.md) — ~25
+   `FUTEX_CMP_REQUEUE` in [futex-design.md §2](futex-design.md) — ~80
    lines of kernel work and the first path to hold two bucket locks.
    Owning the queue is the cost that pays for this.
 

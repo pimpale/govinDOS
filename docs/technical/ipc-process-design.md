@@ -43,7 +43,7 @@ the roles; see [boot-init-design.md](boot-init-design.md)).
   which time-per-request can participate. The kernel does not arbitrate.
 - **Sharing maps immediately; consent is keeping.** `SYS_VM_SHARE` to a
   user pid maps the block into the target on the spot and posts a
-  notification (§2, scheme `-1`); rejection is one `SYS_VM_UNSHARE` —
+  notification (§2, scheme `-1`); rejection is one `SYS_VM_DROPSHARE` —
   the same bounded work an accept handshake would cost, with no pending
   state to track. The accepted price is the planting caveat (§1): the
   mapping and its bookkeeping exist until the target unshares it. Resource
@@ -103,10 +103,13 @@ and memory-design.md §5.)
 ### Syscalls
 
 `SYS_VM_ALLOC`, `SYS_VM_FREE`, `SYS_VM_SIZE`, `SYS_VM_PROTECT`,
-`SYS_VM_UNSHARE` are unchanged from memory-design.md. (Renamed from
+`SYS_VM_DROPSHARE` are unchanged from memory-design.md. (Renamed from
 `VM_MAP`/`VM_UNMAP`
 2026-07-11: in a SASOS everything is already mapped in principle —
-these verbs create and destroy blocks, they don't position anything.)
+these verbs create and destroy blocks, they don't position anything.
+2026-07-26: the sharer-side drop renamed from `VM_UNSHARE` to
+`VM_DROPSHARE`; `SYS_VM_UNSHARE(base, pid)` is now the owner's per-edge
+revoke — memory-design §5.)
 
 - `SYS_VM_SHARE(base, target, prot) -> 0` — `target` is signed.
   - **User pid (> 0): maps immediately.** The whole owned block at
@@ -192,17 +195,22 @@ reflected-fault waiters — rather than driving their removal itself. Detaching
 them is userspace's job, done with bounded per-item verbs before the free:
 
 ```
-enumerate sharers -> VM_UNSHARE(base, pid) each
-                  -> FUTEX_WAKE the protocol words
-                  -> VM_FREE(base)
+write a close sentinel into the protocol words
+    -> FUTEX_WAKE them
+    -> each peer observes the sentinel and VM_DROPSHAREs — the ack
+    -> VM_FREE(base) once the sharers drain
+       (VM_UNSHARE(base, pid) coerces a peer that never acks)
 ```
 
 The kernel never wakes a parked thread because its block was revoked
 ([futex-design.md](futex-design.md) §5). An owner tearing down a channel knows
 which words its peers park on — the protocol names them, since the kernel no
-longer infers roles — so it wakes them itself after revoking their views, and
-their re-park fails because the view is gone. A party that wants to survive an
-*uncooperative* peer parks with a deadline.
+longer infers roles — so it wakes them itself, **before** any revocation: a
+peer woken after its view is gone faults fatally on its recheck. Revocation is
+reserved for the peer that never acks. A party that wants to survive an
+*uncooperative* peer parks with a deadline, and on timeout revalidates by
+re-entering the wait (`SYSERR_INVAL` is the revocation signal) rather than
+touching the word.
 
 `SYSERR_AGAIN` stays reserved in the ABI and libc `free()` keeps its retry
 loop, so a future continuation can be added without touching callers. No path
@@ -220,7 +228,7 @@ documents named in memory-design §5.
 ```
 server:  VM_ALLOC -> ch; VM_SHARE(ch, -1)      // share channel, once
          BLOCK_WAIT on it; EV_SHARE {pid, base|order} arrives (mapped)
-         validate size/peer — VM_UNSHARE if unwanted —
+         validate size/peer — VM_DROPSHARE if unwanted —
          else ack CQE in the new channel; DOORBELL(base)
 client:  VM_ALLOC -> base; write ring header; VM_SHARE(base, server_pid)
          BLOCK_WAIT(&sh->cq_tail, seen) until the server's ack lands
@@ -319,7 +327,7 @@ cannot overflow by construction: completions are 1:1 with consumed SQEs
 
 One per process (`SYSERR_EXIST` on a second). Where incoming shares
 announce themselves. No commands — like `-3`, a pure event channel;
-rejection is `SYS_VM_UNSHARE`, an
+rejection is `SYS_VM_DROPSHARE`, an
 ordinary syscall, not a scheme op.
 
 | CQE | fields | when |
