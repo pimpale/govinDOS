@@ -1,7 +1,9 @@
 # IOMMU design: required DMA isolation for userspace drivers
 
 Status: **planned 2026-07-12, revised for the `pcid`/driver authority split
-2026-07-12; `iommu=required` is the only initial mode.**
+2026-07-12; `iommu=required` is the only initial mode. The block-side
+mapping index and parent-driven teardown amendments from
+[enumeration-design.md](enumeration-design.md) are planned.**
 Companion to [memory-design.md](memory-design.md),
 [ipc-process-design.md](ipc-process-design.md), and
 [irq-design.md](irq-design.md). PCI ownership and device delegation are
@@ -66,25 +68,21 @@ pinning, or device-assignment model below.
   ECAM/configuration, identifies devices, grants BAR access by sharing
   device-backed ublocks, programs MSI/MSI-X, enables bus mastering only
   after driver setup, and resets/disables a dead driver's device before
-  asking the kernel to reap that driver. It does not create domains, map
+  running enumeration-driven teardown and `SYS_PROC_DESTROY`. It does not create domains, map
   routine DMA buffers, or sit on the I/O data path.
 - **Whole owned ublocks are the v1 DMA-grant unit.** A domain may map only a
   block owned by the ring's process, at the block's identity IOVA. No raw
   physical ranges, shared-in blocks, subranges, client zero-copy, or MMIO
   may be DMA-mapped. NVMe initially uses driver-owned bounce buffers.
 - **A mapped block is pinned.** It cannot be freed, moved, returned to the
-  buddy, or reclaimed by reap until its IOMMU PTEs are gone, the IOTLB has
+  buddy, or reclaimed by parent teardown until its IOMMU PTEs are gone, the IOTLB has
   been invalidated, and the pin has been released. CPU mapping lifetime and
   DMA mapping lifetime cannot disagree.
-  - **TODO — pin enumeration.** `SYS_VM_FREE` refuses a pinned block and
-    does not drive the unmap itself ([memory-design.md](memory-design.md)
-    §5): userspace detaches first, then frees. That requires a way to ask
-    which domains hold pins on a block, and for a zombie's blocks, which
-    pins the parent must clear before it can reclaim the memory. A
-    resumable read (cursor, buffer, length) on the iommu ring or as a
-    `SYS_VM_*` query; not yet designed. Without it a pinned block reports
-    only an opaque `SYSERR_EXIST`, and a driver that dies holding a pin
-    can be diagnosed but not cleaned up systematically.
+  - **Pin enumeration.** `SYS_VM_FREE` refuses a mapped block and does
+    not drive the unmap itself ([memory-design.md](memory-design.md)
+    §5). `SYS_VM_DMA_MAPS` enumerates the block's domain ids and
+    `SYS_VM_DMA_REVOKE` removes one mapping edge, including IOTLB
+    invalidation ([enumeration-design.md](enumeration-design.md) §6).
 - **All kernel-channel commands stay bounded.** One map or unmap SQE
   installs or removes every leaf of one block in a single invocation. This
   is bounded without a resumable cursor because block page counts are
@@ -116,7 +114,8 @@ pinning, or device-assignment model below.
   events on the owning driver's IOMMU ring. The domain remains installed, so
   the offending device is still confined. The driver may quiesce and tear
   down voluntarily; after driver death, `pcid` disables bus mastering/resets
-  the function and parent-driven reap removes the domain incrementally.
+  the function and parent-driven teardown removes its mappings and
+  IOMMU-ring endpoint.
 
 ## 1. Goals and non-goals
 
@@ -125,7 +124,7 @@ pinning, or device-assignment model below.
 - Prevent a PCI bus master assigned to one userspace driver from reading or
   writing kernel memory, another process's memory, or ungranted blocks of
   its own process.
-- Make device assignment, DMA mapping, driver death, and process reaping
+- Make device assignment, DMA mapping, driver death, and process destruction
   compose with the existing ublock and process-tree lifetime rules.
 - Let drivers control their DMA address spaces without exposing remapping
   tables or IOMMU registers to userspace.
@@ -291,12 +290,12 @@ consume unlimited kernel memory:
 Exhaustion returns `SYSERR_NOMEM`. These are implementation limits, not
 ABI promises.
 
-## 5. Direct driver control and the future authorization hook
+## 5. Direct driver control and capability authorization
 
-The current kernel has no general capability objects, and the IOMMU is not a
-reason to block on designing them. There is no IOMMU-root scheme, PID
-appointment, credential check, privileged-process flag, or global manager
-endpoint in v1.
+`KIOMMU_DEVICE_ATTACH` presents a live
+`GRANT_IOMMU_DEV {requester}` token from the ring block. `pcid` receives
+the wildcard root from init and subgrants exact requester tokens to
+drivers; numeric requester ids are not attach authority.
 
 Scheme `-6` may be created once per process. The ring owner is implicitly
 the owner of every domain created through that ring; no command accepts a
@@ -304,36 +303,23 @@ target PID. A process may map only exact ublocks it owns. Domains and device
 claims are scoped to the endpoint internally, so a cookie supplied on one
 ring cannot name or mutate an object created through another ring.
 
-A process may claim any currently unassigned requester ID. The kernel
-enforces exclusive claims and hardware coverage but deliberately applies no
-device policy in v1. Claiming another driver's intended device is denial of
-service, not a memory-isolation bypass: the claimant can map only its own
-blocks into the resulting domain. Recovery is the ordinary process
-mechanism: `SYS_PROC_KILL` on the claimant (subtree-scoped, so possibly
-escalated to init) and its reap detach the contexts and return the
-requester IDs to the unclaimed pool. The kernel should report the claiming
-PID in serial diagnostics so a squatted requester can be identified. V1 accepts only PCI endpoint functions the
-backend can resolve directly; bridge assignment, requester aliases, and
-multi-function/IOMMU groups remain unsupported rather than being guessed.
+A process may attach only the requester named by a verified token. The
+kernel also enforces exclusive attachment and hardware coverage. V1
+accepts only PCI endpoint functions the backend can resolve directly;
+bridge assignment, requester aliases, and multi-function/IOMMU groups
+remain unsupported rather than being guessed.
 
 Keep authorization isolated in one function, conceptually
-`iommu_authorize_attach(process, requester)`. It returns true for every
-well-formed unclaimed requester in v1. When pure capabilities land, the SQE's
-requester field becomes a local device/group-capability handle, that function
-resolves it to the hidden requester set, and the remaining attach path is
-unchanged. This is a planned replacement point, not an implementation
-prerequisite or a second temporary security framework.
+`iommu_authorize_attach(process, token)`. It verifies the token,
+extracts the hidden requester set, and then enters the unchanged
+exclusive-attach path.
 
-The control ring may be destroyed voluntarily only after all domains,
-devices, mappings, and pins have been removed. A live endpoint with
-resources makes block free return `SYSERR_EXIST`.
-
-Process death is different: the ring and domains remain on the zombie, with
-all mapped blocks pinned, until its parent reaps it. The first IOMMU reap
-steps remove device contexts and complete their invalidations; later bounded
-steps remove mapping leaves and pins, destroy domains, and finally allow the
-control block and ordinary ublocks to be reclaimed. No device can reach
-recycled memory during that sequence.
+Destroying the control-ring block always invokes the endpoint destroy
+hook. It force-detaches devices, completes invalidations, removes
+mappings, and destroys domains, bounded by the fixed `IOMMU_MAX_*`
+limits. Process death leaves the ring and domains on the zombie until
+its parent frees that ring block through the same path. No device can
+reach recycled memory during the sequence.
 
 ## 6. Driver ring ABI
 
@@ -422,10 +408,11 @@ gets the order wrong: the absent context blocks later DMA, though the
 device may fault or wedge.
 
 On unexpected driver death the parent follows the same hardware order as
-far as possible, then calls `SYS_PROC_REAP`. The reaper performs
-`DEVICE_DETACH`, unmap, and domain destruction on behalf of the dead process
-in bounded steps; no userspace thread needs to survive to clean up the
-IOMMU objects.
+far as possible, then uses the enumeration/coercion API from
+[enumeration-design.md](enumeration-design.md): revoke each block-side
+mapping, free the dead driver's IOMMU-ring block (whose endpoint destroy
+force-detaches and destroys its remaining domains), and finally call
+`SYS_PROC_DESTROY`. No driver thread needs to survive for cleanup.
 
 ## 7. Mapping state and bounded work
 
@@ -465,11 +452,13 @@ make prior translations an unbounded memory authority.
 
 ## 8. Ublock and process-lifetime integration
 
-Add DMA-pin state to `struct ublock`. The exact representation may be a
-count or an intrusive list of mapping references; v1 needs at least a count
-plus the domain mapping records that identify who owns each pin.
+As amended by [enumeration-design.md](enumeration-design.md), each
+ublock owns a domain-id-keyed mapping-edge tree rather than a bare
+`dma_pins` count. That tree both retains the block and tells a reaper
+which bounded `SYS_VM_DMA_REVOKE(base, domain_id)` calls can remove the
+retention.
 
-Rules while `dma_pins != 0`:
+Rules while the mapping tree is non-empty:
 
 - `SYS_VM_FREE` returns `SYSERR_EXIST`.
 - `SYS_VM_MOVE` returns `SYSERR_EXIST`; identity IOVA must not silently
@@ -479,15 +468,16 @@ Rules while `dma_pins != 0`:
 - `SYS_VM_SHARE` may still create CPU views, but it grants no DMA authority.
 - driver death leaves the block on the zombie and keeps all pins/mappings;
   there is no use-after-free window.
-- process reap handles IOMMU state before ordinary ublocks: it detaches one
-  context or unmaps one whole block per step and reports `REAP_MORE` until
-  every DMA pin is gone.
+- parent-driven teardown enumerates and revokes mapping edges before
+  freeing ordinary ublocks. Freeing the IOMMU-ring block runs endpoint
+  destruction, including force-detach and domain teardown.
 
 The intended tree shape is `init -> pcid -> hardware drivers`. `pcid` gets a
 tree event when a driver dies, resets/disables its devices and clears bus
-mastering, then drives that child's reap loop. Kernel reap owns IOMMU object
-cleanup; `pcid` owns the device-specific action that stops useful DMA and
-prevents a fault storm.
+mastering, then drives that child's enumeration/destroy loop. The
+IOMMU endpoint's ring-destroy hook owns forced object cleanup; `pcid`
+owns the device-specific action that stops useful DMA and prevents a
+fault storm.
 
 A CPU share to the driver is not implicit consent for device DMA. V1 maps
 only blocks the driver itself owns. Later zero-copy needs an explicit
@@ -528,7 +518,7 @@ fault route whose lock pins the device-to-ring association for the
 data-plane post path; the handler records and clears a bounded number of
 hardware records under the unit-local lock and posts or coalesces the
 event through that route, never taking the global umem lock; and
-`DEVICE_DETACH` or reap severs the route under the route lock before the
+`DEVICE_DETACH` or endpoint destruction severs the route under the route lock before the
 device record or ring block can be freed. Any required
 control-plane cleanup is initiated later by the driver or its reaper.
 
@@ -647,7 +637,7 @@ destroy on-disk data it was authorized to access, and consume service time.
 
 There is no global IOMMU lock. Every control-plane path already serializes
 on `g_umem`: driver commands arrive through scheme drains, which run
-holding it; process reap enters with it; boot bring-up is single-threaded.
+holding it; endpoint destruction enters with it; boot bring-up is single-threaded.
 A nested `g_iommu` would never be acquired independently and would protect
 nothing. The control-plane state — domain-ID allocator,
 requester-to-domain assignments, domain and mapping records — is therefore
@@ -660,8 +650,8 @@ g_umem -> process ulock -> domain/unit leaf locks
 ```
 
 The synchronous invalidation waits held under `g_umem` are
-microsecond-scale register polls that occur only at configuration,
-teardown, and reap time; steady-state I/O issues no IOMMU commands. If that
+microsecond-scale register polls that occur only at configuration and
+teardown time; steady-state I/O issues no IOMMU commands. If that
 stops being true — ATS device-TLB or queued invalidation is adopted, or
 measured real-hardware invalidation latency stalls the control plane —
 introduce a `g_iommu` together with the `as_flush_multi` pin-and-drop
@@ -671,18 +661,19 @@ across the wait buys nothing.
 Hardware fault handlers use a unit-local leaf lock, the shared IRQ
 fault-route lock, and the existing stripe-ranked CQ post path only; they
 never take `g_umem`. The route lock is the lifetime pin:
-detach and reap sever the fault route under it — following the same
+detach and endpoint destruction sever the fault route under it — following the same
 rank/side rules as IRQ routes — before the device record or ring block is
 freed.
-Driver commands or process reap later reconcile the recorded fault on the
+Driver commands or parent-driven teardown later reconcile the recorded fault on the
 control plane.
 
-IOMMU reap extends the existing process-reap state machine. Entered with
-`g_umem`, it performs one detach or one whole-block
-unmap per step, including the required synchronous invalidation, then returns
-`REAP_MORE`. It does not pretend to submit commands through the dead ring.
-Only after every IOMMU object and pin is gone may ordinary block reap reach
-the control ring or mapped ublocks.
+IOMMU cleanup no longer extends a process-reap state machine. The
+reaper invokes `SYS_VM_DMA_REVOKE` for block-side mapping edges, and
+freeing the dead process's IOMMU-ring block invokes the scheme destroy
+hook directly. That hook performs bounded-by-`IOMMU_MAX_*`
+force-detach, invalidation, unmap, and domain destruction; it does not
+pretend to submit commands through the dead ring. Only after every
+mapping edge is gone may the corresponding ordinary block be freed.
 
 ## 14. Security invariants
 
@@ -731,8 +722,8 @@ The implementation is correct only while all of these hold:
 8. After unmap and invalidation, the former IOVA faults.
 9. Two domains cannot DMA into each other's blocks.
 10. Kill the driver with I/O outstanding: blocks remain pinned; `pcid`
-    resets the device, then bounded kernel reap detaches/unmaps and only
-    afterward returns the blocks to the buddy.
+    resets the device, then bounded enumeration/endpoint teardown
+    detaches/unmaps and only afterward returns the blocks to the buddy.
 11. Repeated domain construction/destruction returns kernel table counts,
     mapping counts, pins, and domain IDs to their baselines.
 
@@ -754,8 +745,7 @@ criterion for calling the driver isolated.
    keep authorization behind the single replaceable hook in §5.
 7. Add ublock DMA pins and single-invocation whole-block map/unmap reusing
    the paging.c walk (4 KiB and 2 MiB superpage leaves).
-8. Add the per-process direct-driver ring ABI and automatic IOMMU reap
-   steps.
+8. Add the per-process direct-driver ring ABI and endpoint destroy hook.
 9. Add fault interrupt delivery and coalesced `KEV_IOMMU_FAULT` events,
    reusing the IRQ route-lock delivery machinery as shared code.
 10. Implement the driver/`pcid` lifecycle: the driver configures its domain,

@@ -5,10 +5,8 @@ list, step 7, is not built — see §5). Supersedes the `SYS_BLOCK_WAIT` /
 `SYS_BLOCK_DOORBELL` pair described in
 [ipc-process-design.md](ipc-process-design.md) §1, and the
 "process-private events and userspace multiplexing" rules of its §2.
-[park-design.md](park-design.md) is an explicit alternative to this
-document — same problem, thread-directed rather
-than address-keyed waiting; this one was built, and
-its §11 is the head-to-head. It
+A thread-directed park alternative was considered and rejected; this
+address-keyed design was built, and §11 retains the head-to-head. It
 obeys that document's design law unchanged: bounded non-blocking
 kernel work, registrations for interest, events for results, **no kernel
 threads, no deferred kernel work**.
@@ -676,10 +674,9 @@ are handled by three different parties:
   in libc before `SYS_THREAD_EXIT`, but an involuntary single-thread
   death (a ring-3 fault kills one thread while its process lives)
   walks nothing.
-- **Its memory.** The parent claims each block with the upward
-  `VM_MOVE`, then frees it with the ordinary flow above — the same
-  cleanup routine it would run for its own memory. `SYS_PROC_REAP` does
-  **not** free memory (§below).
+- **Its memory.** The parent enumerates each owned block, removes
+  sharer and DMA edges, then frees it with the ordinary flow above.
+  `SYS_PROC_DESTROY` does **not** free memory (§below).
 
 Peers parked on words in the dead process's memory are covered by the
 first bullet if they were mutex owners, and otherwise by their own
@@ -697,22 +694,22 @@ fault the deadline saved it from. The cheap revalidation is re-entering
 own check, and that error, not a userspace load, is the recovery
 signal.
 
-### `SYS_PROC_REAP` — narrowing deferred on the enumeration TODO
+### `SYS_PROC_DESTROY` — final process-body disposal
 
-The intended end state: reap handles only what userspace cannot — the
-child's TCBs (including removing their futex tree nodes), its share
-edges, its address space, its registry entry, and its process struct —
-and blocks the zombie *owned* must be claimed by the parent with
-`VM_MOVE` before reap can finish. That keeps memory reclamation on the
-same userspace-driven path as every other free and makes accounting
-honest: a parent that takes over a dead child's memory is charged for
-it, and one that declines leaks only within its own subtree.
+[enumeration-design.md](enumeration-design.md) supplies the intended
+end state: userspace enumerates and disposes TCBs, share edges, DMA
+mappings, views, and owned blocks. `SYS_PROC_DESTROY` then tears down
+only the empty address space, registry entry, and exact process struct;
+it never walks a subtree or frees user resources. A reaper may name any
+dead descendant only when every intermediate process is dead, and
+destroys the tree post-order.
 
-**As implemented, reap still frees the zombie's owned blocks** (one
-single-shot release per step now that the waiter drain is gone; the
-`VM_MOVE` claim remains available before reap for parents that want the
-memory). The narrowing is blocked on the block/sharer enumeration
-syscalls recorded as TODOs in [memory-design.md](memory-design.md): a
+**The current implementation's legacy reap syscall still frees the
+zombie's owned blocks.** The planned `SYS_PROC_DESTROY` ABI
+intentionally replaces that behavior rather than preserving it. The
+replacement depends on the
+block/sharer enumeration syscalls in
+[enumeration-design.md](enumeration-design.md): a
 parent cannot claim blocks it cannot name — a child's own allocations
 (heap, kring blocks) are invisible to it — so a reap that refuses while
 they remain would simply never finish. Narrow when enumeration lands.
@@ -870,7 +867,7 @@ Deleting (kernel):
 | `side_waiter`, prototypes, contract comments | 25 |
 | four `ublock` waiter fields + `freeing` + comments | 14 |
 | `freeing` ripples across `umem.c`, `rc == 1` in `syscall.c` | 45 |
-| the block-freeing steps of `SYS_PROC_REAP` (§5) | 40 |
+| the legacy block-freeing reap steps removed by `SYS_PROC_DESTROY` (§5) | 40 |
 | **total** | **~350** |
 
 Adding: bucket table and template instantiation (~15), the template's
@@ -1034,7 +1031,8 @@ handling — the robust-list registration and the parent-side walk are
 4. **Teardown** (§5): delete `freeing`, the resumable free, and the
    waiter-drain steps of reap; add owner-revoke `VM_UNSHARE(base, pid)`
    (the sharer drop renames to `VM_DROPSHARE`); narrow
-   `SYS_PROC_REAP` and make the parent claim blocks with `VM_MOVE`.
+   replace the legacy reap syscall with final-body-only `SYS_PROC_DESTROY`;
+   enumeration-design supplies the parent-driven block choreography.
    Tests: a client parked on a server's ring across the server's death
    and across an explicit revoke; `VM_FREE` refusing while a sharer
    remains; a full parent-driven reclaim of a killed child's memory.

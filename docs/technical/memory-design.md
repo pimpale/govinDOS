@@ -198,14 +198,18 @@ because each can be held across `as_flush` by some path:
    makes a concurrent guard (`prot == 0`) unable to yank a mapping
    between wait's access check and its kernel load.
 3. **Stripes** — a static lock array indexed by hash(block base),
-   guarding each block's channel slots. The lock's storage outlives
-   any block, which makes lock-then-look safe without lifetime
-   machinery (the full data-plane rules live in umem.h and
-   ipc-process-design.md §7).
+   guarding each block's channel slots and serving as the
+   lifetime/writeability handoff for syscall copy-out buffers
+   ([enumeration-design.md](enumeration-design.md) §2). The lock's
+   storage outlives any block, which makes lock-then-look safe without
+   lifetime machinery. Free, view removal/move, and a
+   write-restricting `SYS_VM_PROTECT` synchronize on the stripe before
+   changing PTEs or recycling the block.
 
-Consequences: the IPC data plane never touches `g_umem`; `umem_alloc`
-takes no global lock at all (the buddy has its own lock and the list push
-uses `p->ulock`); and revocation's
+Consequences: the IPC data plane never touches `g_umem`; with the
+global `g_ublocks` index added by enumeration-design, `umem_alloc`
+takes `g_umem` only long enough to publish the new base-index entry
+(the buddy has its own lock); and revocation's
 flush round runs with *no* locks held (free path below).
 
 The `ublock` list is the **sole authority** on ownership and lifetime; the
@@ -266,8 +270,8 @@ Notes:
 ### Free path (also the owner-exit path per block)
 
 `SYS_VM_FREE(base)` is a single bounded transaction. It **fails** while
-anything is still attached to the block — sharers, DMA pins, capability
-grants, reflected-fault waiters — and detaching those is userspace's job,
+anything is still attached to the block — sharers, DMA pins,
+reflected-fault waiters — and detaching those is userspace's job,
 done with bounded per-item verbs beforehand (`SYS_VM_UNSHARE(base, pid)` per
 sharer, and so on). There is no kernel work queue and no waiter drain: the
 kernel does not notify threads parked in a block that is being revoked, so
@@ -285,8 +289,17 @@ what is attached to a block. None of these exist yet:
 |---|---|
 | sharers of a block; blocks owned by a (zombie) process | this document |
 | DMA pins / IOMMU domain attachments | [pci-design.md](pci-design.md), [iommu-design.md](iommu-design.md) |
-| capability grants anchored on a block | [capability-design.md](capability-design.md) |
 | threads parked on a reflected fault | [ipc-process-design.md](ipc-process-design.md) §3 |
+
+(Capability grants no longer appear here: grants never retain blocks —
+[capability-design.md](capability-design.md) §6,
+[enumeration-design.md](enumeration-design.md) §0.)
+
+Reflected-fault enumeration is explicitly deferred with fault
+reflection itself. It is not part of the implementable enumeration v1
+while no reflected-fault waiters exist. The fault-reflection feature
+must add its own enumerator/coercion contract before such waiters are
+allowed to retain a block.
 
 Each is a resumable *read* — a cursor, a buffer, and a length — which is a
 categorically easier thing to get right than the resumable *mutation* the
@@ -388,7 +401,7 @@ User threads are stackless in the kernel; their death costs nothing here.
 
 ## 8. Resource policy
 
-- The kernel has no uid or account table. Login identities and POSIX
+- The kernel has no identity/account table. Login identities and POSIX
   credentials belong to userspace services.
 - `SYS_VM_ALLOC` currently fails only when the global buddy allocator is out
   of memory. A later capability design may add explicit resource-budget

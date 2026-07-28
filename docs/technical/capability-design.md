@@ -1,12 +1,15 @@
 # Capability design: grants, tokens, and the cap channel
 
-Status: **implemented 2026-07-16 from the design planned 2026-07-14;
-trust domains and offline caveat chains remain deferred (§9). Final v1 shape: kernel
-state is a tree of revocation anchors ("grants"); authority is
+Status: **base mechanism implemented 2026-07-16 from the design planned
+2026-07-14; the process-decoupling, bearer-revoke, and fused-MSI
+amendments from [enumeration-design.md](enumeration-design.md) are
+planned. Trust domains and offline caveat chains remain deferred (§9).
+Target v1 shape: kernel state is a tree of revocation anchors ("grants"); authority is
 fixed-size MAC'd tokens transferred as plain bytes; all attenuation is
 re-issuance over the cap scheme (`KSCHEME_CAP = -2`); zero new
 syscalls. Revocation is prospective, grant depth is capped at 64, and
-pid binding, grant-death events, and resource quotas are deferred.**
+pid binding and grant-death events are deferred. V1 has no grant
+breadth quota or accounting subsystem.**
 Companion to [ipc-process-design.md](ipc-process-design.md),
 [irq-design.md](irq-design.md), [iommu-design.md](iommu-design.md), and
 [pci-design.md](pci-design.md). This is the "general capability model"
@@ -45,8 +48,8 @@ Delegation has exactly two verbs, with a clean cost split:
   together.
 - **Re-issue** (`KCAP_SUBGRANT`): mints *distinct, narrowed* authority —
   a new grant node. Costs kernel state and a ring round-trip; buys
-  individual revocability, enumerability, and death-coupling to the
-  issuer.
+  individual revocability and enumerability. It is not coupled to any
+  process lifetime.
 
 That is the deliberate cost model: *revocability is what kernel state is
 for* — and in v1, attenuation and revocability are the same purchase.
@@ -81,22 +84,32 @@ designed but deferred (§9).
 - **Every narrowing is its own anchor.** Re-issuance makes revocation
   granularity perfect — each delegated narrowing is individually
   revocable — at the cost of a grant node per attenuation. V1 caps grant
-  depth at 64. A breadth quota is deferred; untrusted token holders can
-  otherwise exhaust kernel memory by creating sibling grants, an accepted
-  trusted-v1 limitation.
-- **Narrowed delegation death-couples; copied tokens don't.** A
-  sub-grant dies with its creator (reap revokes it), severing that
-  delegation. Copying bytes shares the original anchor and outlives the
-  middleman. The two verbs make death-coupling explicit rather than a
-  convention.
-- **Revocation authority = grant ancestry.** A grant may be revoked by
-  its creator or by the creator of any ancestor grant. Revocation marks
-  the anchor dead immediately, then reclaims its subtree in bounded retry
-  steps. Reap
-  revokes a zombie's created grants (§6). No separate revoke-tokens.
+  depth at 64 but does not bound breadth. Trusted issuers can exhaust
+  grant memory; admission control is deliberately deferred.
+- **Narrowed delegation is independently revocable; copied tokens
+  share fate.** A sub-grant is its own anchor — revoke it and only
+  that delegation dies. Copying bytes shares the original anchor. The
+  two verbs make the revocation boundary explicit rather than a
+  convention. Neither couples to any process's death: **grants are
+  decoupled from the process tree.** A dead holder's anchors persist
+  as inert nodes (every payload shape fails safe:
+  device ranges are eternal identities, route grants are
+  generation-gated against their dead slot incarnation) until a token
+  holder or ancestor collects them.
+- **Revocation authority = token possession.** `KCAP_REVOKE` accepts
+  the anchor's authenticated token and needs nothing further — any
+  copy-holder may revoke (accepted deliberately: copy-holders already
+  stand behind one anchor and share one fate, and token theft already
+  means full use-authority, so bearer-revoke adds only a revocation
+  DoS to an attacker who could already impersonate). Revocation marks
+  the anchor dead immediately, then reclaims its subtree in bounded
+  retry steps. Ancestor-driven collection of *unheld* descendants
+  arrives with subgrant enumeration (the deferred GC surface, which
+  also mints public grant ids). Process death revokes nothing.
 - **Grant management is a scheme, not syscalls.** The capability system
-  adds **zero syscalls** (the table stays at `SYS_VM_SIZE 18` /
-  `SYS_MAX 19`); it changes one signature (§4.1) and adds scheme -2.
+  adds **zero capability-specific syscalls**; it changes one signature
+  (§4.1) and adds scheme -2. Later syscall-table growth in
+  [enumeration-design.md](enumeration-design.md) is independent.
   The scheme earns its ring under the "kernel delivers events back"
   rule as a command-oriented exception: grant-death events are deferred.
   Multi-step revocation returns `SYSERR_AGAIN`; the client resubmits until
@@ -128,14 +141,14 @@ designed but deferred (§9).
 // A revocation anchor. The global grant tree is the kernel's entire
 // capability state — the boot roots plus one node per re-issued
 // (narrowed) delegation. Guarded by g_umem (the control plane), so
-// grant liveness can never disagree with process liveness or
-// revocation in flight.
+// grant liveness is independent of process liveness.
 //
-// Ownership: grants are individually allocated and linked into intrusive
-// parent/child and per-creator lists. Nodes never move. The global
+// Ownership: grants are individually allocated and linked into an
+// intrusive parent/child tree. Nodes never move. The global
 // id→grant llrb resolves token grant_id values (pid-registry style).
 // Removal order, under g_umem: unlink the non-owning references,
-// then destroy the owning node. A per-creator breadth quota is deferred.
+// then destroy the owning node. Grants are DECOUPLED from processes:
+// no creator tie, no death revocation, no accounting field.
 struct grant {
   uint64_t id;             // monotonic, never reused
   uint8_t  type;           // GRANT_DEVMEM / GRANT_IRQ_ROUTE / GRANT_IOMMU_DEV
@@ -147,15 +160,13 @@ struct grant {
     struct { struct irq_route *route; uint32_t id; } irq; // generation-bound
     struct { uint32_t requester; } iommu_dev; // segment:bus:devfn
   };
-  struct process *creator; // revocation authority + reap tie
   struct grant *parent;    // nullptr for the boot roots
   struct grant *first_child, *next_sibling, *prev_sibling;
-  struct grant *creator_next, *creator_prev;
 };
 ```
 
 Bounded revoke follows `first_child` to one deepest leaf (at most 64
-links) and removes it. Intrusive sibling and creator links make removal
+links) and removes it. Intrusive sibling links make removal
 O(1), with no container growth or copying under `g_umem`.
 
 (Trust domains add a `domain` field here when they land — §9.)
@@ -167,10 +178,12 @@ Grant types v1 mirror the hardware authority gaps:
   platform space. `pcid` sub-grants BAR ranges for drivers (pci-design's
   "future BAR-range capability"; ECAM authority is a devmem grant over
   the ECAM window).
-- **GRANT_IRQ_ROUTE {route}** — claim/bind/release one `irq_route`. Root
-  is route-wildcard; sub-granting selects a GSI. MSI routes allocate
-  hardware state, so they materialize via `KIRQ_MSI` (§4.2), which
-  creates a child grant.
+- **GRANT_IRQ_ROUTE** — the one IRQ token type. A concrete pin payload
+  authorizes `KIRQ_CLAIM`; a wildcard payload authorizes the fused
+  `KIRQ_MSI` allocate+bind operation; the concrete
+  `{slot, generation}` token returned by that operation authorizes
+  `KIRQ_MSI_ADDR`. `KIRQ_RELEASE` and ACK remain ring-scoped. There is
+  no separate MSI allocation token or bind authority.
 - **GRANT_IOMMU_DEV {requester}** — attach/detach that full PCI
   segment:bus:devfn requester id to a caller-owned domain. Root is a
   tagged requester-wildcard, delegated init → `pcid`,
@@ -211,14 +224,16 @@ forgery, §5):
   SUBGRANT instead of passing base/len), `flags` ⊆ grant flags.
   Existing kernel range validation (non-RAM, alignment, FIRMWARE only
   on ACPI backing) unchanged on top.
-- **IRQ ring**: `KIRQ_CLAIM` / `KIRQ_BIND` present a
+- **IRQ ring**: `KIRQ_CLAIM` / `KIRQ_MSI` / `KIRQ_MSI_ADDR` present a
   route token by offset+length *within the ring's block* (`sqe->a` =
-  offset, `sqe->b` = length, `sqe->c` = cookie where one applies),
-  replacing bare GSIs / granted route ids. `KIRQ_ACK` and `KIRQ_RELEASE`
-  stay token-free: both are scoped to a route already bound to this ring.
+  offset, `sqe->b` = length, `sqe->c` = cookie/output offset where one
+  applies), replacing bare GSIs / granted route ids. `KIRQ_ACK` and
+  `KIRQ_RELEASE` stay token-free: both are scoped to a route already
+  bound to this ring.
   The ring is the authority context and the hot/cleanup paths stay raw
   indexed ops.
-  Authority is spent at claim/bind, not per interrupt.
+  Authority is spent at claim or fused allocate+bind, not per
+  interrupt.
 - **IOMMU ring**: `KIOMMU_DEVICE_ATTACH` presents a device token the same
   way (the "requester field becomes a capability" swap
   iommu-design §5 reserved). `DOMAIN_*` and `*_MAP_BLOCK` are unchanged:
@@ -267,11 +282,10 @@ struct kcap_subgrant_req {
 
 Tokens and requests ride inside the ring's block; `SUBGRANT` writes the
 child's token back at the caller-chosen offset. Authority checks:
-`SUBGRANT` needs a live parent token (and creates the child with creator =
-caller); `REVOKE` accepts an authenticated live or dead-but-retained token
-and needs the caller to be the anchor's creator or an ancestor grant's
-creator. Dead grants remain in the id index until their final cleanup step
-so retries can resolve them. `QUERY` writes a fixed result structure into
+`SUBGRANT` needs a live parent token; `REVOKE` accepts an authenticated live or
+dead-but-retained token and needs nothing further — possession is
+revocation authority. Dead grants remain in the id index until their
+final cleanup step so retries can resolve them. `QUERY` writes a fixed result structure into
 the ring block rather than trying to squeeze type-specific params into a
 CQE.
 
@@ -287,7 +301,7 @@ authority already exercised through a live token (§3).
 - New command-only scheme -2 with the ops above.
 - `SYS_VM_MAP_DEVICE` signature: `(token_ptr, token_len, flags)`.
 - Bootinfo v2 gains three literal root token fields (§6).
-- **No new syscalls.** The table stays `SYS_VM_SIZE 18`, `SYS_MAX 19`.
+- **No new capability syscalls.**
 
 (Trust domains later add a `SYS_PROC_CREATE` flags argument and give
 `KCAP_SUBGRANT`'s reserved `b` its meaning; caveat chains later give
@@ -295,17 +309,22 @@ the token's reserved `nres` byte its meaning — all additive.)
 
 ### 4.2 MSI
 
-`KIRQ_MSI` presents a parent route token (`a` = offset, `b` = length,
-`c` = output offset): the kernel allocates a free route, creates a
-child grant under the presented anchor (creator = caller), and writes
-its token into the ring block; the completion carries the MSI
-address/data pack. The concrete grant records the route generation as
-well as its slot, so releasing and reusing a slot cannot revive an old
-token. pcid programs the device (its job per irq-design)
-and hands the token bytes to the driver over their ring — or, for a
-driver it wants revocable independently, sub-grants first and hands
-over the child's token. The old "target must be a direct child" rule
-is deleted; pcid and drivers can be siblings.
+`KIRQ_MSI` presents the wildcard route token (`a` = offset, `b` = length,
+`c` = output offset), is executed by the *driver* on its own IRQ ring,
+and fuses allocation with binding: the kernel allocates a free route,
+binds it to the calling ring, creates a child grant under the
+presented wildcard anchor, and writes its token into the ring block.
+`pcid` gives each trusted driver a byte-for-byte copy of the wildcard
+token; it does not mint a narrowed per-driver MSI token. V1 therefore
+trusts drivers not to exhaust the fixed route pool and has no quota
+fallback. The concrete grant records
+`{slot, generation}`, so releasing and reusing a slot cannot revive an
+old token. The driver hands the token to `pcid`, which derives the
+address/data pair with `KIRQ_MSI_ADDR` (generation-checked) and
+programs the device (its job per irq-design) — the pair is derived by
+`pcid`, never relayed as driver-asserted data. There is no separate bind op; rebinding is
+release + re-fuse. The old "target must be a direct child" rule is
+deleted; pcid and drivers can be siblings.
 
 ## 5. Interposition
 
@@ -317,8 +336,8 @@ instead of the kernel: filtering, logging, rewriting, or satisfying
 requests by making narrowed `KCAP_SUBGRANT`s against its own broader
 tokens and forwarding the results. The supervisor gains no forgery power
 — it can only re-delegate what it already holds. This proxy is
-intentionally not ownership-transparent: kernel grants it creates are
-death-coupled to the supervisor, and the supervisor owns their revocation
+intentionally not identity-transparent: grants it creates survive the
+supervisor, and any holder of their token has bearer revocation
 authority. Until trust domains land this is an authority-filtering
 convention, not a containment wall.
 
@@ -328,32 +347,43 @@ Enforcement does not interpose: exercise sites (§3) verify against
 extended to IRQ/IOMMU rings too; the cap ring deliberately sets that
 precedent, but this is an observation, not a v1 goal.
 
-## 6. Death, reap, bootstrap
+## 6. Death, process destruction, bootstrap
 
-- **Reap** gains one step type: advance revocation of one grant created by
-  the zombie,
-  deepest-first, before the parent reclaims owned blocks (a route grant's
-  teardown may release a claim on a ring living in an owned block — verify
-  this ordering against `channel_block_destroyable` sequencing at
-  implementation time). Grants die with their creators; tokens die with
-  their grants; no other capability cleanup exists because no other
-  capability state exists. Established mappings, claims, and attachments
-  retain their ordinary object lifetimes.
-  - Reap no longer frees the zombie's memory
-    ([ipc-process-design.md](ipc-process-design.md) §4) — the parent claims
-    each block with `VM_MOVE` and frees it itself — so grant revocation must
-    complete before the parent's reclaim, not before a kernel-side free.
-- **TODO — grant enumeration.** `SYS_VM_FREE` refuses a block that still
-  anchors grants and does not revoke them itself
-  ([memory-design.md](memory-design.md) §5). Userspace therefore needs to
-  ask which grants a block anchors — a resumable read over the creator's
-  grant list, plausibly a `KCAP_LIST` op on the `-2` ring. Not yet
-  designed; until it exists, a caller learns only that the free failed.
-- **Pids are never reused** (monotonic 64-bit): creator ties require it;
-  the phase-2 identity split (§9) wants it
+- **Process destruction touches no grants.** Process death is invisible to the grant
+  tree: grants are decoupled from processes and are API keys entitling
+  object creation, never an object's lifecycle record
+  ([enumeration-design.md](enumeration-design.md) §0) — revocation is
+  prospective, and the objects created under a grant (blocks, slot
+  reservations, bindings) are cleaned by their own owners' teardown
+  paths. A dead holder's anchors persist until a token
+  holder or (with the future GC surface) an ancestor collects them;
+  tokens die with their grants; no other capability cleanup exists
+  because no other capability state exists. Established mappings,
+  claims, and attachments retain their ordinary object lifetimes.
+- **Grants never retain blocks**
+  ([enumeration-design.md](enumeration-design.md) §0). `SYS_VM_FREE`
+  ignores grants: no grant payload references a block object or a
+  recyclable RAM base, so nothing dangles when a block dies, and
+  re-redeeming a surviving devmem grant maps the same physical window
+  the authority always named — prospective authority and established
+  objects are separate planes in both directions. Grant payloads must
+  be never-recycled identities (device ranges, requester ids) or
+  generation-gated recyclable ones (MSI route slots: the concrete
+  grant records `{slot, generation}`, verified at every use, so
+  authority from a previous incarnation fails harmlessly). Alias
+  prevention is a redemption-time check: `SYS_VM_MAP_DEVICE` refuses a
+  range overlapping a live device block. A `KCAP_LIST` op is therefore
+  unnecessary for teardown correctness — no free ever fails on grants,
+  so nothing gates on asking which grants a block anchors. Grant
+  enumeration remains intended as a *later* introspection/GC surface
+  (a cursor over an anchor's subtree — §6's GC note); nothing in the
+  teardown design waits for it.
+- **Pids are never reused** (monotonic 64-bit): cross-process
+  references (the reserved `CAV_PID` binding, the enumeration
+  cursors) require it; the phase-2 identity split (§9) wants it
   anyway.
-- **Bootstrap**: the kernel creates the three root grants (creator =
-  init) and writes their root tokens as bytes into a new bootinfo
+- **Bootstrap**: the kernel creates the three root grants and writes
+  their root tokens as bytes into a new bootinfo
   section. No pre-seal table population, no minting hook — init reads
   bytes and starts delegating over rings. Boot selftests drive the
   grant tree through kernel-side calls as usual.
@@ -420,11 +450,18 @@ semantics; servers that need more bind to peers or expire aggressively.
   to one never-reused pid. Binding must be monotonic: a child of a bound
   grant remains bound to the same pid. V1 has no binding field or
   binding behavior.
-- **Grant quotas.** Depth is bounded at 64 in v1; per-process or
-  parent-donated breadth budgets remain future work.
-- **Grant-death events.** A future cap-ring event may notify a creator when
-  an ancestor kills its grant. It requires persistent tombstone/pending
-  event state and is deliberately absent from v1.
+- **Grant admission control.** Depth is bounded at 64 in v1; breadth is
+  not. A future budget may cap it, but no accounting machinery is
+  implied.
+- **Grant-death events.** A future cap-ring event may notify holders when
+  an ancestor kills a grant they stand behind. It requires persistent
+  tombstone/pending event state and is deliberately absent from v1.
+- **Subgrant enumeration (the GC surface).** Intended, later: a cursor
+  over an anchor's children on the `-2` ring (minting public grant
+  ids then), so ancestor-token holders — init at the root — can find
+  and collect a dead holder's inert anchors. Nothing gates on it:
+  teardown never waits for grants, so GC is hygiene. Until it lands,
+  trusted issuers can leak anchors and exhaust grant memory.
 - **Offline attenuation (macaroon caveat chains).** Designed during this
   document's second revision, deferred in favor of re-issuance-only:
   tokens grow HMAC-chained caveat records (`mac_i = MAC(mac_{i-1},
@@ -436,14 +473,14 @@ semantics; servers that need more bind to peers or expire aggressively.
   get long or high-frequency enough that a ring round-trip per
   narrowing hurts — the trade is a real in-kernel parser and the loss
   of one-anchor-per-narrowing enumerability, which is why v1 skips it.
-- **Process authority (phase 2).** KILL/REAP/SPAWN/MOVE_IN/PROTECT are
+- **Process authority (phase 2).** KILL/DESTROY/SPAWN/MOVE_IN/PROTECT are
   still pid+tree-checked. The token translation: process-object grants
   with rights params, ids staying pure identity. Costs parked: every
   proc syscall changes shape; kernel events need grant-cookie plumbing;
   processes would be the first grant *params* that die, needing
-  object→grant back-references. Reap authority stays parent-only
-  regardless — reap decides where salvaged blocks go (tree edges), not
-  just who may trigger it.
+  object→grant back-references. Destroy authority remains structural
+  regardless — an all-dead descendant path decides who may tear down
+  an exact process body.
 - **Group grants / ACS.** GRANT_IOMMU_DEV is per-rid until pci-design's
   ACS work defines isolation groups.
 - **Persistence.** `k_boot` is per-boot by design; durable authority is
@@ -453,21 +490,22 @@ semantics; servers that need more bind to peers or expire aggressively.
 ## 10. Implementation order
 
 1. Intrusive grant tree under `g_umem`
-   (create/link/dead-mark/ancestor-liveness, id→grant llrb, creator
-   bookkeeping); token write/verify (fixed record, one HMAC) + `k_boot`;
+   (create/link/dead-mark/ancestor-liveness, id→grant llrb); token
+   write/verify (fixed record, one HMAC) + `k_boot`;
    selftests including the SHA-256 vector, forged tokens, zero-base
    narrowing, the depth boundary, and prospective retry revocation.
 2. Root grants + bootinfo token section.
 3. Scheme -2: SUBGRANT (⊆ enforcement and depth bound) / QUERY /
-   retryable REVOKE; reap step for creator death. Selftests: stale anchor,
+   retryable bearer REVOKE; no reap interaction. Selftests: stale anchor,
    dead ancestor, immediate invalidation before cleanup completes,
    depth-64 rejection, zero-valued selectors, and params-widening rejection.
 4. Convert `SYS_VM_MAP_DEVICE` to token signature; delete the umem.c
    TODO; pcid sub-grants driver BAR ranges.
-5. Convert IRQ scheme ops (CLAIM/BIND by token; ring-scoped RELEASE; MSI
-   per §4.2);
-   delete both irq.c authorization TODOs. `route->target` remains only as
-   the unbound MSI allocation-lifetime owner; it is not bind authority.
+5. Convert IRQ scheme ops (`KIRQ_CLAIM` by concrete pin token;
+   `KIRQ_MSI` fused allocate+bind by wildcard token; ring-scoped
+   RELEASE; `KIRQ_MSI_ADDR` by concrete MSI token); delete `KIRQ_BIND`
+   and both irq.c authorization TODOs. No unbound MSI owner/state
+   remains.
 6. Convert `KIOMMU_DEVICE_ATTACH` and retain ring-scoped DETACH; delete the iommu.c
    first-claim hook; update nvmed + QEMU harness.
 7. Authority-ring inheritance/default convention in gdoslib.

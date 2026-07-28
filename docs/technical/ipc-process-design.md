@@ -1,7 +1,9 @@
 # IPC & process design: channels, kernel schemes, fault reflection, threads, process trees
 
-Status: **implemented 2026-07-07** — §§1, 2, 4, 5 all landed (channels +
-schemes -1/-3, process trees, zombies + reap, kernel-thread deletion,
+Status: **implemented 2026-07-07; planned amendments are specified by
+[enumeration-design.md](enumeration-design.md)** — §§1, 2, 4, 5 landed
+(channels + schemes -1/-3, process trees, zombies + destruction,
+kernel-thread deletion,
 `g_as_template` collapse); **§3 fault reflection remains unimplemented**
 (its own session, as planned). §7 records where the implementation
 deliberately diverges. Companion to [memory-design.md](memory-design.md);
@@ -12,7 +14,7 @@ implemented — the reaper kthread is gone.
 
 Implementation map: `channel.c/h` (channels, private events, kernel ring ABI,
 schemes, waiter slots), `process.c/h` (tree, embryo, kill, zombies,
-reap steps), `umem.c/h` (share edges, revoke authority, VM_MOVE
+destruction), `umem.c/h` (share edges, revoke authority, VM_MOVE
 mechanics, live-pid index), `syscall.c/h` (dispatch; SYSCALL/SYSRET),
 `packages/tests/tests.c` (the ring-3 test suite for all of it —
 formerly hello.c, which doubled as init until the boot-init design split
@@ -39,23 +41,22 @@ the roles; see [boot-init-design.md](boot-init-design.md)).
   registration in the owning scheme, and results are events.
 - **Channel blocks are client-owned.** A client can
   impose costs on a server anyway (request spam, expensive requests);
-  servers defend themselves with their own quota/accounting policy, in
+  servers defend themselves with their own admission policy, in
   which time-per-request can participate. The kernel does not arbitrate.
 - **Sharing maps immediately; consent is keeping.** `SYS_VM_SHARE` to a
   user pid maps the block into the target on the spot and posts a
   notification (§2, scheme `-1`); rejection is one `SYS_VM_DROPSHARE` —
   the same bounded work an accept handshake would cost, with no pending
   state to track. The accepted price is the planting caveat (§1): the
-  mapping and its bookkeeping exist until the target unshares it. Resource
-  budgets are deferred to the capability design.
-- **Teardown has one authority: the revoke path.** Free, unshare,
-  decline, and death all land in the same umem code, which wakes parked
-  peers with an error. There is no parallel IPC bookkeeping to keep in
-  sync with block lifetime.
-- **Death is O(1); the dead are zombies until their parent reaps them.**
+  mapping and its bookkeeping exist until the target unshares it. V1
+  adds no kernel resource quota.
+- **Teardown uses the same per-edge revoke path.** Free, unshare, and
+  decline converge on the same umem code. Death itself does no hidden
+  revoke work: the dead process's reaper invokes those verbs explicitly.
+- **Death is O(1); the dead are zombies until userspace destroys them.**
   Pids are u64, allocated monotonically, never reused. Cross-process
   references are `(pid, base)` pairs checked against a live-pid index,
-  not pointers, healed lazily. Reclamation is the parent's reap loop —
+  not pointers, healed lazily. Reclamation is the parent's teardown loop —
   bounded syscalls, destruction mirroring construction — so there is
   **no kernel work queue** and no deferred kernel work at all (§4).
 - **Fault reflection is in** (separate implementation session). The
@@ -64,20 +65,20 @@ the roles; see [boot-init-design.md](boot-init-design.md)).
 - **No kernel threads.** The only per-CPU kernel contexts are the
   scheduler/idle loops on the bootstrap stacks. Everything currently done
   by kthreads is dissolved (§4). Nothing is deferred inside the kernel,
-  either: teardown — the one long-running job — is the parent's reap
+  either: teardown — the one long-running job — is the parent's
+  enumeration/destroy
   loop, so the scheduler/idle loops are pure dispatch.
 - **Process trees, parent-driven creation, no reparenting ever.**
   Parents build children from their own resources (embryo state, block
   ownership transfer, explicit first-thread spawn). **Killing a process
   logically kills every descendant through immutable parent links.** No
   eager subtree walk is needed. Orphaned embryos die with their
-  parent by the same rule; a dead parent's zombies are reaped by the
-  grandparent as part of its subtree. Daemonization means asking init
+  parent by the same rule; a grandparent may clean a descendant only
+  through an all-dead path. Daemonization means asking init
   (over a channel) to spawn the image as *its* child — Unix's
   orphan-adoption by pid 1 is deliberately rejected; Fuchsia's job
   trees are the precedent.
-- **Resource budgets:** deferred to the capability design. The kernel has no
-  uid/account layer today.
+- **Resource budgets:** no kernel limit exists in v1.
 
 ## 1. Shared-block channels
 
@@ -496,51 +497,46 @@ per-process vec**: nothing external points into it, so the final reap
 step frees it wholesale.
 
 **Logical death is O(tree depth), independent of subtree breadth.** Mark
-the subtree root directly dead, remove it from the live-pid index, and post
-`EV_CHILD_DEAD` to its live parent. A process is effectively dead when it
-or any immutable ancestor is directly dead; syscall/interrupt checkpoints,
-scheduler dispatch, peer-liveness checks, and live-pid lookup all use that
-predicate. Reap materializes descendants' direct death one leaf at a time,
-removing their hidden registry entries as it reaches them. Runnable/running
-threads die at dispatch or their next kernel entry. Blocked victims are not
-woken merely to be culled: reap frees up to 256 detached TCBs per call,
-removing each one's futex tree node before the TCB itself.
+the subtree root directly dead and post `EV_CHILD_DEAD` to its live
+parent. A process is effectively dead when it or any immutable ancestor
+is directly dead; syscall/interrupt checkpoints, scheduler dispatch,
+peer-liveness checks, and live-only pid lookup all use that predicate.
+The all-process pid index retains zombies until exact final destruction;
+raw teardown lookup and live lookup are separate APIs
+([enumeration-design.md](enumeration-design.md) §2). Runnable/running
+threads die at dispatch or their next kernel entry. Blocked victims are
+not woken merely to be culled; userspace enumerates their tids and
+`SYS_THREAD_DESTROY` removes each futex node, drops its completion pin
+exactly once, and frees the TCB.
 
 **Zombies hold everything.** Pristinity needs no revocation at death:
 revocation guards *recycled* memory, and a zombie's blocks are still
 allocated. Sharers' views survive — a server may drain a dead client's last
-requests. Parents are responsible for promptly reaping their dead subtrees;
-resource containment is deferred to capability budgets.
+requests. Parents are responsible for promptly dismantling their dead
+subtrees; v1 has no resource quota backstop.
 
-**`SYS_PROC_REAP(pid) -> REAP_MORE | REAP_DONE | SYSERR_AGAIN`** —
-callable by the parent on a dead child, covering the child's whole
-dead subtree (post-order cursor; nothing ever reparents, so the
-subtree is closed).
+**`SYS_PROC_DESTROY(pid) -> PROC_DESTROY_MORE |
+PROC_DESTROY_DONE | SYSERR_AGAIN | SYSERR_EXIST`** — callable on an
+exact effective-dead descendant when every process from the target
+through the caller's direct child is also effective-dead/non-running.
+A live intermediate child is a hard boundary. The call never walks a
+subtree; userspace discovers descendants and destroys them post-order.
 
-**Reap handles process and thread state only. It does not free memory.**
-The parent claims each block the zombie owned with the upward `VM_MOVE`
-(§5) and then frees it with the ordinary §1 flow — the same cleanup
-routine it runs for its own memory, with the same handling of sharers,
-DMA pins, and grants. Reap reports the count still outstanding and
-cannot finish until they are gone. This keeps every entanglement of
-memory teardown on one userspace-driven path, and it makes accounting
-honest: a parent that takes over a dead child's memory is charged for
-it, and one that declines to reclaim leaks only inside its own subtree.
-Post-mortem inspection and exec-image recycling fall out of the same
-primitive — construction run in reverse.
+**Destroy handles the empty process body only. It does not free memory,
+views, TCBs, IRQ routes, IOMMU objects, or grants.** The parent uses the
+enumeration/coercion ABI to dismantle those resources and frees each
+owned block with the ordinary §1 flow. Grants are independent of
+process death. `SYS_PROC_DESTROY` reports `SYSERR_EXIST` until the
+target's block, view, thread, and child trees are empty. This keeps every
+resource entanglement on one userspace-driven path.
 
 One bounded step per call, whichever applies:
 
-1. drop one share edge naming the zombie from a live owner's block (the
-   zombie's own *views* need no unmapping — they die with its AS); or
-2. free up to 256 detached blocked TCBs, removing each thread's futex
-   node by its wait key first ([futex-design.md](futex-design.md) §5);
-   scheduler-owned runnable/running TCBs yield `SYSERR_AGAIN` until
-   dispatch/preemption culls them; or
-3. free K page-table nodes of the AS — `SYSERR_AGAIN` until the drain
-   flag is up and every owned block has been claimed; or
-4. all thread and process state gone: free the metadata vec in one
-   shot, free the process struct — `REAP_DONE`.
+1. verify exact-target authority and that resources/children are empty;
+2. wait for CPU/AS pins (`SYSERR_AGAIN`) or free K page-table nodes
+   (`PROC_DESTROY_MORE`);
+3. remove the pid-registry and parent-tree entries, then free the
+   process struct — `PROC_DESTROY_DONE`.
 
 Mutexes the dead threads held are recovered by the parent walking their
 `SYS_SET_ROBUST_LIST` registrations, in userspace, during this loop.
@@ -550,10 +546,10 @@ monitor thread on their tree or shares channel. That latency rides on
 prompt parents — a libc default (park on the tree channel, reap on
 `EV_CHILD_DEAD`), not a kernel guarantee — accepted.
 
-What stays lazy until touched or reaped: a dead sharer's entry in a live
-owner's sharer vec, share edges naming the dead, and an effective-dead
-descendant's hidden live-index entry. Materializing that descendant during
-post-order reap removes the registry entry in O(log n).
+Nothing is silently removed merely because a process died. Share and
+DMA edges, views, blocks, and TCBs remain enumerable until the reaper
+explicitly removes them; final `PROC_DESTROY` removes the registry entry
+in O(log n).
 
 ## 5. Process trees and parent-driven creation
 
@@ -578,7 +574,7 @@ SYS_GETTID()                                -> tid
 SYS_THREAD_EXIT()                           -> never // current thread only
 SYS_PROC_EXIT(status)                       -> never // whole process; status reported to parent
 SYS_PROC_KILL(pid)                                // own descendant; logical subtree death (O(depth))
-SYS_PROC_REAP(pid)     -> more | done | again     // own dead child; one bounded step (§4)
+SYS_PROC_DESTROY(pid)  -> more | done | again | exist // exact dead descendant through all-dead path (§4)
 ```
 
 - Pids are the u64 never-reused identifiers of §4; `SYS_PROC_CREATE`
@@ -589,9 +585,7 @@ SYS_PROC_REAP(pid)     -> more | done | again     // own dead child; one bounded
   W^X on the embryo's views, spawns the first thread. First spawn ends
   embryo state; parent authority drops to normal peer.
 - `VM_MOVE` runs only along parent↔child tree edges: **down** into your
-  own embryo (construction) and **up** out of your own zombie child
-  (reap-time claim — post-mortem inspection and exec-image recycling
-  are userspace libraries built on this). General gifting between
+  own embryo during construction. General gifting between
   established processes stays banned — a griefing vector and unneeded;
   established processes *share* (channels; an unwanted share costs its
   target one unshare, while a move changes ownership, which is why only
@@ -618,12 +612,12 @@ are immediately dead by ancestry. This answers the orphaned-embryo problem
 without walking a broad tree. Running threads die at their next kernel
 entry (the quantum timer bounds hostile CPU-bound code to one quantum);
 runnable threads are culled at dispatch; blocked threads stay off the
-runqueue and are reclaimed by bounded reap.
+runqueue and are reclaimed by bounded `SYS_THREAD_DESTROY` calls.
 
-**Nothing ever reparents.** Death follows tree edges down; reaping
-follows them up; the tree is never restructured. A dead parent's
-zombies are reaped by the grandparent as part of the parent's subtree
-(§4's post-order cursor makes this the same loop, not a special case).
+**Nothing ever reparents.** Death follows tree edges down; cleanup and
+destruction proceed post-order; the tree is never restructured. A
+grandparent may destroy a dead grandchild only after the intervening
+child is dead, and it must name each exact process (§4).
 Unix's orphan adoption by pid 1 is deliberately rejected — Fuchsia's
 job trees are the precedent. Daemonization is a service, not a tree
 operation: ask init over a channel to run the image as *its* child;
@@ -649,7 +643,7 @@ capability design rather than inferred from a user identity.
    path. Legacy `SYS_RING_*` kept temporarily.
 2. **Process trees + lifecycle** (§5, §4): u64 pids + live-pid index,
    embryo, `VM_MOVE` both directions, parent protect/spawn, lazy descendant
-   kill, zombies + `SYS_PROC_REAP`, the `-3` tree scheme; pe.c →
+   kill, zombies + `SYS_PROC_DESTROY`, the `-3` tree scheme; pe.c →
    boot-only init loader. This replaces the reaper kthread's job.
 3. **Fault reflection** (§3) — its own session, already agreed.
 4. **Kernel-thread deletion** (§4): with teardown already
@@ -710,14 +704,13 @@ rings/dummydev (and their kthreads) had to go with it.
   SQE/CQE, `nslots = 32 << order` each, SQ at 64, CQ after it. Every SQE
   completes with a CQE echoing `{op, a, b}` + status; event types have
   bit 63 set.
-- **Reap step 3 frees the whole AS in one call**, not K page-table nodes
-  per call — as_free isn't incremental yet. Bounded by the AS's table
-  count, which sharer/owner teardown in earlier steps has already pruned.
-  Revisit if page trees ever get big enough to matter.
-- **Reap batches cheap TCB work.** Scheduler-owned threads die at their next
-  kernel entry or dispatch; detached `THREAD_BLOCKED` TCBs are freed in
-  batches of at most 256 after the leaf process's blocks/views are gone.
-  Thread-vector slots make scheduler removal O(1), avoiding quadratic cull.
+- **`PROC_DESTROY` may initially free the whole AS in one call**, since
+  `as_free` is not incremental yet. It is bounded by the target's table
+  count after resource teardown. Add `PROC_DESTROY_MORE` page-table
+  chunking if page trees become large.
+- **TCB disposal is enumerated.** Scheduler-owned threads die at their
+  next kernel entry or dispatch; detached `THREAD_BLOCKED` TCBs are
+  freed by exact `SYS_THREAD_DESTROY(pid, tid)` calls.
 - **All death cascades logically.** Natural death and explicit kill mark
   only the subtree root; immutable ancestor traversal makes every descendant
   immediately dead while post-order reap materializes them incrementally.
@@ -730,8 +723,8 @@ rings/dummydev (and their kthreads) had to go with it.
   turns a private event block into a channel and requires an empty private
   FIFO; the second makes it ordinary multi-sharer memory. Structural endpoint
   waiters are bounded one per side and wake `SYSERR_DEAD` on either transition.
-- **Resource budgets are not wired**: there are no kernel uid accounts or
-  per-process limits. A later capability design may add explicit budgets.
+- **Resource budgets are not wired**: there are no kernel identity
+  accounts or per-process limits. Explicit budgets remain future work.
 - **Wait-groups were removed (2026-07-12).** Scheme `-2`, its ABI, channel
   registration slots, cross-block forwarding, and two-stripe ranked wake
   path are gone. Process-private ublock events plus sharded server queues are

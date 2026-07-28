@@ -1,7 +1,10 @@
 # IRQ design: userspace drivers, the irq scheme
 
-Status: **pin IRQs implemented 2026-07-11; MSI and capability authorization
-implemented 2026-07-16.** Companion to
+Status: **pin IRQs implemented 2026-07-11; the original MSI and
+capability authorization implemented 2026-07-16; fused driver-side
+MSI allocation/binding and `KIRQ_MSI_ADDR` are the planned replacement
+specified here and in
+[enumeration-design.md](enumeration-design.md).** Companion to
 [ipc-process-design.md](ipc-process-design.md); this is the first of the
 "device schemes, where the IRQ handler posts the completion CQE" its §2
 promised, and it must obey that document's design law: bounded
@@ -52,16 +55,30 @@ dispatch branch), `packages/gdoslib-dev/kring.c` (driver-side wrappers).
   Managarm ack-wins/all-nack-stalls) — real machinery that modern
   hardware makes optional, because everything that matters is MSI.
   If it's ever needed the recipe is recorded in §7.
-- **MSI/MSI-X: kernel allocates, `pcid` programs, driver receives events.**
-  `KIRQ_MSI` returns an opaque `(address, data)` pair to the trusted userspace
-  PCI manager; `pcid` writes the device's MSI capability/MSI-X table and
-  grants route binding to its driver child. The kernel still grows no PCI
-  layer. This supersedes the earlier Redox-style driver-programs-device split
-  now that [pci-design.md](pci-design.md) keeps ECAM out of drivers (§5).
-- **Claims and MSI binding are capability-gated.** `KIRQ_CLAIM` and
-  `KIRQ_BIND` verify concrete route tokens; `KIRQ_MSI` verifies a wildcard
-  parent token and returns a newly allocated route token. Release and ack are
-  scoped to an already-bound route on the ring.
+- **MSI/MSI-X: the driver allocates-and-binds in one fused op; `pcid`
+  programs.** `KIRQ_MSI` is executed by the *driver* on its own IRQ ring
+  under the wildcard route token `pcid` copies into every driver start
+  record: it allocates a free
+  slot and binds it to the calling ring atomically, so a slot is either
+  free or bound — no allocated-unbound state exists, route cleanup is
+  entirely ring cleanup, and the reap-side route sweep is gone
+  ([enumeration-design.md](enumeration-design.md) §5). `pcid` retrieves
+  the opaque `(address, data)` pair with the token-authenticated
+  `KIRQ_MSI_ADDR` and writes the device's MSI capability/MSI-X table
+  (config space stays out of drivers — [pci-design.md](pci-design.md)
+  §5). V1 deliberately has no quota: trusted drivers share the
+  wildcard and can exhaust the fixed route pool. Interrupt remapping
+  later expands the source-indexed slot namespace, reducing this risk.
+  The kernel still grows no PCI layer.
+- **Claims and MSI allocation are capability-gated.** `KIRQ_CLAIM`
+  verifies a concrete pin-route token. There is one IRQ token type:
+  its wildcard form permits only the fused `KIRQ_MSI`
+  allocate+bind operation, which returns its concrete
+  `{slot, generation}` form; `KIRQ_MSI_ADDR` verifies that
+  concrete token (generation-checked) and returns the address/data
+  pair. There is no separate bind op — binding happens at mint, and
+  rebinding is release + re-fuse (a slot is never unbound). Release and
+  ack are scoped to an already-bound route on the ring.
 - **Affinity is deferred: everything routes to the BSP.** Also makes
   handler-side lock contention structurally nil in v1. A claim-time
   affinity argument slots in later without ABI change (the CQE and
@@ -100,7 +117,7 @@ redoxos}`); the scheme below is a synthesis, not an invention.
   programs MSI address/data into the device itself; root-only.
   Contributions taken: nearly everything — the count-as-sequence, the
   ack-mismatch-refires semantics, the exclusive-vector stance, the
-  MSI division of labor, excluding its uid-based policy. Redox's shape is close to
+  MSI division of labor, excluding its identity-based policy. Redox's shape is close to
   isomorphic to a govindos scheme already.
 
 The three agree on the core: **mask level lines until the driver says
@@ -113,17 +130,18 @@ handle vs fd), which govindos already standardized as krings.
 Many rings per process allowed, many claims per ring (a driver with
 several devices, or one device's several MSI-X vectors, multiplexes one
 ring — the `cookie` tells events apart). Ring creation is the ordinary
-`SYS_VM_SHARE(base, -4, prot)`; capability gating is deferred (§0).
+`SYS_VM_SHARE(base, -4, prot)`; claims and MSI setup use the token
+rules in §0.
 
 `abi/gdosabi/kring_irq.h`:
 
 | SQE | fields | effect |
 |---|---|---|
-| `KIRQ_CLAIM` | a = token offset, b = token length, c = cookie | verify a concrete pin-route token, claim it exclusively for this ring, program it, and unmask it |
-| `KIRQ_RELEASE` | a = gsi | unclaim: masks the line, frees the route. `SYSERR_INVAL` if not this ring's claim |
-| `KIRQ_ACK` | a = gsi, b = seq | "the device is serviced through `seq`": sets `acked = seq`, unmasks a level line, re-fires the event if raises slipped past `seq` (§3) |
-| `KIRQ_MSI` | a = parent-token offset, b = length, c = output offset | allocate an MSI route under the presented grant, write its token, and complete with opaque address plus packed route-id/data (§5) |
-| `KIRQ_BIND` | a = token offset, b = token length, c = cookie | verify and bind a concrete MSI route token; completion `a` carries the ring-scoped route id used by ACK/RELEASE |
+| `KIRQ_CLAIM` | a = token offset, b = token length, c = cookie | verify a concrete pin-route token, claim it exclusively for this ring, program and unmask it; completion `a` is the ring-scoped route id |
+| `KIRQ_RELEASE` | a = route id | unclaim: masks the line and frees the route. `SYSERR_INVAL` if it is not this ring's claim |
+| `KIRQ_ACK` | a = route id, b = seq | "the device is serviced through `seq`": sets `acked = seq`, unmasks a level line, re-fires the event if raises slipped past `seq` (§3) |
+| `KIRQ_MSI` | a = wildcard-token offset, b = length, c = output offset | verify the shared wildcard token, allocate a free MSI route **and bind it to this ring** atomically, then write the new concrete `{slot, generation}` token; completion `a` carries the ring-scoped route id used by ACK/RELEASE (also the default `KEV_IRQ` cookie) |
+| `KIRQ_MSI_ADDR` | a = token offset, b = token length | verify a concrete route token (generation-checked) and complete with the opaque MSI address plus packed route-id/data — `pcid`'s config-programming query |
 
 | CQE | fields | when |
 |---|---|---|
@@ -138,11 +156,11 @@ The driver loop, entirely existing vocabulary:
 
 ```
 setup:   VM_ALLOC -> ring; VM_SHARE(ring, -4)
-         submit KIRQ_CLAIM{gsi, cookie}; DOORBELL; check completion
+         submit KIRQ_CLAIM{pin-token, cookie}; DOORBELL; save route_id
 loop:    BLOCK_WAIT(&hdr->cq_count, seen)
          consume KEV_IRQ{cookie, seq}; advance cq_head
          ... read device ISR, drain queues, quiesce ...
-         submit KIRQ_ACK{gsi, seq}; DOORBELL   // doorbell = consumption ack too
+         submit KIRQ_ACK{route_id, seq}; DOORBELL // doorbell = consumption ack too
 ```
 
 A driver process is otherwise ordinary. It may dedicate one thread to the
@@ -165,7 +183,7 @@ Rules:
   raised}` and set `posted` (CQ full ⇒ don't post — `raised != acked`
   *is* the pending level state, replay will deliver it). If `posted`,
   nothing: the raise is absorbed into the count.
-- **`KIRQ_ACK(gsi, seq)`:** `acked = seq`; unmask if level-triggered.
+- **`KIRQ_ACK(route_id, seq)`:** `acked = seq`; unmask if level-triggered.
   Then, if the outstanding event is retired and `raised != acked`,
   post `KEV_IRQ{cookie, raised}` again.
 - **Doorbell replay (`ring_replay`, scheme `-4` arm):** for every
@@ -241,8 +259,8 @@ can reach the ring, so the free is safe; and a dead driver never
 leaves a screaming level line unmasked (MINIX's `rm_irq_handler`
 rule). `KIRQ_RELEASE` is the same sequence minus the endpoint
 teardown. Process death needs nothing new: the ring block is owned by
-the driver, so the zombie holds it and the parent's reap revokes it
-through this same path.
+the driver, so the zombie holds it until the parent enumerates and
+`VM_FREE`s it through this same path.
 
 **No faults in IRQ context.** CQE stores go through the SASOS identity
 map from any CR3 (the ipc doc's IOCP-style posting), but a kernel-mode
@@ -293,23 +311,41 @@ BARs (plain MMIO), vs MSI's single pair in PCI config space.
 
 Division of labor (userspace PCI management, still no kernel PCI layer):
 
-- **Kernel (`KIRQ_MSI`):** verify `pcid`'s parent token, allocate a free
-  device vector and route with no RTE, create a concrete child grant, and
-  return its token plus the `(address, data)` programming pair. The pair is
-  **opaque to userspace** — the kernel composes it (destination, delivery mode,
-  vector; someday the IOMMU-remapping format), which keeps affinity
-  and hardening kernel-owned without ABI change. Vector choice is the
-  security-critical half and stays kernel-only.
-- **`pcid`:** writes that pair into the MSI capability in ECAM or the MSI-X
-  table in a temporarily mapped BAR, and controls masking/enabling. It does
-  not receive interrupt events on the normal path.
-- **Driver (`KIRQ_BIND`):** binds the granted route token to its IRQ ring and
-  cookie, then receives `KEV_IRQ` with the ordinary edge/count semantics. It
-  never sees ECAM and need not know the programming pair.
+- **`pcid`:** copies the boot wildcard IRQ token into every trusted
+  driver's start record. This is delegation by copying bytes, not a
+  narrowed subgrant; all such drivers share one revocation fate and,
+  in v1, can exhaust the global vector pool.
+- **Driver (`KIRQ_MSI`):** on its own IRQ ring, presents the wildcard
+  token. The kernel chooses a free device vector, allocates the route,
+  binds it to that ring, and creates the generation-bound concrete
+  token in one atomic operation. There is no allocated-but-unbound
+  state and no `KIRQ_BIND`. The driver publishes the concrete token to
+  `pcid` through the setup page and receives `KEV_IRQ` with the
+  ordinary edge/count semantics.
+- **Kernel query (`KIRQ_MSI_ADDR`):** on an IRQ ring owned by `pcid`,
+  verifies the concrete token and returns the opaque `(address, data)`
+  programming pair. The kernel composes destination, delivery mode,
+  and vector (and later the interrupt-remapping format), keeping
+  vector choice kernel-owned without ABI change.
+- **`pcid` programming:** writes the pair into the MSI capability in
+  ECAM or the MSI-X table in a temporarily mapped BAR, and controls
+  masking/enabling. It does not receive interrupt events on the normal
+  path.
 
-The route ID and MSI data remain packed into CQE `b`; the token, rather than
-the guessability of that ID or a target PID, authorizes binding. Interrupt
-remapping remains future kernel work behind the same opaque pair.
+The route ID and MSI data remain packed into CQE `b`; the wildcard
+token authorizes allocation+binding and the concrete token authorizes
+only the address query. `KIRQ_RELEASE` or IRQ-ring destruction reaps
+the slot, including a `present` route: under the route lock it clears
+the binding, increments the generation, then publishes the slot free.
+`KIRQ_MSI_ADDR` requires both an allocated slot and an exact generation
+match. A retained concrete token therefore fails immediately and never
+retains the slot.
+
+Before interrupt remapping, a stale device may still emit a previously
+programmed MSI after its route is recycled. This is accepted with the
+existing ability of a DMA-capable device to forge the LAPIC MSI window.
+IR closes both gaps, adds an invalidation fence to recycling, and
+provides a larger source-indexed slot namespace.
 
 ## 6. Hardware prerequisites (kernel-side, all bounded)
 
@@ -366,6 +402,7 @@ ACPI (`_PRT` for PCI INTx) or platform knowledge — userspace's problem
    something tests.c can claim and count deterministically under QEMU.
 3. **Wait-group composition test**: one group hearing `KEV_IRQ` +
    a user channel — the canonical driver main loop.
-4. **MSI** (§5): `KIRQ_MSI`, the vector-only route arm — once the
-   device-memory story (ECAM/BAR mapping) exists to make a real MSI
-   driver possible.
+4. **MSI** (§5): fused `KIRQ_MSI`, generation-bound concrete tokens,
+   and `KIRQ_MSI_ADDR`; delete `KIRQ_BIND` and all unbound route state.
+   This lands once the device-memory story (ECAM/BAR mapping) exists to
+   make a real MSI driver possible.

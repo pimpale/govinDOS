@@ -17,6 +17,9 @@ root token bytes to `pcid`, `pcid` sub-grants exact firmware/ECAM/BAR ranges
 before `SYS_VM_MAP_DEVICE`, and requester/IRQ tokens cross the driver handoff.
 Multi-namespace discovery, concurrent requests,
 flush/discard, a name registry, and client-revocation hardening remain.
+The fixed v4 setup-page and fused MSI protocol in §§6–8 are planned
+replacements for the implemented v3 IRQ handoff; they are not a
+compatibility layer.
 
 Govindos follows the seL4 division of labor, without making seL4's full
 capability machinery a prerequisite. A trusted userspace service, `pcid`,
@@ -148,7 +151,8 @@ must deliver events back to userspace; device-memory mapping is synchronous
 and strictly user-to-kernel, so it is a plain syscall, not a ring. And
 delegation needs no dedicated verbs: the call produces an ordinary
 device-backed ublock, so handing it to a driver is `SYS_VM_SHARE` (or
-`SYS_VM_MOVE`), and revocation is the existing unshare/kill/reap machinery.
+`SYS_VM_MOVE`), and revocation is the existing unshare plus
+enumeration-driven process-destruction machinery.
 
 Provisional ABI in `abi/gdosabi/syscall.h`, named in the `SYS_VM_*` family
 because the result is a ublock:
@@ -159,8 +163,7 @@ because the result is a ublock:
 
 The call is synchronous, bounded, and returns 0 or `SYSERR_*`. Rules:
 
-- any process may call it in v1: userspace is trusted until the capability
-  system lands, and caller policy is exactly what capabilities will add;
+- any process holding a matching devmem token may call it;
 - the block is the delegation unit, fixed at map time: the caller sizes one
   block per extent it intends to share, and separate blocks for pages it
   withholds (an MSI-X table page is its own block);
@@ -173,9 +176,10 @@ A device-backed block differs from a RAM ublock by flags, not machinery: it
 is never buddy-owned (`SYS_VM_FREE` retires the mapping without returning
 pages to the buddy or writing to device registers), carries a fixed cache
 type that every share view inherits, can never be `PAGE_X`, is rejected by
-`KIOMMU_MAP_BLOCK`, and is accounted separately from RAM. Everything else —
-share views pinning the viewing address space, revoke-on-death, reap
-ordering — is the existing ublock machinery unchanged.
+`KIOMMU_MAP_BLOCK`, and is accounted separately from RAM. Everything
+else — share views pinning the viewing address space, explicit
+unshare, and enumeration-driven destroy ordering — is the ordinary
+ublock machinery.
 
 Only `PAGE_R`, `PAGE_W`, `PAGE_UC`, and an allowlisted `PAGE_WC` are accepted;
 device mappings are never executable. PCI configuration and ordinary control
@@ -205,8 +209,8 @@ this easy, but the validator must not assume it.
 
 The mapping is installed in the owner's existing per-process page tables;
 the kernel identity mapping does not make it user-accessible by itself.
-Share views, revocation PTE clears, TLB shootdown ordering, and reap
-participation are the ordinary ublock paths.
+Share views, revocation PTE clears, TLB shootdown ordering, and
+parent-driven teardown are the ordinary ublock paths.
 
 For the first Q35 target, the kernel declares the machine's fixed PCI MMIO
 apertures after subtracting RAM and its own MMIO reservations. Real hardware
@@ -300,31 +304,62 @@ BARs.
 `01/08/02`; later it can load declarative matches from initfs. Broad generic
 matches lose to exact vendor/device matches, and one function binds once.
 
-`pcid` is the parent of every hardware driver it manages. It creates the
-child, maps device blocks for the selected BAR extents and shares them into
-the child, creates an ordinary setup channel, moves the
-image/stack, and starts the child. The setup message contains data, not
-authority:
+`pcid` is the parent of every hardware driver it manages. It creates
+the child, maps device blocks for the selected BAR extents and shares
+them into the child, creates a shared setup page, moves the image/stack,
+and starts the child. The fixed v4 page is both the start record and the
+readiness reply; token fields are authority bytes, while numeric ids are
+only identity/correlation:
 
 ```c
+#define PCI_DRIVER_START_VERSION   4
+#define PCI_DRIVER_MAX_BARS        6
+#define PCI_DRIVER_MAX_IRQ_ROUTES 32
+
+struct pci_driver_bar {
+  uint64_t base;
+  uint64_t length;
+  uint32_t bar_index;
+  uint32_t flags;
+};
+
 struct pci_driver_start {
   uint32_t version;
   uint32_t n_bars;
-  uint64_t requester_id; // temporary v1 IOMMU attach name
+  uint64_t requester_id; // diagnostic/ring-scoped detach name
   uint64_t function_id;  // pcid-local cookie for later requests
-  struct {
-    uint64_t base;
-    uint64_t length;
-    uint32_t bar_index;
-    uint32_t flags;
-  } bars[];
+  struct pci_driver_bar bars[PCI_DRIVER_MAX_BARS];
+  _Atomic uint32_t state;
+  uint32_t n_irq_routes;
+  struct cap_token iommu_token;  // narrowed requester authority
+  struct cap_token irq_wildcard; // copied shared MSI allocate+bind authority
+  struct cap_token irq_routes[PCI_DRIVER_MAX_IRQ_ROUTES]; // driver reply
+  uint64_t service_channel;
 };
+
+#define PCI_DRIVER_QUEUES_READY 1
+#define PCI_DRIVER_LIVE         2
+#define PCI_DRIVER_STOP         3
+#define PCI_DRIVER_DMA_STOPPED  4
 ```
 
-The driver receives shared BAR views rather than a devmem token, so it cannot
-create arbitrary device mappings. Its start record carries a requester token
-and IRQ route token; numeric requester identity remains present for
-diagnostics and ring-scoped detach, not as attach authority.
+`pcid` zeroes the whole page, fills every immutable field through
+`irq_wildcard`, then starts the child. The driver is the only writer of
+`n_irq_routes` and `irq_routes[]`; unused entries remain zero. State
+transitions are sequential: driver `QUEUES_READY`, `pcid` `LIVE`,
+`pcid` `STOP`, driver `DMA_STOPPED`. Every producer release-stores
+`state` only after its associated fields/actions are complete; every
+consumer acquire-loads it before reading them. Both sides reject an
+unknown version, `n_bars > PCI_DRIVER_MAX_BARS`, or
+`n_irq_routes > PCI_DRIVER_MAX_IRQ_ROUTES`.
+
+The driver receives shared BAR views rather than a devmem token, so it
+cannot create arbitrary device mappings. Its start record carries a
+narrowed requester token and a byte-for-byte copy of `pcid`'s wildcard
+IRQ token. The latter is intentionally not narrowed in v1: all trusted
+drivers may use it only for fused MSI allocate+bind. Numeric requester
+identity remains present for diagnostics and ring-scoped detach, not as
+attach authority.
 
 Driver-to-`pcid` control requests include readiness, orderly stop, FLR/reset,
 power-state change, and diagnostic config reads from an allowlisted set.
@@ -333,22 +368,49 @@ access another function fail and are logged.
 
 ## 7. IRQ setup
 
-The IRQ design's current `KIRQ_MSI` allocation is retained, but allocation
-and hardware programming belong to `pcid`:
+MSI route allocation is fused with ring binding and belongs to the
+*driver*; hardware programming stays with `pcid`
+([irq-design.md](irq-design.md)):
 
-1. `pcid` asks the IRQ scheme for one or more vector routes and receives
-   opaque address/data pairs.
-2. It masks the function's MSI/MSI-X source.
-3. For MSI, it writes the capability in ECAM. For MSI-X, it maps the table
-   BAR into itself, writes entries, and applies the required ordering.
-4. The driver binds IRQ event delivery to its IRQ ring with the route token
-   returned by `KIRQ_MSI` and copied through its start record.
-5. `pcid` enables MSI/MSI-X and unmasks the selected entries only after the
-   driver reports its queues and IOMMU domain ready.
+1. `pcid` copies its wildcard IRQ token into
+   `pci_driver_start.irq_wildcard`.
+2. During its own setup the driver submits fused `KIRQ_MSI` ops on its
+   IRQ ring: each allocates a free vector route, binds it to that ring
+   atomically, and yields a concrete route token. It stores successful
+   tokens densely in `irq_routes[]`, stores `n_irq_routes`, then
+   release-stores `PCI_DRIVER_QUEUES_READY` to `state`.
+3. `pcid` acquire-observes `QUEUES_READY`, rejects
+   `n_irq_routes > PCI_DRIVER_MAX_IRQ_ROUTES`, and copies each token
+   into its own IRQ-ring block for the offset-based query ABI. This is
+   the complete wire contract; there is no separate `IRQ_READY`
+   rendezvous or variable-length control message.
+4. `pcid` derives each route's address/data pair with `KIRQ_MSI_ADDR` —
+   token-authenticated and generation-checked, so a relayed-wrong or
+   stale token cannot aim a device at someone else's vector — masks the
+   function's MSI/MSI-X source, then programs it: for MSI the capability
+   in ECAM, for MSI-X the table BAR it maps into itself, with the
+   required ordering.
+5. `pcid` enables MSI/MSI-X and unmasks only after programming completes.
 
-`KIRQ_MSI` requires a live route-wildcard parent token and creates a concrete
-route grant. `KIRQ_BIND` verifies that token at the IRQ object; direct-child
-PID provenance is no longer part of authorization.
+Routes die with the driver's IRQ ring — release or ring destruction,
+including `present` routes. Pin routes stay masked until a next
+claimant reprograms; MSI sources follow the mask/reset-before-ring-free
+ordering in §8, subject to the accepted pre-IR stale-source caveat. Thus
+there is no unbound-allocated state and no process-destroy route sweep.
+Authorization is token provenance throughout;
+direct-child PID provenance plays no part.
+
+If the driver cannot allocate all requested routes, it releases every
+route already recorded before reporting failure; process/ring teardown
+is the backstop and reaps any slot it missed. If `pcid` rejects the
+reply or programming fails partway, it keeps every source masked,
+clears BME, kills the driver, and lets IRQ-ring destruction release all
+routes. Tokens left in the setup page retain no slot.
+
+V1 trusts drivers not to exhaust the fixed pool because they all hold
+the wildcard token and there is no quota. Interrupt remapping later
+provides a larger source-indexed namespace, reducing this risk while
+also fencing stale MSI programming.
 
 INTx is deferred entirely: `_PRT` routing requires AML interpretation,
 which is a stated non-goal until an `acpid` exists. V1 devices must support
@@ -365,20 +427,21 @@ pcid:   set Memory Space Enable for the validated BARs
 pcid:   spawn driver; share selected BAR blocks and setup channel
 driver: create IOMMU ring/domain
 driver: map queue and bounce-buffer ublocks
-driver: DEVICE_ATTACH(requester_id)       // v1 first-claim hook
+driver: DEVICE_ATTACH(requester token)
+driver: fuse MSI routes onto its IRQ ring (KIRQ_MSI)
 driver: initialize disabled device queues/register image
-driver -> pcid: QUEUES_READY(function_id)
-pcid:   allocate/program MSI/MSI-X; grant route id to child
-driver: KIRQ_BIND(route_id); driver -> pcid: IRQ_READY
+driver: write n_irq_routes + route tokens; release-store QUEUES_READY
+pcid:   KIRQ_MSI_ADDR per token; program MSI/MSI-X masked
 pcid:   set Bus Master Enable
 pcid:   enable/unmask interrupt source
 pcid -> driver: LIVE
 driver: enable controller and serve block requests
 ```
 
-If any step fails, `pcid` masks interrupts, leaves/clears BME, revokes BAR
-block shares as needed, and kills/reaps the child. It never enables an incompletely
-isolated function.
+If any step fails, `pcid` masks interrupts, leaves/clears BME, revokes
+BAR block shares as needed, and kills the child, runs the
+enumeration-driven teardown choreography, then calls
+`SYS_PROC_DESTROY`. It never enables an incompletely isolated function.
 
 Orderly stop and driver-death recovery use the reverse safety order:
 
@@ -388,8 +451,8 @@ pcid:   request device quiesce, then FLR/reset if necessary
 pcid:   clear Bus Master Enable and read back command/status
 pcid -> driver: DMA_STOPPED             // omitted if driver is dead
 driver: DEVICE_DETACH; unmap; destroy domain
-pcid:   revoke the IRQ route and BAR block shares
-pcid:   reap driver
+pcid:   revoke the BAR block shares (routes die with the driver's IRQ ring)
+pcid:   enumerate/tear down driver resources; PROC_DESTROY(driver)
 ```
 
 Clearing BME is not proof that all earlier posted transactions have drained;
@@ -406,16 +469,19 @@ authority over the bridge.
 
 ## 9. Failure, restart, and ownership
 
-The intended process tree is `init -> pcid -> hardware drivers`. Therefore
-`pcid` receives child-death events and controls reaping. A dead driver cannot
-unmap its BARs or detach itself, so `pcid` performs hardware quiescence and
-the kernel's bounded process-reap path removes IOMMU state, IRQ routes,
-device-block views, and ordinary ublocks in the required order.
+The intended process tree is `init -> pcid -> hardware drivers`.
+Therefore `pcid` receives child-death events and owns cleanup. A dead
+driver cannot unmap its BARs or detach itself, so `pcid` first performs
+hardware quiescence, then uses the enumeration/coercion verbs to remove
+IOMMU mappings, IRQ-ring blocks, device-block views, and ordinary
+ublocks in the required order. `SYS_PROC_DESTROY` only frees the empty
+process body.
 
 If `pcid` dies, init must treat all of its driver descendants as failed:
 
 1. kill the subtree;
-2. rely on bounded reap to mask recorded IRQ routes and revoke device-block
+2. have init walk the dead descendants post-order, freeing IRQ-ring
+   blocks (which release routes) and explicitly revoking device-block
    views;
 3. rely on IOMMU default-deny/context teardown to contain DMA;
 4. restart `pcid`, which re-enumerates only after the old subtree is gone;
@@ -459,7 +525,8 @@ while the block or other views remain.
 4. A driver receives only explicitly selected BAR pages; page rounding never
    exposes another function or protected resource.
 5. BME is set only after a live IOMMU context and required DMA mappings exist.
-6. IRQ sources are masked before route destruction, reset, or driver reap.
+6. IRQ sources are masked before route destruction, reset, or driver
+   process destruction.
 7. BARs are never sized or relocated while a function is live.
 8. Driver death cannot free DMA-pinned memory before context removal and
    IOTLB invalidation.
@@ -489,8 +556,8 @@ while the block or other views remain.
 4. Attempt to map conventional RAM and IOMMU registers; both fail.
 5. Verify BME remains clear until IOMMU attach, queues, and IRQ are ready.
 6. Complete one NVMe command using MSI/MSI-X programmed only by `pcid`.
-7. Kill the driver during I/O; observe mask/reset/BME-clear before bounded
-   IOMMU and memory reap.
+7. Kill the driver during I/O; observe mask/reset/BME-clear before
+   bounded enumerated IOMMU and memory teardown.
 8. Restart the driver and verify no stale IRQ route, device-block view,
    requester context, or BAR mapping survives.
 9. Kill `pcid`; verify the subtree dies and no DMA reaches unpinned memory.
@@ -502,9 +569,9 @@ while the block or other views remain.
 2. Implement device-backed ublocks: no buddy ownership, fixed inherited
    cache type, never `PAGE_X` or DMA-mapped, free without touching device
    registers; test rejection of RAM and protected MMIO.
-3. Implement `SYS_VM_MAP_DEVICE` with no caller policy and non-delegatable
-   ECAM/firmware blocks; delegation, revocation, and reap ride the existing
-   share/move machinery. Mark the capability hooks.
+3. Implement token-authorized `SYS_VM_MAP_DEVICE` and non-delegatable
+   ECAM/firmware blocks; delegation and revocation ride the existing
+   share/move machinery.
 4. Build `pcid`: ACPI/MCFG parser, ECAM mapping, enumeration, topology, and
    capability-list validation (prerequisite: add the ACPI RSDP address to
    bootinfo). Probe inactive functions to validate and then
