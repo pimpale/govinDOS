@@ -327,7 +327,7 @@ static void add_client(struct block_client clients[MAX_CLIENTS], uint64_t base,
       return;
     }
   }
-  sys_vm_dropshare(base);
+  sys_vm_dropshare(base, 0);
 }
 
 static void drain_shares(struct kring *shares,
@@ -446,16 +446,13 @@ void _start(uint64_t arg) {
     print("nvmed: IOMMU setup failed\n");
     sys_proc_exit(1);
   }
-  signal_state(setup, PCI_DRIVER_IOMMU_READY);
-
-  if (!wait_state(setup, PCI_DRIVER_IRQ_GRANTED))
-    sys_proc_exit(1);
   struct kring irq;
   if (kring_create(&irq, KSCHEME_IRQ, PAGE_SIZE) != 0 ||
-      kring_irq_bind(&irq, &setup->irq_token, setup->function_id,
-                     nullptr) != 0)
+      kring_irq_msi(&irq, &setup->irq_wildcard, &setup->irq_routes[0],
+                    nullptr) != 0)
     sys_proc_exit(1);
-  signal_state(setup, PCI_DRIVER_IRQ_READY);
+  setup->n_irq_routes = 1;
+  signal_state(setup, PCI_DRIVER_QUEUES_READY);
   if (!wait_state(setup, PCI_DRIVER_LIVE))
     sys_proc_exit(1);
 
@@ -507,7 +504,7 @@ void _start(uint64_t arg) {
     }
     print(saw_fault ? "nvmed: bad PRP contained by IOMMU\n"
                     : "nvmed: IOMMU fault event MISSING\n");
-    print("nvmed: exiting first instance for reap/restart test\n");
+    print("nvmed: exiting first instance for destroy/restart test\n");
     sys_proc_exit(1);
   }
 

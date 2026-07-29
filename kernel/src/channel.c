@@ -23,8 +23,8 @@
 // on its cq_count word per posted CQE.
 //
 // Locking (hierarchy in umem.h): ring drains, scheme replays, and
-// teardown run under g_umem; CQ publication itself takes the ring
-// block's stripe, and the post's futex wake nests a bucket inside it.
+// teardown run under g_umem; CQ publication itself takes the ring-local
+// lock, and the post's futex wake nests a bucket inside it.
 
 // Post one CQE. Full against the *user-owned* consumption index, read
 // once and never trusted: a cq_head run ahead of cq_count makes the
@@ -54,23 +54,20 @@ bool ring_post_locked(struct ring *ring, uint64_t type, uint64_t a,
 
 bool channel_post(struct ring *ring, uint64_t type, uint64_t a, uint64_t b,
                   uint64_t status) {
-  uint32_t si = umem_stripe(ring->block->base);
-  umem_stripe_lock(si);
+  svclock_lock(&ring->cq_lock);
   bool posted = ring_post_locked(ring, type, a, b, status);
-  umem_stripe_unlock(si);
+  svclock_unlock(&ring->cq_lock);
   return posted;
 }
 
 bool channel_post_data(struct ring *ring, uint64_t type, uint64_t a,
                        uint64_t b, uint64_t status, uint32_t *index_out) {
-  ublock *blk = ring->block;
-  uint32_t si = umem_stripe(blk->base);
-  umem_stripe_lock(si);
+  svclock_lock(&ring->cq_lock);
   bool posted = ring_post_locked(ring, type, a, b, status);
   if (posted) {
     *index_out = ring->cq_count - 1;
   }
-  umem_stripe_unlock(si);
+  svclock_unlock(&ring->cq_lock);
   return posted;
 }
 
@@ -130,9 +127,9 @@ static uint64_t scheme_exec(struct thread *curr, struct ring *ring,
 #define RING_SQ_BATCH 1024
 #define RING_SQ_CHUNK 64
 
-// Drain up to `budget` SQEs. g_umem held, no stripe held: the sq_head
+// Drain up to `budget` SQEs. g_umem held, no CQ lock held: the sq_head
 // cursor is g_umem-only state (drains are its sole touchers), and each
-// completion CQE takes the ring's stripe inside channel_post. Returns
+// completion CQE takes the ring-local lock inside channel_post. Returns
 // the number consumed.
 static uint32_t ring_run_chunk(struct thread *curr, struct ring *ring,
                                uint32_t budget) {
@@ -203,7 +200,7 @@ uint64_t channel_scheme_create(struct process *p, uint64_t base,
   ublock *b = umem_owned_locked(p, base);
   if (b == nullptr || b->backing != UBLOCK_RAM || b->ring != nullptr ||
       atomic_load(&b->thread_pins) != 0 ||
-      vec_share_edge_len(b->sharers) != 0) {
+      llrb_pid_edge_len(b->sharers) != 0) {
     umem_proc_unlock(p);
     umem_unlock();
     return SYSERR_INVAL;
@@ -242,10 +239,7 @@ uint64_t channel_scheme_create(struct process *p, uint64_t base,
   memset(h, 0, sizeof(*h));
   h->nslots = ring->nslots;
 
-  uint32_t si = umem_stripe(b->base);
-  umem_stripe_lock(si);
   b->ring = ring;
-  umem_stripe_unlock(si);
   umem_proc_unlock(p);
 
   if (anchor != nullptr) {
@@ -261,18 +255,14 @@ uint64_t channel_scheme_create(struct process *p, uint64_t base,
 }
 
 void channel_ring_destroy(ublock *b) {
-  // Caller holds g_umem, not the stripe. Clearing b->ring under the
-  // stripe means no new CQ post can reach the ring; earlier posters
-  // finished before the clear acquired it. Parked futex waiters are not
-  // notified — their recovery is their deadline (futex-design.md §5).
-  uint32_t si = umem_stripe(b->base);
-  struct ring *ring = nullptr;
-  umem_stripe_lock(si);
-  if (b->ring != nullptr) {
-    ring = b->ring;
-    b->ring = nullptr;
-  }
-  umem_stripe_unlock(si);
+  // Caller holds g_umem. Clearing the control-plane reference prevents new
+  // lookups. The scheme destroy operation then detaches every borrowed
+  // data-plane reference under its route/device lifetime lock. Taking the CQ
+  // lock once afterward is the final barrier before freeing the ring.
+  // Parked futex waiters are not notified — their recovery is their deadline
+  // (futex-design.md §5).
+  struct ring *ring = b->ring;
+  b->ring = nullptr;
   if (ring == nullptr) {
     return;
   }
@@ -286,6 +276,8 @@ void channel_ring_destroy(ublock *b) {
   if (ring->ops->destroy != nullptr) {
     ring->ops->destroy(ring);
   }
+  svclock_lock(&ring->cq_lock);
+  svclock_unlock(&ring->cq_lock);
   slab_ring_free(ring);
 }
 
@@ -295,15 +287,16 @@ bool channel_block_destroyable(ublock *b) {
 }
 
 void channel_thread_complete_locked(struct process *p, ublock *block,
-                                    uint64_t event) {
+                                    uint64_t event, bool publish) {
   asserts(block != nullptr && block->owner == p,
           "thread completion: bad block");
   asserts(atomic_load(&block->thread_pins) != 0,
           "thread completion: unpinned block");
-  // Registration kept the block private, writable, and identity-stable.
-  // The publish-under-bucket makes the durable one-shot transition
-  // lossless against a concurrent compare-and-park; multi-joiner fan-out
-  // is userspace's chain-wake (futex-design.md §4).
-  futex_publish_wake(event, GDOS_THREAD_COMPLETE);
+  if (publish) {
+    // Registration kept the block private, writable, and identity-stable.
+    // The publish-under-bucket makes the durable one-shot transition
+    // lossless against a concurrent compare-and-park.
+    futex_publish_wake(event, GDOS_THREAD_COMPLETE);
+  }
   atomic_fetch_sub(&block->thread_pins, 1);
 }

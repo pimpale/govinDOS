@@ -413,12 +413,6 @@ static struct pci_bar *bar_by_index(struct pci_function *f, uint8_t index) {
   return nullptr;
 }
 
-static bool allocate_msi(uint64_t *address, uint32_t *data,
-                         struct cap_token *route) {
-  return kring_irq_msi(&g_irq_control, &g_bootstrap->cap_irq, route,
-                       address, data) == 0;
-}
-
 static bool program_interrupt_masked(struct managed_driver *m,
                                      uint64_t address, uint32_t data) {
   struct pci_function *f = m->function;
@@ -609,6 +603,7 @@ static void prepare_nvme(struct pci_function *f) {
     setup->requester_id = f->requester_id;
     setup->function_id = ++g_driver_generation;
     setup->service_channel = (uint64_t)service;
+    setup->irq_wildcard = g_bootstrap->cap_irq;
     setup->bars[0] = (struct pci_driver_bar){
         .base = start,
         .length = length,
@@ -644,12 +639,19 @@ static void prepare_nvme(struct pci_function *f) {
                                        .pid = child,
                                        .bar_block = start,
                                        .service_block = (uint64_t)service};
-    if (!wait_state(setup, PCI_DRIVER_IOMMU_READY))
+    if (!wait_state(setup, PCI_DRIVER_QUEUES_READY))
       return;
+    if (setup->n_irq_routes == 0 ||
+        setup->n_irq_routes > PCI_DRIVER_MAX_IRQ_ROUTES) {
+      print("pcid: invalid IRQ route reply\n");
+      sys_proc_kill(child);
+      return;
+    }
     uint64_t msi_address;
     uint32_t msi_data;
-    if (!allocate_msi(&msi_address, &msi_data, &setup->irq_token)) {
-      print("pcid: MSI allocation failed\n");
+    if (kring_irq_msi_addr(&g_irq_control, &setup->irq_routes[0],
+                           &msi_address, nullptr, &msi_data) != 0) {
+      print("pcid: MSI route query failed\n");
       sys_proc_kill(child);
       return;
     }
@@ -658,9 +660,6 @@ static void prepare_nvme(struct pci_function *f) {
       sys_proc_kill(child);
       return;
     }
-    signal_state(setup, PCI_DRIVER_IRQ_GRANTED);
-    if (!wait_state(setup, PCI_DRIVER_IRQ_READY))
-      return;
     command = cfg16(f->config, PCI_COMMAND);
     cfg16_write(f->config, PCI_COMMAND,
                 command | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER |
@@ -675,18 +674,9 @@ static void prepare_nvme(struct pci_function *f) {
   }
 }
 
-static void reap_child(uint64_t pid) {
-  for (;;) {
-    uint64_t rc = sys_proc_reap(pid);
-    if (rc == REAP_DONE)
-      return;
-    if (rc == SYSERR_AGAIN) {
-      sys_yield();
-      continue;
-    }
-    if (rc != REAP_MORE)
-      return;
-  }
+static void destroy_child(uint64_t pid) {
+  if (!pe_destroy(pid))
+    print("pcid: process destroy failed\n");
 }
 
 static void driver_died(void) {
@@ -699,14 +689,14 @@ static void driver_died(void) {
               (command & ~(PCI_COMMAND_MASTER | PCI_COMMAND_MEMORY)) |
                   PCI_COMMAND_INT_DISABLE);
   (void)cfg16(g_driver.function->config, PCI_COMMAND);
-  reap_child(g_driver.pid);
+  destroy_child(g_driver.pid);
   if (g_driver.table_block)
     sys_vm_free(g_driver.table_block);
   sys_vm_free(g_driver.bar_block);
   sys_vm_free(g_driver.service_block);
   sys_vm_free((uint64_t)g_driver.setup);
   memset(&g_driver, 0, sizeof(g_driver));
-  print("pcid: dead driver disabled and reaped\n");
+  print("pcid: dead driver disabled and destroyed\n");
   if (g_driver_generation == 1) {
     print("pcid: restarting NVMe after death-path test\n");
     prepare_nvme(function);

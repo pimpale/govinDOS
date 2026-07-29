@@ -195,8 +195,7 @@ uint64_t kring_irq_ack(struct kring *r, uint64_t gsi, uint64_t seq) {
 }
 
 uint64_t kring_irq_msi(struct kring *r, const struct cap_token *parent,
-                       struct cap_token *out, uint64_t *address,
-                       uint32_t *data) {
+                       struct cap_token *out, uint32_t *route_id) {
   uint64_t off = data_off(r);
   *(struct cap_token *)(r->base + off) = *parent;
   struct ksqe *sqe = kring_get_sqe(r);
@@ -208,24 +207,27 @@ uint64_t kring_irq_msi(struct kring *r, const struct cap_token *parent,
   if (rc == 0) rc = wait_completion(r, KIRQ_MSI, &cqe);
   if (rc == 0) {
     *out = *(struct cap_token *)(r->base + off + CAP_TOKEN_SIZE);
-    *address = cqe.a;
-    *data = KIRQ_MSI_DATA(cqe.b);
+    if (route_id != nullptr) *route_id = (uint32_t)cqe.a;
   }
   return rc;
 }
 
-uint64_t kring_irq_bind(struct kring *r, const struct cap_token *token,
-                        uint64_t cookie, uint32_t *route_id) {
+uint64_t kring_irq_msi_addr(struct kring *r, const struct cap_token *token,
+                            uint64_t *address, uint32_t *route_id,
+                            uint32_t *data) {
   uint64_t off = data_off(r);
   *(struct cap_token *)(r->base + off) = *token;
   struct ksqe *sqe = kring_get_sqe(r);
   if (sqe == nullptr) return SYSERR_AGAIN;
-  *sqe = (struct ksqe){.op = KIRQ_BIND, .a = off, .b = CAP_TOKEN_SIZE,
-                       .c = cookie};
+  *sqe = (struct ksqe){.op = KIRQ_MSI_ADDR, .a = off, .b = CAP_TOKEN_SIZE};
   uint64_t rc = kring_submit(r);
   struct kcqe cqe;
-  if (rc == 0) rc = wait_completion(r, KIRQ_BIND, &cqe);
-  if (rc == 0 && route_id != nullptr) *route_id = (uint32_t)cqe.a;
+  if (rc == 0) rc = wait_completion(r, KIRQ_MSI_ADDR, &cqe);
+  if (rc == 0) {
+    if (address != nullptr) *address = cqe.a;
+    if (route_id != nullptr) *route_id = KIRQ_MSI_ROUTE(cqe.b);
+    if (data != nullptr) *data = KIRQ_MSI_DATA(cqe.b);
+  }
   return rc;
 }
 

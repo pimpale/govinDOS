@@ -21,20 +21,28 @@ void slabs_init(void) {
           "slab: grant-node arena initialization failed");
   asserts(slab_llrb_pid_process_node_init(count),
           "slab: pid-node arena initialization failed");
+  asserts(slab_llrb_base_ublock_node_init(count),
+          "slab: block-node arena initialization failed");
+  asserts(slab_llrb_base_block_node_init(count),
+          "slab: owned-block arena initialization failed");
+  asserts(slab_llrb_pid_edge_node_init(count),
+          "slab: share-edge arena initialization failed");
+  asserts(slab_llrb_base_edge_node_init(count),
+          "slab: view-index arena initialization failed");
+  asserts(slab_llrb_tid_thread_node_init(count),
+          "slab: thread-index arena initialization failed");
   asserts(slab_llrb_tdeadline_node_init(count),
           "slab: deadline-node arena initialization failed");
   asserts(slab_thread_init(count),
           "slab: thread arena initialization failed");
   asserts(slab_process_init(count),
           "slab: process arena initialization failed");
-  asserts(slab_ublock_init(count),
-          "slab: ublock arena initialization failed");
   asserts(slab_ring_init(count), "slab: ring arena initialization failed");
   asserts(slab_grant_init(count), "slab: grant arena initialization failed");
   asserts(slab_iommu_domain_init(count),
           "slab: IOMMU-domain arena initialization failed");
   asserts(slab_iommu_device_init(count),
           "slab: IOMMU-device arena initialization failed");
-  asserts(slab_iommu_mapping_init(count),
+  asserts(slab_llrb_domid_map_node_init(count),
           "slab: IOMMU-mapping arena initialization failed");
 }

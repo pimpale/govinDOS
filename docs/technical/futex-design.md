@@ -343,10 +343,10 @@ and the kernel-scheme establishment protocol are unchanged.
 ## 3. Wait queues
 
 **The bucket table.** A static array `g_futex[1024]` of `{ spinlock;
-llrb_futex *waiters; }`, indexed by `hash(addr & ~3ull)`. Same pattern
-and same rank as `g_stripes` (below the per-process list locks), but a
-plain `spinlock` rather than an `svclock`: no futex path is ever held
-across `as_flush`, and the timeout path (§6) takes a bucket from
+llrb_futex *waiters; }`, indexed by `hash(addr & ~3ull)`. Buckets rank
+below per-process list locks and ring-local CQ locks. They use a plain
+`spinlock` rather than an `svclock`: no futex path is ever held across
+`as_flush`, and the timeout path (§6) takes a bucket from
 interrupt context, where a shootdown-servicing lock is forbidden.
 
 **Each bucket is an ordered tree, not a chain.** Reuse the existing
@@ -457,9 +457,8 @@ is the same outcome as any other use of a revoked block.
 `PAGE_U` at `addr`; load the word; compare; insert; arm any deadline
 (§6); drop the bucket; `uthread_park_blocked()`. A wake between the
 last look at the word and the park cannot be lost because the waker
-takes the same bucket — the same argument that makes
-`channel_block_wait` race-free today, with the bucket in place of the
-stripe.
+takes the same bucket. The compare and waiter insertion are therefore one
+atomic transaction with respect to every wake.
 
 The view check must sit *inside* the bucket hold, and the placement is
 load-bearing twice over. Authorization: without a view check,
@@ -527,9 +526,8 @@ only one of them is a user thread that can be told "call me again".
 | `channel_thread_complete_locked` | scheduler stack, post-deschedule | **wake exactly one**, chain the rest |
 
 **Pop under the lock, unblock outside it.** `thread_unblock` spins on
-the target's `on_cpu` until its context save completes. Today's
-`wake_slot` does that spin holding the block's stripe, which is
-tolerable for one thread; a batch wake must not hold a bucket across up
+the target's `on_cpu` until its context save completes. A batch wake must
+not hold a bucket across up
 to `FUTEX_WAKE_BATCH` such spins. Follow managarm: detach the batch into
 a local list under the bucket lock, drop the lock, then unblock each.
 The bucket hold becomes a few pointer writes. The waker CASes each
@@ -556,7 +554,7 @@ argument, not the mechanism.) The handler does a seek, a removal, and a
 across a shootdown (§3).
 
 The rules from [irq-design.md](irq-design.md) §4 carry over, with the
-lock list extended: the handler may take stripes, futex buckets, the
+lock list extended: the handler may take ring CQ locks, futex buckets, the
 per-CPU timer locks, `g_allocator_lock`, and the scheduler lock, and
 must never take `g_umem`. The timer locks are in the list because a
 claimed ring waiter that parked with a deadline — `epoll_wait` with a

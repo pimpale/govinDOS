@@ -6,11 +6,11 @@
 // (docs/technical/boot-init-design.md §0).
 //
 // Children below are built here, parent-driven, the way real userspace
-// does it (ipc-process-design.md §5): PROC_CREATE an embryo, VM_MOVE it
+// does it (ipc-process-design.md §5): PROC_CREATE a child, VM_MOVE it
 // a stack, VM_SHARE it this very image read-execute (SASOS: the child
 // runs the same code at the same addresses), pre-seed a bootstrap
 // channel, THREAD_SPAWN its first thread. Children exercise the channel
-// data plane from the far side; kill/reap/tree-events are exercised from
+// data plane from the far side; kill/destroy/tree-events are exercised from
 // this side.
 //
 // Kernel channels go through gdoslib-dev <kring.h> (so every boot exercises
@@ -111,7 +111,7 @@ static void test_memory(void) {
   print("pe: vm_share to self rc=");
   print_hex(sys_vm_share(blk, (int64_t)sys_getpid(), VM_PROT_READ));
   print("pe: vm_dropshare of owned block rc=");
-  print_hex(sys_vm_dropshare(blk));
+  print_hex(sys_vm_dropshare(blk, 0));
   print("pe: vm_unshare with no edge rc=");
   print_hex(sys_vm_unshare(blk, 0xdead));
   print("pe: cleanup vm_free rc=");
@@ -342,7 +342,6 @@ static void test_pthreads(void) {
         pthread_mutex_unlock(&timed_mutex) == 0 &&
         pthread_mutex_timedlock(&timed_mutex, &abstime) == 0 &&
         pthread_mutex_unlock(&timed_mutex) == 0;
-
   print(ok ? "tests: pthread lifecycle/TLS/synchronization ok\n"
            : "tests: PTHREAD IMPLEMENTATION FAILED\n");
 }
@@ -508,7 +507,7 @@ static void child_main(uint64_t boot_ch) {
   print("child: hello (spawned by tests)\n");
 
   // Create a shares channel; the bootstrap block was shared to us while
-  // we were still an embryo, so its KEV_SHARE must replay right here
+  // it predated this ring, so its KEV_SHARE must replay right here
   // (as must the image's — both edges predate the ring).
   struct kring sch;
   print("child: kring_create(ch, -1) rc=");
@@ -557,7 +556,7 @@ static void child_main(uint64_t boot_ch) {
   print(sentinel ? "child: close sentinel ok, dropping share\n"
                  : "child: CLOSE SENTINEL WRONG\n");
   print("child: vm_dropshare(boot_ch) rc=");
-  print_hex(sys_vm_dropshare(boot_ch));
+  print_hex(sys_vm_dropshare(boot_ch, 0));
   sys_proc_exit(0);
 }
 
@@ -571,7 +570,7 @@ static void child_spin_main(uint64_t arg) {
 }
 
 // Announce that we reached the channel, then remain parked. Killing this
-// process exercises lazy dead-waiter detachment and reap-owned TCB freeing:
+// process exercises lazy dead-waiter detachment and explicit TCB disposal:
 // the victim must never be enqueued merely to be culled.
 static void child_park_main(uint64_t boot_ch) {
   volatile uint32_t *ready = (volatile uint32_t *)boot_ch;
@@ -584,7 +583,7 @@ static void child_park_main(uint64_t boot_ch) {
 
 // First thread of the preemption-test child: burns CPU in ring 3 and
 // never enters the kernel again. Only the quantum timer can pull it in,
-// so killing AND reaping it proves preemption end to end — the reap
+// so killing AND destroying it proves preemption end to end — destruction
 // needs the thread culled at a kernel entry and the AS drained off its
 // CPU, neither of which can happen while it sits in ring 3.
 static void child_burn_main(uint64_t arg) {
@@ -617,6 +616,28 @@ static void child_process_exit_main(uint64_t arg) {
   sys_proc_exit(0x42);
 }
 
+struct parent_authority_event {
+  _Atomic uint32_t primary_ready;
+  _Atomic uint32_t worker_ran;
+  _Atomic uint32_t release;
+};
+
+static void child_parent_managed_main(uint64_t event_base) {
+  struct parent_authority_event *event = (void *)event_base;
+  atomic_store_explicit(&event->primary_ready, 1, memory_order_release);
+  sys_futex_wake(&event->primary_ready, 1);
+  while (atomic_load_explicit(&event->release, memory_order_acquire) == 0)
+    sys_futex_wait(&event->release, 0, nullptr, 0);
+  sys_proc_exit(0);
+}
+
+static void child_parent_spawned_worker(uint64_t event_base) {
+  struct parent_authority_event *event = (void *)event_base;
+  atomic_store_explicit(&event->worker_ran, 1, memory_order_release);
+  sys_futex_wake(&event->worker_ran, 1);
+  sys_thread_exit();
+}
+
 // Build a child process the parent-driven way and return its pid.
 // entry runs on our shared image; boot_ch (may be 0) is its argument.
 static uint64_t spawn_child(void (*entry)(uint64_t), uint64_t boot_ch) {
@@ -624,7 +645,7 @@ static uint64_t spawn_child(void (*entry)(uint64_t), uint64_t boot_ch) {
   print("tests: proc_create pid=");
   print_hex(pid);
 
-  // Stack: built here, ownership transferred into the embryo.
+  // Stack: built here, ownership transferred into the child.
   uint64_t stack = sys_vm_alloc(8192, VM_PROT_READ | VM_PROT_WRITE);
   uint64_t stack_bytes = sys_vm_size(stack);
   print("tests: vm_move(stack) rc=");
@@ -642,8 +663,8 @@ static uint64_t spawn_child(void (*entry)(uint64_t), uint64_t boot_ch) {
                          VM_PROT_READ | VM_PROT_EXEC));
 
   if (boot_ch != 0) {
-    // Pre-seed the bootstrap channel while the child is an embryo — the
-    // seL4/Xen answer to how strangers ever get introduced.
+    // Pre-seed the bootstrap channel before starting the child — the
+    // seL4/Xen answer to how strangers are initially introduced.
     print("tests: vm_share(boot_ch) rc=");
     print_hex(
         sys_vm_share(boot_ch, (int64_t)pid, VM_PROT_READ | VM_PROT_WRITE));
@@ -663,28 +684,9 @@ static uint64_t spawn_child(void (*entry)(uint64_t), uint64_t boot_ch) {
   return pid;
 }
 
-// Drive SYS_PROC_REAP to completion, yielding through SYSERR_AGAIN
-// (culling/drain may lag the death by a few dispatches).
-static void reap_child(uint64_t pid) {
-  uint64_t steps = 0;
-  while (1) {
-    uint64_t rc = sys_proc_reap(pid);
-    if (rc == REAP_DONE) {
-      break;
-    }
-    if (rc == SYSERR_AGAIN) {
-      sys_yield();
-      continue;
-    }
-    if (rc != REAP_MORE) {
-      print("tests: REAP FAILED rc=");
-      print_hex(rc);
-      return;
-    }
-    steps++;
-  }
-  print("tests: reaped in bounded steps=");
-  print_hex(steps);
+static void destroy_child(uint64_t pid) {
+  print(pe_destroy(pid) ? "tests: process destroyed\n"
+                        : "tests: PROCESS DESTROY FAILED\n");
 }
 
 // Wait for the next KEV_CHILD_DEAD on the tree channel and consume it.
@@ -934,41 +936,86 @@ static void test_process_tree(struct kring *tch) {
   print("tests: vm_free(boot_ch) after dropshare rc=");
   print_hex(free_rc);
   await_child_death(tch);
-  reap_child(c1);
+  destroy_child(c1);
 
-  // A reaped pid is gone for good (never reused): all verbs refuse it.
-  print("tests: reap of reaped pid rc=");
-  print_hex(sys_proc_reap(c1));
+  // A destroyed pid is gone for good (never reused): all verbs refuse it.
+  print("tests: destroy of destroyed pid rc=");
+  print_hex(sys_proc_destroy(c1));
 
-  // --- Child 2: kill a running process ----------------------------------
-  uint64_t c2 = spawn_child(child_spin_main, 0);
+  // --- Child 2: direct-parent authority remains after first spawn -------
+  uint64_t authority_block =
+      sys_vm_alloc(4096, VM_PROT_READ | VM_PROT_WRITE);
+  struct parent_authority_event *authority = (void *)authority_block;
+  uint64_t c2 = spawn_child(child_parent_managed_main, authority_block);
+  while (atomic_load_explicit(&authority->primary_ready,
+                              memory_order_acquire) == 0)
+    sys_futex_wait(&authority->primary_ready, 0, nullptr, 0);
+
+  uint64_t live_stack = sys_vm_alloc(8192, VM_PROT_READ | VM_PROT_WRITE);
+  uint64_t live_stack_bytes = sys_vm_size(live_stack);
+  uint64_t live_move = sys_vm_move(live_stack, c2);
+  uint64_t live_protect = sys_vm_protect_for(live_stack, 4096, 0, c2);
+  struct gdos_thread_start live_start = {
+      .version = GDOS_THREAD_START_VERSION,
+      .size = sizeof(live_start),
+      .entry = (uint64_t)child_parent_spawned_worker,
+      .argument = authority_block,
+      .stack_pointer =
+          live_stack + live_stack_bytes - GDOS_THREAD_ENTRY_FRAME_BYTES,
+  };
+  uint64_t live_tid = sys_thread_spawn(c2, &live_start);
+  bool live_authority_ok =
+      live_move == 0 && live_protect == 0 && !sys_iserr(live_tid);
+  if (live_authority_ok) {
+    while (atomic_load_explicit(&authority->worker_ran,
+                                memory_order_acquire) == 0)
+      sys_futex_wait(&authority->worker_ran, 0, nullptr, 0);
+  }
+  print(live_authority_ok &&
+                atomic_load_explicit(&authority->worker_ran,
+                                     memory_order_acquire) != 0
+            ? "tests: live direct-child move/protect/spawn ok\n"
+            : "tests: LIVE DIRECT-CHILD AUTHORITY FAILED\n");
+  atomic_store_explicit(&authority->release, 1, memory_order_release);
+  sys_futex_wake(&authority->release, 1);
+  await_child_death(tch);
+  print("tests: vm_unshare(parent-authority block) rc=");
+  print_hex(sys_vm_unshare(authority_block, c2));
+  destroy_child(c2);
+  if (live_move != 0)
+    sys_vm_free(live_stack);
+  print("tests: vm_free(parent-authority block) rc=");
+  print_hex(sys_vm_free(authority_block));
+
+  // --- Child 3: kill a running process ----------------------------------
+  uint64_t c3 = spawn_child(child_spin_main, 0);
   sys_yield(); // let the victim actually run
   print("tests: proc_kill rc=");
-  print_hex(sys_proc_kill(c2));
+  print_hex(sys_proc_kill(c3));
   await_child_death(tch);
-  reap_child(c2);
+  destroy_child(c3);
 
   // Kill authority: only descendants (not self, not strangers).
   print("tests: kill self rc=");
   print_hex(sys_proc_kill(sys_getpid()));
 
-  // --- Child 3: kill a CPU-bound process (preemption test) --------------
+  // --- Child 4: kill a CPU-bound process (preemption test) --------------
   // The burner never syscalls, so before timer preemption this could
   // never terminate: the victim would spin in ring 3 forever, its thread
   // never culled and its AS pinned on whatever CPU ran it.
-  uint64_t c3 = spawn_child(child_burn_main, 0);
+  uint64_t c4 = spawn_child(child_burn_main, 0);
   for (int i = 0; i < 64; i++) {
     sys_yield(); // let the burner get dispatched somewhere
   }
   print("tests: proc_kill(burner) rc=");
-  print_hex(sys_proc_kill(c3));
+  print_hex(sys_proc_kill(c4));
   await_child_death(tch);
-  reap_child(c3);
+  destroy_child(c4);
 
-  // --- Child 4: kill a thread parked on a revoked block -----------------
+  // --- Child 5: kill a thread parked on a revoked block -----------------
   uint64_t park_ch = sys_vm_alloc(4096, VM_PROT_READ | VM_PROT_WRITE);
   volatile uint32_t *ready = (volatile uint32_t *)park_ch;
-  uint64_t c4 = spawn_child(child_park_main, park_ch);
+  uint64_t c5 = spawn_child(child_park_main, park_ch);
   while (__atomic_load_n(ready, __ATOMIC_ACQUIRE) == 0) {
     sys_futex_wait(ready, 0, nullptr, 0);
   }
@@ -978,23 +1025,23 @@ static void test_process_tree(struct kring *tch) {
   // Owner-side coercion: revoke the (unresponsive) peer's edge, then the
   // free succeeds with the peer's thread still parked on the word — the
   // kernel never wakes waiters on revocation.
-  print("tests: vm_unshare(park_ch, c4) rc=");
-  print_hex(sys_vm_unshare(park_ch, c4));
+  print("tests: vm_unshare(park_ch, c5) rc=");
+  print_hex(sys_vm_unshare(park_ch, c5));
   print("tests: vm_free(park_ch) rc=");
   print_hex(sys_vm_free(park_ch));
   print("tests: proc_kill(parked) rc=");
-  print_hex(sys_proc_kill(c4));
+  print_hex(sys_proc_kill(c5));
   await_child_death(tch);
   // Reap claims the parked TCB (PARKED -> CLAIMED), removes its futex
   // node, and frees it.
-  reap_child(c4);
+  destroy_child(c5);
 
-  // --- Child 5: one thread exits the whole multithreaded process ----------
-  uint64_t c5 = spawn_child(child_process_exit_main, 0);
+  // --- Child 6: one thread exits the whole multithreaded process ----------
+  uint64_t c6 = spawn_child(child_process_exit_main, 0);
   uint64_t exit_status = await_child_death(tch);
   print(exit_status == 0x42 ? "tests: process-wide exit status/peer cull ok\n"
                             : "tests: PROCESS-WIDE EXIT FAILED\n");
-  reap_child(c5);
+  destroy_child(c6);
 
 }
 
@@ -1033,7 +1080,7 @@ void _start(uint64_t arg) {
   test_process_tree(&tch);
 
   print("tests: all tests done\n");
-  // Unlike the old hello.c-as-init, this process may exit: init reaps
+  // Unlike the old hello.c-as-init, this process may exit: init destroys
   // us, which frees our image, stack, and the tree-channel block.
   sys_proc_exit(0);
 }

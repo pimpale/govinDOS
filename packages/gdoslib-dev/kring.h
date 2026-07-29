@@ -101,10 +101,10 @@ uint64_t kring_irq_claim(struct kring *r, const struct cap_token *token,
 uint64_t kring_irq_release(struct kring *r, uint64_t gsi);
 uint64_t kring_irq_ack(struct kring *r, uint64_t gsi, uint64_t seq);
 uint64_t kring_irq_msi(struct kring *r, const struct cap_token *parent,
-                       struct cap_token *out, uint64_t *address,
-                       uint32_t *data);
-uint64_t kring_irq_bind(struct kring *r, const struct cap_token *token,
-                        uint64_t cookie, uint32_t *route_id);
+                       struct cap_token *out, uint32_t *route_id);
+uint64_t kring_irq_msi_addr(struct kring *r, const struct cap_token *token,
+                            uint64_t *address, uint32_t *route_id,
+                            uint32_t *data);
 
 uint64_t kring_iommu_attach(struct kring *r, uint64_t domain,
                             const struct cap_token *token,

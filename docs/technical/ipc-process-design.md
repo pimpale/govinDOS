@@ -13,7 +13,7 @@ its §7 and the eager teardown walks in its §6), this one is what's
 implemented — the reaper kthread is gone.
 
 Implementation map: `channel.c/h` (channels, private events, kernel ring ABI,
-schemes, waiter slots), `process.c/h` (tree, embryo, kill, zombies,
+schemes, waiter slots), `process.c/h` (tree, parent authority, kill, zombies,
 destruction), `umem.c/h` (share edges, revoke authority, VM_MOVE
 mechanics, live-pid index), `syscall.c/h` (dispatch; SYSCALL/SYSRET),
 `packages/tests/tests.c` (the ring-3 test suite for all of it —
@@ -68,11 +68,12 @@ the roles; see [boot-init-design.md](boot-init-design.md)).
   either: teardown — the one long-running job — is the parent's
   enumeration/destroy
   loop, so the scheduler/idle loops are pure dispatch.
-- **Process trees, parent-driven creation, no reparenting ever.**
-  Parents build children from their own resources (embryo state, block
-  ownership transfer, explicit first-thread spawn). **Killing a process
+- **Process trees, parent-driven creation and management, no reparenting
+  ever.** Parents build and continue to manage direct children from their
+  own resources (block ownership transfer, protection, thread spawn).
+  **Killing a process
   logically kills every descendant through immutable parent links.** No
-  eager subtree walk is needed. Orphaned embryos die with their
+  eager subtree walk is needed. Zero-thread children die with their
   parent by the same rule; a grandparent may clean a descendant only
   through an all-dead path. Daemonization means asking init
   (over a channel) to spawn the image as *its* child — Unix's
@@ -96,10 +97,8 @@ share edge, and per-scheme endpoint state
 for kernel channels (§2). The ublock sharer machinery is the single
 source of truth for who participates, and its revoke path is the single
 teardown authority. There is no session object, no per-process session
-list, no IPC registry. (Locking, as implemented 2026-07-11: the wait/
-doorbell data plane runs on per-process list locks + per-block stripe
-locks and never takes the global umem lock — see §7's lock-split entry
-and memory-design.md §5.)
+list, no IPC registry. Ring CQ publication uses a lock embedded in the
+ring; ring drains and ownership-graph mutations use `g_umem`.
 
 ### Syscalls
 
@@ -161,7 +160,7 @@ revoke — memory-design §5.)
 
 - `SYS_BLOCK_WAIT(addr, expected) -> 0` — (may park.) `addr` is any
   4-byte-aligned address inside a block the caller has a view of
-  (`SYSERR_INVAL` otherwise). Under the block's stripe lock: load the
+  (`SYSERR_INVAL` otherwise). Under the address's futex bucket: load the
   32-bit word at `addr`; if it differs from `expected`, return 0
   immediately; else append to the private FIFO, or park in the caller's
   structural side slot for a shared/kernel endpoint, until a wake: the
@@ -169,9 +168,9 @@ revoke — memory-design §5.)
   (returns 0); or revocation/identity change (`SYSERR_DEAD`). Parking on a user channel
   whose peer process is no longer live fails `SYSERR_DEAD` up front (a
   live-pid index check, §4) — only threads already parked at the death
-  wait for reap-time revocation. Doorbell, post, and park all take that
-  same stripe, so a wake between the caller's last look at the word and
-  its park cannot be lost — the protocol is verbatim the old
+  wait for reap-time revocation. Wake and park take the same bucket, so a
+  wake between the caller's last look at the word and its park cannot be
+  lost — the protocol is verbatim the old
   `ring_wait_user`, generalized to a caller-chosen word. The loaded word is untrusted:
   the kernel only compares it, and a lying peer can only misdirect
   waiters who chose to rendezvous with it. Private blocks admit any number of
@@ -565,9 +564,9 @@ zero-copy.
 ### Creation protocol
 
 ```
-SYS_PROC_CREATE()                        -> pid   // embryo: AS clone, no threads
+SYS_PROC_CREATE()                        -> pid   // alive: AS clone, no threads
 SYS_VM_MOVE(base, pid)                            // ownership transfer along tree edges only (below)
-SYS_VM_PROTECT(base, len, prot [, pid])           // parent may set an embryo's views (W^X after writing)
+SYS_VM_PROTECT(base, len, prot [, pid])           // parent may set a direct child's views
 SYS_THREAD_SPAWN(pid, &start, sizeof start) -> tid // versioned entry/arg/RSP/TLS/completion descriptor
 SYS_THREAD_BASES_SET(fsbase, gsbase)        -> 0   // change the current thread's user TLS bases
 SYS_GETTID()                                -> tid
@@ -582,19 +581,17 @@ SYS_PROC_DESTROY(pid)  -> more | done | again | exist // exact dead descendant t
 - Parent allocates blocks in its own AS, writes the PE image (loader =
   today's pe.c logic as a userland library; relocs computed against
   final addresses), transfers the image + stack blocks, sets per-section
-  W^X on the embryo's views, spawns the first thread. First spawn ends
-  embryo state; parent authority drops to normal peer.
-- `VM_MOVE` runs only along parent↔child tree edges: **down** into your
-  own embryo during construction. General gifting between
-  established processes stays banned — a griefing vector and unneeded;
-  established processes *share* (channels; an unwanted share costs its
+  W^X on the child's views, and spawns its first thread. The direct parent
+  retains those move/protect/spawn powers after the child starts.
+- `VM_MOVE` runs only **down** a direct parent→child tree edge. General
+  gifting between unrelated or non-adjacent processes stays banned;
+  peers *share* (channels; an unwanted share costs its
   target one unshare, while a move changes ownership, which is why only
-  moves are tree-restricted). A parent can
-  pre-seed a bootstrap channel (to itself or a registry server) before
-  first spawn — the seL4/Xen answer to how strangers ever get
-  introduced.
-- `SYS_THREAD_SPAWN(self, ...)` post-embryo gives in-process
-  multithreading with no extra mechanism.
+  moves are tree-restricted). A parent can pre-seed a bootstrap channel
+  (to itself or a registry server) before first spawn — the seL4/Xen
+  answer to how strangers are initially introduced.
+- `SYS_THREAD_SPAWN` accepts self or a live direct child. This supplies
+  both in-process multithreading and parent-directed thread creation.
 - The kernel consumes only an initial user `stack_pointer` (`8 mod 16` at a
   Win64 function entry); allocation bounds and guard pages belong to the
   userspace loader/thread library. It checks that the initial stack page is
@@ -607,8 +604,9 @@ SYS_PROC_DESTROY(pid)  -> more | done | again | exist // exact dead descendant t
 ### The tree
 
 Every process records its immutable parent and children. Killing a process
-marks only the subtree root directly dead; descendants, embryos included,
-are immediately dead by ancestry. This answers the orphaned-embryo problem
+marks only the subtree root directly dead; every descendant, including an
+as-yet zero-thread child, is immediately dead by ancestry. This answers the
+orphaned-child problem
 without walking a broad tree. Running threads die at their next kernel
 entry (the quantum timer bounds hostile CPU-bound code to one quantum);
 runnable threads are culled at dispatch; blocked threads stay off the
@@ -642,7 +640,7 @@ capability design rather than inferred from a user identity.
    `BLOCK_DOORBELL`/`BLOCK_WAIT`, `SYSERR_DEAD` wakes in the revoke
    path. Legacy `SYS_RING_*` kept temporarily.
 2. **Process trees + lifecycle** (§5, §4): u64 pids + live-pid index,
-   embryo, `VM_MOVE` both directions, parent protect/spawn, lazy descendant
+   direct-parent move/protect/spawn authority, lazy descendant
    kill, zombies + `SYS_PROC_DESTROY`, the `-3` tree scheme; pe.c →
    boot-only init loader. This replaces the reaper kthread's job.
 3. **Fault reflection** (§3) — its own session, already agreed.
@@ -736,46 +734,42 @@ rings/dummydev (and their kthreads) had to go with it.
   14 was changed in place; there is no legacy `SYS_THREAD_SPAWN2` spelling.
 - **init**: loaded by the kernel from the embedded PE blob (pe.c's one
   remaining caller); its death is a kernel panic. hello.c is init and
-  the whole ring-3 test suite: it builds children per §5 (embryo, move,
+  the whole ring-3 test suite: it builds children per §5 (create, move,
   share-image-RX — SASOS makes the entry pointer valid cross-AS —
   pre-seeded bootstrap channel, spawn) and exercises channels, local event
   wakes, revoke wakes, kill, tree events, and reap.
-- **Live-pid index** is the linear registry vec from umem.c (processes
-  are few; binary search when it hurts). Sharer entries and shared_in
-  still hold `struct process *` / `ublock *` pointers rather than
-  `(pid, base)` pairs — safe today because zombies keep their structs
-  until reaped and every edge is unlinked by then; the doc's healed-lazy
-  pair scheme becomes necessary only if anything ever caches references
-  across the reap boundary.
+- **PID and resource indices** are ordered LLRBs. The global PID registry
+  retains zombie structs until exact `PROC_DESTROY`; per-process children,
+  threads, owned blocks, and incoming views remain enumerable during
+  userspace-driven teardown. Share edges are stable inline values linked from
+  both sides. See [enumeration-design.md](enumeration-design.md).
 
 ### The umem lock split (2026-07-11)
 
 The single umem lock this doc assumed throughout was split into the
-hierarchy described in memory-design.md §5 (g_umem control plane →
-per-process list locks → per-block stripe locks, all
-shootdown-servicing). What it means for the channel machinery
+hierarchy described in memory-design.md §5 (`g_umem` control plane →
+per-process list locks), with a separate ring-local CQ lock for channel
+publication. What it means for the channel machinery
 specifically — the authoritative comments live in `umem.h`,
 `channel.c`, and `channel_internal.h`:
 
-- **Two planes.** `SYS_BLOCK_WAIT` and `SYS_BLOCK_DOORBELL` on user
-  channels and private event blocks run on list lock + one stripe only;
-  unrelated blocks never contend. Ring drains, replays, and teardown stay
-  under `g_umem`; the drain's `sq_head` cursor wants a serializer anyway.
-- **CQ publication is stripe-scoped, uniformly.** The full-check, CQE
-  write, `cq_count` bump, and owner-side wake happen under
-  stripe(ring block) for every scheme. The asymmetry to remember:
-  holding the stripe does NOT by itself license posting for shares/
+- **Two planes.** Futex waits and wakes use per-process list locks plus
+  address-keyed futex buckets. Ring drains, replays, and teardown stay under
+  `g_umem`; the drain's `sq_head` cursor wants a serializer anyway.
+- **CQ publication is ring-scoped, uniformly.** The full-check, CQE write,
+  `cq_count` bump, and owner-side wake happen under the lock embedded in
+  that ring for every scheme. The asymmetry to remember: holding the CQ
+  lock does NOT by itself license posting for shares/
   tree — their posts must stay atomic with level-state flips
   (`notified`/`death_notified`) that live under `g_umem`.
-- **No current channel path holds two stripes.** A future cross-block
-  operation must pin both blocks and acquire stripe indices in ascending
-  order; the old registration-specific release/reacquire/revalidate path
-  was removed with scheme `-2`.
+- **No false sharing between unrelated rings.** Each CQ lock has exactly
+  the ring's lifetime. IRQ-route and IOMMU-fault locks pin that lifetime
+  for borrowed-context posts; endpoint destruction detaches those sources
+  and crosses the CQ lock before freeing the ring.
 - **`channel_block_torn` contract**: callers mutate shared/channel identity
-  first (edge pushed/removed, owner swapped, lists unlinked), then
-  call torn *without* the stripe — torn takes it itself and wakes parked
-  threads. Post-mutation parkers fail classification; pre-mutation parkers
-  are woken by torn. Scheme creation is the controlled exception: it holds
+  first (edge pushed/removed, owner swapped, lists unlinked), then wake
+  parked threads. Post-mutation parkers fail classification; pre-mutation
+  parkers are woken by torn. Scheme creation is the controlled exception: it holds
   the owner's list lock, verifies the private FIFO is empty, and publishes the
   ring before releasing the list lock, so nobody can park in between.
 - **Layout**: per-scheme logic moved to `kernel/src/schemes/{shares,

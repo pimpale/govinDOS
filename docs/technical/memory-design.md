@@ -168,43 +168,47 @@ struct ublock {
   uint64_t        base;      // identity VA == PA, buddy-aligned
   uint8_t         order;     // size = PAGE_SIZE << order
   struct process *owner;     // never null while the block lives
-  vec_share_edge  sharers;   // processes other than owner with a view
+  llrb_pid_edge  *sharers;   // owning pid -> inline share-edge tree
+  llrb_domid_map *dma_maps;  // owning domain-id -> inline DMA-map tree
 };
 
 struct process {
   ...
-  struct svclock  ulock;      // list lock (see "Locking as implemented")
-  vec_ublock_ptr  blocks;     // owned
-  vec_ublock_ptr  shared_in;  // shared to me by others
+  struct svclock   ulock;
+  llrb_base_block *blocks;    // owning tree; ublocks are inline values
+  llrb_base_edge  *views;     // secondary index into share edges
 };
 ```
+
+The process block tree physically owns each ublock node. `g_ublocks` is a
+secondary base-to-pointer index into those stable inline values. `VM_MOVE`
+extracts and relinks the same owning node, so both the ublock address and the
+global secondary entry remain stable.
 
 ### Locking as implemented (2026-07-11)
 
 The first implementation used one global umem lock for everything.
 That was split (same day, after profiling the design on paper) into a
-three-level hierarchy, acquired strictly top-down; every level is an
-`svclock` — a spinlock whose waiters keep servicing TLB shootdowns,
+two-level control-plane hierarchy, acquired strictly top-down. Both levels
+are `svclock`s — spinlocks whose waiters keep servicing TLB shootdowns —
 because each can be held across `as_flush` by some path:
 
 1. **`g_umem`** — the control-plane lock: every ownership-graph
-   mutation (free, share, unshare, move, reap, kill, the pid registry)
+   mutation (free, share, unshare, move, destroy, kill, the pid registry)
    and all kernel-ring/group bookkeeping (ipc-process-design.md §7).
    Blocks are freed only under it, so holding it pins every ublock.
-2. **`p->ulock`** — sole guard of `p->blocks`/`p->shared_in`, reads
-   included. Finding a block in a list you hold pins it: a freer must
-   unlink from every list first. `SYS_BLOCK_WAIT` holds it across its
+2. **`p->ulock`** — sole guard of `p->blocks`/`p->views`, reads
+   included. Finding a block in an index you hold pins it: a freer must
+   unlink it first. `SYS_FUTEX_WAIT` holds it across its
    user-word load and `umem_protect` flags under it, which is what
    makes a concurrent guard (`prot == 0`) unable to yank a mapping
    between wait's access check and its kernel load.
-3. **Stripes** — a static lock array indexed by hash(block base),
-   guarding each block's channel slots and serving as the
-   lifetime/writeability handoff for syscall copy-out buffers
-   ([enumeration-design.md](enumeration-design.md) §2). The lock's
-   storage outlives any block, which makes lock-then-look safe without
-   lifetime machinery. Free, view removal/move, and a
-   write-restricting `SYS_VM_PROTECT` synchronize on the stripe before
-   changing PTEs or recycling the block.
+Kernel rings separately embed a CQ lock. IRQ routes and IOMMU fault routes
+pin the ring while borrowed-context posts hold that lock; endpoint teardown
+detaches those routes and crosses the CQ lock before freeing it. Enumeration
+copy-out needs no third lock: `g_umem` pins the output ublock against free,
+and the caller's `ulock` excludes protection and view changes through the
+bounded copy.
 
 Consequences: the IPC data plane never touches `g_umem`; with the
 global `g_ublocks` index added by enumeration-design, `umem_alloc`
@@ -212,14 +216,14 @@ takes `g_umem` only long enough to publish the new base-index entry
 (the buddy has its own lock); and revocation's
 flush round runs with *no* locks held (free path below).
 
-The `ublock` list is the **sole authority** on ownership and lifetime; the
+The process-owned `llrb_base_block` is the **sole authority** on ownership and lifetime; the
 page trees remain the authority for access checks (`user_range_ok` is
 unchanged). **This retires `g_frames` entirely.** Its one load-bearing job
 today is `umem_free`'s "is this range `FRAME_USER` owned by this pid" check,
 and an exact-match ublock lookup (base must name a block the caller owns) is a
 strictly stronger version of it — it also rejects freeing a sub-range or a
 misaligned base, which per-frame tags can't. Everything else in `g_frames` is
-debug tagging reconstructible from the buddy + ublock lists + page trees.
+debug tagging reconstructible from the buddy + ublock trees + page trees.
 Per-frame metadata earns its keep in kernels with fork-style CoW, swap, or a
 file page cache — none of which fit an identity-mapped SASOS. (One caveat:
 the shared-subtree representation in Appendix A wants a one-word-per-frame
@@ -229,19 +233,19 @@ refcount for page-table pages; if that lands, that single field returns.)
 
 | call | semantics |
 |---|---|
-| `SYS_MEM_ALLOC(order, prot)` | buddy-alloc 2^order pages, **zero them**, `as_flag(p->as, …, prot\|PAGE_U)` + flush, return base |
-| `SYS_MEM_FLAG(base, len, prot)` | sub-range re-flag within a block the caller has a view of; applied to the **caller's AS only** |
-| `SYS_MEM_SHARE(base, pid, prot)` | owner only: map whole block `prot\|PAGE_U` into target's AS, add to `sharers` |
-| `SYS_MEM_DROPSHARE(base)` | sharer drops its own view: re-flag pristine in its AS + flush |
-| `SYS_MEM_UNSHARE(base, pid)` | owner only: revoke one sharer's view — same re-flag + flush, the per-edge inverse of `SYS_MEM_SHARE` |
-| `SYS_MEM_FREE(base)` | owner only: full teardown (below) |
+| `SYS_VM_ALLOC(len, prot)` | buddy-allocate the rounded power-of-two block, **zero it**, map `prot\|PAGE_U`, return base |
+| `SYS_VM_PROTECT(base, len, prot)` | re-flag a sub-range in the caller's own view |
+| `SYS_VM_SHARE(base, pid, prot)` | live owner maps the whole block into a live target and creates one edge |
+| `SYS_VM_DROPSHARE(base, pid)` | viewer, or its authorized reaper, removes that incoming edge |
+| `SYS_VM_UNSHARE(base, pid)` | owner, or its authorized reaper, removes one exact viewer edge |
+| `SYS_VM_FREE(base)` | owner or authorized reaper; refuses while any retention remains |
 
 Notes:
 
 - **Two unshare verbs, split by actor (2026-07-26).** `DROPSHARE` is the
-  sharer's own drop and keeps syscall slot 9's existing semantics under the
-  clearer name; `UNSHARE` takes a mandatory pid and is the owner's per-edge
-  revoke, making `SHARE`/`UNSHARE` a symmetric owner pair (both name a peer).
+  viewer-side drop; `UNSHARE` is the owner-side per-edge revoke, making
+  `SHARE`/`UNSHARE` a symmetric owner pair (both name a peer). Both accept
+  the authorized-reaper form used for a dead descendant.
   The revoke verb is what lets `SYS_MEM_FREE` be a single transaction that
   fails while attached (§5): `VM_MOVE` transfers ownership but never removes
   a third party's edge, so without owner-side revoke a hung sharer holds
@@ -267,7 +271,7 @@ Notes:
   handing out a dead process's heap is an info leak. Zeroing at alloc time
   covers every path (kernel-internal `malloc` users don't need it and skip it).
 
-### Free path (also the owner-exit path per block)
+### Free path
 
 `SYS_VM_FREE(base)` is a single bounded transaction. It **fails** while
 anything is still attached to the block — sharers, DMA pins,
@@ -282,14 +286,14 @@ the teardown flow and why notification moved to userspace.
 loop so a continuation can be added later without touching callers; no path
 returns it today. The two candidates are noted at the end of this section.
 
-**TODO — enumeration syscalls.** The flow above assumes userspace can find
-what is attached to a block. None of these exist yet:
+The implemented enumeration and exact-removal surface makes each refusal
+actionable:
 
-| what | owning document |
+| retention | enumeration / removal |
 |---|---|
-| sharers of a block; blocks owned by a (zombie) process | this document |
-| DMA pins / IOMMU domain attachments | [pci-design.md](pci-design.md), [iommu-design.md](iommu-design.md) |
-| threads parked on a reflected fault | [ipc-process-design.md](ipc-process-design.md) §3 |
+| share edges | `VM_SHARERS`, `VM_VIEWS`; `VM_UNSHARE`, `VM_DROPSHARE` |
+| owned blocks | `VM_BLOCKS`; `VM_FREE` |
+| DMA mappings | `VM_DMA_MAPS`; `VM_DMA_REVOKE` |
 
 (Capability grants no longer appear here: grants never retain blocks —
 [capability-design.md](capability-design.md) §6,
@@ -301,31 +305,20 @@ while no reflected-fault waiters exist. The fault-reflection feature
 must add its own enumerator/coercion contract before such waiters are
 allowed to retain a block.
 
-Each is a resumable *read* — a cursor, a buffer, and a length — which is a
-categorically easier thing to get right than the resumable *mutation* the
-`freeing` protocol used to be. Only the owner can add sharers, so an owner
-enumerating its own block races with nobody; the pinning cases can race, and
-the answer there is simply that free fails and the caller loops.
+Each enumerator is a stateless, ordered read: return up to `cap` keys strictly
+greater than `after`. See [enumeration-design.md](enumeration-design.md) §2.
 
 Once nothing is attached, two release phases run (the flush is the
 single longest thing the old global lock ever covered, so it moved outside):
 
-1. **Under `g_umem`** (`block_release_prepare`): unlink from the
-   owner's `blocks` and every sharer's `shared_in` (their list locks,
-   one at a time), tear the channel state (`channel_block_torn` — its
-   stripe acquisition drains out any data-plane holder that resolved
-   the block before the unlinks), `as_flag(.., PAGE_KERNEL_PRISTINE)`
-   every view, and **pin** each viewing AS (`as_pin`).
-2. **With no locks held** (`umem_release_finish`): flush every view in
-   **one combined shootdown round** (`as_flush_multi` — union dirty
-   range, one IPI per target CPU regardless of sharer count), unpin,
-   `buddy_page_free`.
+1. **Under `g_umem`** (`block_release_prepare`): extract the owning block
+   node, remove its `g_ublocks` entry, tear down any ring endpoint,
+   re-flag the sole remaining owner view pristine, and pin that AS.
+2. **With no locks held** (`umem_release_finish`): flush the owner AS,
+   unpin it, return RAM to the buddy, and free the extracted owning node.
 
-This final release is still proportional to the number of sharer views and
-page-table changes, and it is where the two reserved `SYSERR_AGAIN` consumers
-would land. Adversarially large sharer sets are largely defused by the
-userspace pre-pass above — an owner revokes sharers one bounded call at a
-time and only then frees — leaving the **page-table walk of a large block**
+Sharers and DMA mappings have already been removed by the bounded pre-pass,
+leaving the **page-table walk of a large block**
 as the one unbounded step no pre-pass can remove: a 64 MB block at 4 K
 granularity is ~16k PTE rewrites per view, plus a shootdown that waits for
 cross-CPU acks. It is bounded by the caller's own allocation rather than by
@@ -334,70 +327,44 @@ solves the same problem with `cond_resched()` inside `zap_pte_range`; without
 preemption the equivalent is a cursor and a resumable free.
 
 Flush-before-buddy-free is the pristinity/TLB rule from §2. The pins
-are what let the flush leave the lock: a concurrently-reaped sharer's
-`as_free` step returns SYSERR_AGAIN while pins remain (reap already
+are what let the flush leave the lock: a concurrently-destroyed sharer's
+`as_free` step returns SYSERR_AGAIN while pins remain (destroy already
 has that retry shape for its thread/CPU drains), and once a zombie's
 lists are empty no new pin can target its AS, so the gate clears in
 bounded time.
 
-## 6. Owner-death policy for shared blocks: **revoke** (option 1)
+## 6. Owner-death policy for shared blocks: parent-driven revoke
 
-Recommendation: **the creator is the ultimate owner; when it dies, sharers'
-access is revoked** (their views are re-flagged pristine, so a subsequent
-ring-3 touch takes a page fault → kill or error delivery). Rationale:
+The creator remains the ultimate owner, but owner death itself changes no
+mapping and performs no resource cleanup. The dead process continues to own
+the block while its authorized reaper enumerates the owner's blocks and each
+block's share edges. `VM_UNSHARE` or coerced `VM_DROPSHARE` restores each
+viewer to the pristine kernel mapping; `VM_FREE` succeeds only after the share
+and DMA edge sets are empty.
 
-- **Deterministic reclamation.** Block lifetime == owner lifetime. A leaked or
-  hostile share can never keep a block alive after its owner is reaped.
-- **No implicit inheritance policy.** Survivorship (option 2) would need rules
-  for choosing a new owner. Revocation has no such policy decision.
-- **Mechanically free.** Owner exit walks `blocks` and runs the §5 free path;
-  revocation of sharers *is* step 1. Option 2 needs extra transfer logic.
-- Sharing is cooperative — a sharer must already handle the owner
-  disappearing; a clean fault is a better failure than silently keeping a page
-  whose logical owner is gone.
-
-The `ublock` structure (explicit owner + sharer list) keeps option 2 available
-as a later per-share flag (`SHARE_BEQUEATH`: on owner death, promote the first
-sharer to owner) without reshaping anything.
+This preserves deterministic eventual reclamation without putting an
+unbounded edge walk in process destruction. It also gives peers a coherent
+window in which to drain a dead producer's still-live buffer. Prompt teardown
+is a userspace protocol decision; the kernel supplies ordered enumeration and
+exact removal. See [enumeration-design.md](enumeration-design.md) for the
+authority predicate, cursor contract, and full post-order choreography.
 
 ## 7. Teardown paths
 
-> **Superseded in part by [ipc-process-design.md](ipc-process-design.md)**
-> (2026-07-07): the reaper *kthread* described below is implemented and
-> working, but the follow-up design eliminates kernel threads entirely —
-> teardown moves to bounded work items on a scheduler-drained queue, and
-> `g_as_template` collapses back into `g_as_kernel` once kthread-stack
-> guard punches no longer exist. This section describes the current code.
-
 ### Process exit (last thread dead)
 
-1. For each `shared_in` block: remove `p` from its sharer list (its AS is
-   dying anyway; this keeps sharer lists truthful).
-2. For each owned block: §5 free path (revokes sharers, restores pristine,
-   buddy-frees).
-3. Ring/TCB teardown (existing loose end; ring pages are user memory and fall
-   out of step 2 once rings allocate from ublocks).
-4. `as_list_unregister(p->as)`; wait until no `g_cpu_state_table[i].current_as
-   == p->as`. This terminates because of the §3 rule: every CPU switches to
-   `g_as_kernel` (idle/kthread) or another process's AS at its next dispatch;
-   an idle CPU never sits in HLT holding a dead CR3. Waiting runs in the
-   reaper kthread with IRQs on, so it may simply poll.
-5. `as_free(p->as)` — returns all its page-table frames to the buddy (already
-   implemented).
+Exit only marks the process dead and publishes its tree event. Its process
+record, TCBs, owned blocks, incoming views, rings, and DMA edges remain
+enumerable. An authorized ancestor performs the bounded post-order sequence in
+[enumeration-design.md](enumeration-design.md) §5, then calls
+`PROC_DESTROY`. The final destroy operation refuses while any child, TCB,
+owned block, or incoming view remains; it frees only the empty address-space
+body and process record.
 
-Steps 4–5 live in a **reaper kthread**, which also owns dead-*thread* reaping:
-
-### Kernel thread death
-
-On reap of a dead kthread:
-
-1. `as_flag(g_as_kernel, stack_base, stack_base + PAGE_SIZE,
-   PAGE_KERNEL_PRISTINE)` + flush — the guard was only ever punched there
-   (§3 guard scoping); the merge pass folds the PT back into the hugepage.
-2. `free(stack_base)` where `stack_base = stack_top - KERNEL_TASK_STACK_SIZE`.
-3. Free the TCB.
-
-User threads are stackless in the kernel; their death costs nothing here.
+`PROC_DESTROY` returns `SYSERR_AGAIN` while an AS pin or CPU reference is
+draining and `SYSERR_EXIST` when userspace-visible resources remain. There are
+no kernel reaper threads; user threads are stackless in the kernel, and exact
+TCB disposal is exposed as `THREAD_DESTROY`.
 
 ## 8. Resource policy
 
@@ -410,8 +377,9 @@ User threads are stackless in the kernel; their death costs nothing here.
   owned by the caller. This is the rounded ublock size, not the caller's
   original requested length; a non-base or non-owned address returns
   `SYSERR_PERM`.
-- Permission checks are ublock checks: only the owner may free or share; a
-  sharer may only flag/unshare its own view.
+- Permission checks resolve through ublocks: a live owner controls sharing,
+  and an authorized all-dead-path ancestor may enumerate and dismantle a
+  dead descendant's exact block or view.
 - Zero-on-alloc (§5) and per-process page trees enforce isolation.
 
 ## 9. Locking

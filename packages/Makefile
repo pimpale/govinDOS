@@ -22,8 +22,12 @@ PACKAGE_INPUTS := Makefile $(GDOS_ROOT)/.abuild $(GDOS_ROOT)/abuild.env \
 
 all: $(REPOSITORY_STAMP)
 
+# APKBUILDs compile directly in their monorepo package directories. When the
+# repository is invalidated, clear those outputs too so reverse dependencies
+# relink against newly built libraries instead of reusing stale executables.
 $(REPOSITORY_STAMP): $(PACKAGE_INPUTS)
 	rm -rf $(NATIVE_REPOSITORY)
+	rm -rf */out
 	mkdir -p $(STAMPS)
 	$(call apk_initialize_root,$(HOST_BUILD_ROOT),x86_64)
 	$(call apk_initialize_root,$(BUILD_ROOT),$(GDOS_PACKAGE_ARCH))

@@ -149,8 +149,8 @@ pinning, or device-assignment model below.
   existing opaque `KIRQ_MSI` result later.
 - Authenticating device claims. The ABI reserves the authorization point,
   but v1 uses exclusive first claim. Later, ordinary unforgeable
-  device/group capabilities replace the bare ID rather than adding PID, UID,
-  or privileged-process policy.
+  device/group capabilities replace the bare ID rather than adding identity
+  records or privileged-process policy.
 
 ## 2. Terms and identifiers
 
@@ -659,7 +659,7 @@ pattern: pin the affected objects, drop `g_umem`, perform the wait under
 `g_iommu`, reacquire. Introducing the lock without dropping `g_umem`
 across the wait buys nothing.
 Hardware fault handlers use a unit-local leaf lock, the shared IRQ
-fault-route lock, and the existing stripe-ranked CQ post path only; they
+fault-route lock, and the ring-local CQ post path only; they
 never take `g_umem`. The route lock is the lifetime pin:
 detach and endpoint destruction sever the fault route under it — following the same
 rank/side rules as IRQ routes — before the device record or ring block is

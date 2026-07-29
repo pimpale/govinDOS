@@ -84,9 +84,8 @@ static inline uint64_t sys_vm_protect(uint64_t base, uint64_t len,
                                       uint64_t prot) {
   return sys3(SYS_VM_PROTECT, base, len, prot);
 }
-// The pid form: a parent applying view flags (W^X on a written image)
-// to its own embryo — the one window of authority over another
-// process's views.
+// The pid form: a direct parent applying view flags to its child. This
+// authority remains after the child starts running.
 static inline uint64_t sys_vm_protect_for(uint64_t base, uint64_t len,
                                           uint64_t prot, uint64_t pid) {
   return sys4(SYS_VM_PROTECT, base, len, prot, pid);
@@ -98,8 +97,8 @@ static inline uint64_t sys_vm_share(uint64_t base, int64_t target,
   return sys3(SYS_VM_SHARE, base, (uint64_t)target, prot);
 }
 // Sharer side: drop our own shared-in view (the teardown ack).
-static inline uint64_t sys_vm_dropshare(uint64_t base) {
-  return sys1(SYS_VM_DROPSHARE, base);
+static inline uint64_t sys_vm_dropshare(uint64_t base, uint64_t pid) {
+  return sys2(SYS_VM_DROPSHARE, base, pid);
 }
 // Owner side: revoke one sharer's view (the teardown coercion path).
 static inline uint64_t sys_vm_unshare(uint64_t base, uint64_t pid) {
@@ -154,8 +153,38 @@ static inline uint64_t sys_thread_bases_set(uint64_t fs_base,
 static inline uint64_t sys_proc_kill(uint64_t pid) {
   return sys1(SYS_PROC_KILL, pid);
 }
-static inline uint64_t sys_proc_reap(uint64_t pid) {
-  return sys1(SYS_PROC_REAP, pid);
+static inline uint64_t sys_vm_sharers(uint64_t base, uint64_t *buf,
+                                      uint64_t cap, uint64_t after) {
+  return sys4(SYS_VM_SHARERS, base, (uint64_t)buf, cap, after);
+}
+static inline uint64_t sys_vm_blocks(uint64_t pid, uint64_t *buf,
+                                    uint64_t cap, uint64_t after) {
+  return sys4(SYS_VM_BLOCKS, pid, (uint64_t)buf, cap, after);
+}
+static inline uint64_t sys_vm_views(uint64_t pid, uint64_t *buf,
+                                   uint64_t cap, uint64_t after) {
+  return sys4(SYS_VM_VIEWS, pid, (uint64_t)buf, cap, after);
+}
+static inline uint64_t sys_vm_dma_maps(uint64_t base, uint64_t *buf,
+                                      uint64_t cap, uint64_t after) {
+  return sys4(SYS_VM_DMA_MAPS, base, (uint64_t)buf, cap, after);
+}
+static inline uint64_t sys_vm_dma_revoke(uint64_t base, uint64_t domain_id) {
+  return sys2(SYS_VM_DMA_REVOKE, base, domain_id);
+}
+static inline uint64_t sys_threads(uint64_t pid, uint64_t *buf,
+                                   uint64_t cap, uint64_t after) {
+  return sys4(SYS_THREADS, pid, (uint64_t)buf, cap, after);
+}
+static inline uint64_t sys_thread_destroy(uint64_t pid, uint64_t tid) {
+  return sys2(SYS_THREAD_DESTROY, pid, tid);
+}
+static inline uint64_t sys_proc_children(uint64_t pid, uint64_t *buf,
+                                        uint64_t cap, uint64_t after) {
+  return sys4(SYS_PROC_CHILDREN, pid, (uint64_t)buf, cap, after);
+}
+static inline uint64_t sys_proc_destroy(uint64_t pid) {
+  return sys1(SYS_PROC_DESTROY, pid);
 }
 
 #endif // gdos_sys_INCLUDED

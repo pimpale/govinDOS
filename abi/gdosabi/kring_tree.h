@@ -7,7 +7,7 @@
 // the SIGCHLD slot of the signal decomposition (ipc-process-design.md
 // §4). Pure event channel: submits no ops, so any SQE completes with
 // SYSERR_NOSYS. Dead children are level state exactly like share edges:
-// the zombie sits in the parent's child list until reaped, its
+// the zombie sits in the parent's child list until explicitly destroyed; its
 // death-notified bit is the queue entry.
 
 #define KSCHEME_TREE ((int64_t)-3)

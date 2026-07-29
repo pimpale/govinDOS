@@ -16,10 +16,10 @@
 #define KIRQ_RELEASE 2 // a = GSI (or MSI pseudo-gsi)
 #define KIRQ_ACK     3 // a = GSI (or MSI pseudo-gsi), b = serviced sequence
 #define KIRQ_MSI     4 // a = parent token offset, b = parent token length,
-                       // c = child-token output offset; completion a = MSI
-                       // address, b = packed route-id/data
-#define KIRQ_BIND    5 // a = token offset, b = token length, c = event cookie;
-                       // completion a = route id
+                       // c = child-token output offset; completion a = route id
+#define KIRQ_MSI_ADDR 5 // a = concrete token offset, b = token length;
+                        // completion a = MSI address,
+                        // b = packed route-id/data
 
 #define KIRQ_MSI_PACK(route, data)                                           \
   (((uint64_t)(uint32_t)(route) << 32) | (uint32_t)(data))

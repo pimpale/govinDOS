@@ -74,7 +74,7 @@ void as_free(struct address_space *as);
 // Pin an address space against as_free: teardown paths that flush a
 // range out of a foreign AS *after* dropping the locks that made the AS
 // reachable hold a pin across the flush. as_free is never called on a
-// pinned AS — the reaper treats pins != 0 as "still draining" (retry).
+// pinned AS — PROC_DESTROY treats pins != 0 as "still draining" (retry).
 void as_pin(struct address_space *as);
 void as_unpin(struct address_space *as);
 bool as_has_pins(const struct address_space *as);

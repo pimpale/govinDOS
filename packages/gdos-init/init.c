@@ -3,7 +3,7 @@
 // docs/technical/boot-init-design.md). Its job is deliberately small:
 // verify the bootinfo handoff, pull children out of the initfs (the
 // cpio archive linked into this binary as the .bootfs section), spawn
-// them the parent-driven way (gdoslib-dev/pe.c), and reap what dies. init
+// them the parent-driven way (gdoslib-dev/pe.c), and destroy what dies. init
 // must never exit — that's a kernel panic.
 //
 // Freestanding: no libc, no imports (the loader rejects import tables).
@@ -52,24 +52,9 @@ static void bootinfo_report(const struct bootinfo *bi) {
   print_hex(bi->mem_usable_pages);
 }
 
-// Drive SYS_PROC_REAP to completion, yielding through SYSERR_AGAIN
-// (culling/drain may lag the death by a few dispatches).
-static void reap_child(uint64_t pid) {
-  while (1) {
-    uint64_t rc = sys_proc_reap(pid);
-    if (rc == REAP_DONE) {
-      return;
-    }
-    if (rc == SYSERR_AGAIN) {
-      sys_yield();
-      continue;
-    }
-    if (rc != REAP_MORE) {
-      print("init: REAP FAILED rc=");
-      print_hex(rc);
-      return;
-    }
-  }
+static void destroy_child(uint64_t pid) {
+  if (!pe_destroy(pid))
+    print("init: PROCESS DESTROY FAILED\n");
 }
 
 // Wait for the next KEV_CHILD_DEAD on the tree channel and consume it.
@@ -167,7 +152,7 @@ void _start(uint64_t arg) {
       do {
         dead = await_child_death(&tch);
         if (pcid_pid != 0 && dead == pcid_pid) {
-          reap_child(pcid_pid);
+          destroy_child(pcid_pid);
           pcid_pid = pe_spawn_resources(
               pcid, pcid_len, bootstrap_base, 8 * 4096, resources,
               sizeof(resources) / sizeof(resources[0]));
@@ -175,8 +160,8 @@ void _start(uint64_t arg) {
           print_hex(pcid_pid);
         }
       } while (dead != pid);
-      reap_child(pid);
-      print("init: tests.exe reaped\n");
+      destroy_child(pid);
+      print("init: tests.exe destroyed\n");
     }
   }
 
@@ -186,7 +171,7 @@ void _start(uint64_t arg) {
     kring_wait_cqe(&tch, &cqe);
     kring_ack(&tch);
     if (pcid_pid != 0 && cqe.type == KEV_CHILD_DEAD && cqe.a == pcid_pid) {
-      reap_child(pcid_pid);
+      destroy_child(pcid_pid);
       pcid_pid = pe_spawn_resources(
           pcid, pcid_len, bootstrap_base, 8 * 4096, resources,
           sizeof(resources) / sizeof(resources[0]));

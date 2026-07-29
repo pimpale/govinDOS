@@ -68,11 +68,18 @@ bool LLRB_FN(_remove)(LLRB_T *tree, const LLRB_KEY *key,
                       LLRB_VALUE *old_value);
 bool LLRB_FN(_get)(const LLRB_T *tree, const LLRB_KEY *key,
                    LLRB_VALUE *value);
+bool LLRB_FN(_get_ref)(LLRB_T *tree, const LLRB_KEY *key,
+                       LLRB_VALUE **value);
+// Greatest entry whose key is <= *key.
+bool LLRB_FN(_floor)(const LLRB_T *tree, const LLRB_KEY *key,
+                     LLRB_KEY *found_key, LLRB_VALUE *value);
 size_t LLRB_FN(_len)(const LLRB_T *tree);
 
 void LLRB_FN(_iter_begin)(const LLRB_T *tree, LLRB_ITER_T *iter);
 bool LLRB_FN(_iter_next)(LLRB_ITER_T *iter, LLRB_KEY *key,
                          LLRB_VALUE *value);
+bool LLRB_FN(_iter_next_ref)(LLRB_ITER_T *iter, LLRB_KEY *key,
+                             const LLRB_VALUE **value);
 
 // Position the iterator at the first node with key >= *key (the lower
 // bound), so a subsequent _iter_next starts there.

@@ -8,6 +8,7 @@
 #include "debug.h"
 #include "futex.h"
 #include "irq.h"
+#include "iommu.h"
 #include "process.h"
 #include "thread.h"
 #include "timer.h"
@@ -73,13 +74,7 @@ static uint64_t sys_vm_alloc(struct thread *curr, uint64_t len,
 }
 
 static uint64_t sys_vm_free(struct thread *curr, uint64_t base) {
-  int rc = umem_free(curr->proc, base);
-  if (rc == (int)SYSERR_EXIST)
-    return SYSERR_EXIST;
-  if (rc != 0) {
-    return SYSERR_PERM;
-  }
-  return 0;
+  return umem_free(curr->proc, base);
 }
 
 static uint64_t sys_vm_size(struct thread *curr, uint64_t base) {
@@ -93,9 +88,7 @@ static uint64_t sys_vm_protect(struct thread *curr, uint64_t base,
     return SYSERR_INVAL;
   }
   if (pid != 0 && pid != curr->proc->pid) {
-    // Parent applying view flags (W^X on a written image) to its own
-    // embryo — the one window where another process's views are yours
-    // to set.
+    // A direct parent retains authority to apply view flags to its child.
     return proc_sys_vm_protect_for(curr, base, len, vm_prot_to_flags(prot),
                                    pid);
   }
@@ -168,11 +161,11 @@ void syscall_entry(struct trap_frame *tf) {
     return;
 
   case SYS_VM_DROPSHARE:
-    tf->rax = umem_dropshare(curr->proc, a0) == 0 ? 0 : SYSERR_PERM;
+    tf->rax = umem_dropshare(curr->proc, a0, a1);
     return;
 
   case SYS_VM_UNSHARE:
-    tf->rax = umem_unshare_from(curr->proc, a0, a1);
+    tf->rax = umem_unshare(curr->proc, a0, a1);
     return;
 
   case SYS_VM_MOVE:
@@ -181,6 +174,26 @@ void syscall_entry(struct trap_frame *tf) {
 
   case SYS_VM_MAP_DEVICE:
     tf->rax = cap_map_device(curr->proc, a0, a1, (uint32_t)a2);
+    return;
+
+  case SYS_VM_SHARERS:
+    tf->rax = umem_enum_sharers(curr->proc, a0, a1, a2, a3);
+    return;
+
+  case SYS_VM_BLOCKS:
+    tf->rax = umem_enum_blocks(curr->proc, a0, a1, a2, a3);
+    return;
+
+  case SYS_VM_VIEWS:
+    tf->rax = umem_enum_views(curr->proc, a0, a1, a2, a3);
+    return;
+
+  case SYS_VM_DMA_MAPS:
+    tf->rax = iommu_enum_maps(curr->proc, a0, a1, a2, a3);
+    return;
+
+  case SYS_VM_DMA_REVOKE:
+    tf->rax = iommu_revoke_map(curr->proc, a0, a1);
     return;
 
   case SYS_VM_SIZE:
@@ -224,12 +237,24 @@ void syscall_entry(struct trap_frame *tf) {
     tf->rax = proc_sys_kill(curr, a0);
     return;
 
+  case SYS_THREADS:
+    tf->rax = proc_sys_threads(curr, a0, a1, a2, a3);
+    return;
+
+  case SYS_THREAD_DESTROY:
+    tf->rax = proc_sys_thread_destroy(curr, a0, a1);
+    return;
+
+  case SYS_PROC_CHILDREN:
+    tf->rax = proc_sys_children(curr, a0, a1, a2, a3);
+    return;
+
+  case SYS_PROC_DESTROY:
+    tf->rax = proc_sys_destroy(curr, a0);
+    return;
+
   case SYS_PROC_EXIT:
     proc_sys_process_exit(curr, a0);
-
-  case SYS_PROC_REAP:
-    tf->rax = proc_sys_reap(curr, a0);
-    return;
 
   case SYS_THREAD_EXIT:
     uthread_park_exit();

@@ -34,18 +34,134 @@
 
 #define AP_TRAMPOLINE_BASE 0x8000
 
-// Synchronous teardown for boot-test processes (no threads ever ran, so
-// no culling or draining can be pending): kill the subtree, then run the
-// reap loop to completion — which also regression-tests the reap steps
-// themselves at every boot.
+static uint32_t selftest_prng(uint32_t *state) {
+  *state = *state * 1664525u + 1013904223u;
+  return *state;
+}
+
+// Exercise the strengthened owned-tree contract: arbitrary rotations and
+// two-child removals must preserve every surviving inline value's address.
+static void llrb_identity_selftest(void) {
+  enum { N = 193 };
+  llrb_base_block *tree;
+  asserts(llrb_base_block_new(&tree), "llrb selftest: tree alloc failed");
+  uint16_t order[N];
+  ublock *refs[N];
+  bool present[N];
+  for (uint32_t i = 0; i < N; i++) {
+    order[i] = (uint16_t)i;
+    present[i] = false;
+  }
+  uint32_t rng = 0xC0DEF00Du;
+  for (uint32_t i = N - 1; i != 0; i--) {
+    uint32_t j = selftest_prng(&rng) % (i + 1);
+    uint16_t tmp = order[i];
+    order[i] = order[j];
+    order[j] = tmp;
+  }
+  for (uint32_t i = 0; i < N; i++) {
+    uint64_t key = order[i] + 1;
+    ublock value = {.base = key};
+    asserts(llrb_base_block_insert(tree, &key, &value) &&
+                llrb_base_block_get_ref(tree, &key, &refs[key - 1]) &&
+                llrb_base_block_valid(tree),
+            "llrb selftest: insert/valid failed");
+    present[key - 1] = true;
+  }
+  for (uint32_t i = 0; i < N; i++) {
+    uint64_t key = order[i] + 1;
+    ublock old;
+    llrb_base_block_node *node;
+    asserts(llrb_base_block_extract(tree, &key, &old, &node) &&
+                &node->value == refs[key - 1] &&
+                llrb_base_block_valid(tree) &&
+                llrb_base_block_insert_node(tree, &key, &node->value, node) &&
+                llrb_base_block_valid(tree),
+            "llrb selftest: identity relink failed");
+    ublock *ref;
+    asserts(llrb_base_block_get_ref(tree, &key, &ref) &&
+                ref == refs[key - 1],
+            "llrb selftest: value address changed");
+  }
+  for (uint32_t i = 0; i < N; i++) {
+    uint64_t key = order[N - 1 - i] + 1;
+    ublock old;
+    asserts(llrb_base_block_remove(tree, &key, &old) &&
+                llrb_base_block_valid(tree),
+            "llrb selftest: remove/valid failed");
+    present[key - 1] = false;
+    for (uint32_t j = 0; j < N; j++) {
+      if (!present[j])
+        continue;
+      uint64_t survivor = j + 1;
+      ublock *ref;
+      asserts(llrb_base_block_get_ref(tree, &survivor, &ref) &&
+                  ref == refs[j],
+              "llrb selftest: survivor address changed");
+    }
+  }
+  llrb_base_block_delete(&tree);
+  printf("llrb: randomized identity selftest ok\n");
+}
+
+// Synchronous implementation of the explicit teardown choreography for
+// boot-only process fixtures. No fixture has threads or DMA mappings.
 static void destroy_test_process(struct process *p) {
   process_kill_subtree(p);
-  uint64_t rc;
-  do {
-    rc = process_reap_step(p);
-    asserts(rc == REAP_MORE || rc == REAP_DONE,
-            "destroy_test_process: reap stalled");
-  } while (rc != REAP_DONE);
+  while (llrb_pid_process_len(p->children) != 0) {
+    llrb_pid_process_iter iter;
+    llrb_pid_process_iter_begin(p->children, &iter);
+    struct process *child;
+    asserts(llrb_pid_process_iter_next(&iter, nullptr, &child),
+            "destroy_test_process: child tree empty");
+    destroy_test_process(child);
+  }
+  while (llrb_base_edge_len(p->views) != 0) {
+    llrb_base_edge_iter iter;
+    llrb_base_edge_iter_begin(p->views, &iter);
+    uint64_t base;
+    asserts(llrb_base_edge_iter_next(&iter, &base, nullptr),
+            "destroy_test_process: view tree empty");
+    asserts(umem_dropshare(p, base, 0) == 0,
+            "destroy_test_process: dropshare failed");
+  }
+  while (llrb_base_block_len(p->blocks) != 0) {
+    llrb_base_block_iter blocks;
+    llrb_base_block_iter_begin(p->blocks, &blocks);
+    uint64_t base;
+    ublock *b;
+    asserts(llrb_base_block_iter_next(&blocks, &base, nullptr) &&
+                llrb_base_block_get_ref(p->blocks, &base, &b),
+            "destroy_test_process: block tree empty");
+    while (llrb_pid_edge_len(b->sharers) != 0) {
+      llrb_pid_edge_iter sharers;
+      llrb_pid_edge_iter_begin(b->sharers, &sharers);
+      uint64_t pid;
+      asserts(llrb_pid_edge_iter_next(&sharers, &pid, nullptr),
+              "destroy_test_process: sharer tree empty");
+      asserts(umem_unshare(p, base, pid) == 0,
+              "destroy_test_process: unshare failed");
+    }
+    asserts(umem_free(p, base) == 0,
+            "destroy_test_process: free failed");
+  }
+  umem_lock();
+  asserts(llrb_tid_thread_len(p->threads) == 0 &&
+              llrb_pid_process_len(p->children) == 0,
+          "destroy_test_process: process not empty");
+  as_free(p->as);
+  if (p->parent != nullptr) {
+    struct process *removed;
+    asserts(llrb_pid_process_remove(p->parent->children, &p->pid, &removed) &&
+                removed == p,
+            "destroy_test_process: child missing");
+  }
+  umem_proc_unregister_locked(p);
+  umem_process_finish_locked(p);
+  llrb_pid_process_delete(&p->children);
+  llrb_tid_thread_delete(&p->threads);
+  slab_process_free(p);
+  umem_unlock();
 }
 
 // Regression test for the paging merge pass: a guard punch fragments the
@@ -118,7 +234,7 @@ static void umem_selftest(void) {
   // the free succeeds and restores pristine everywhere.
   asserts(umem_free(a, (uint64_t)blk) == (int)SYSERR_EXIST,
           "umem selftest: free ignored attached sharer");
-  asserts(umem_unshare_from(a, (uint64_t)blk, b->pid) == 0,
+  asserts(umem_unshare(a, (uint64_t)blk, b->pid) == 0,
           "umem selftest: unshare failed");
   asserts(!user_range_ok(b, (uint64_t)blk, PAGE_SIZE, false),
           "umem selftest: unshare left sharer access");
@@ -178,7 +294,7 @@ static void device_block_selftest(const struct acpi_rsdp *rsdp,
     asserts(as_getinfo(b->as, mmio, &f, &present) == 0 && present &&
                 (f & (PAGE_U | PAGE_UC)) == (PAGE_U | PAGE_UC) && !(f & PAGE_W),
             "devmem selftest: shared cache/rights not inherited");
-    asserts(umem_dropshare(b, mmio) == 0,
+    asserts(umem_dropshare(b, mmio, 0) == 0,
             "devmem selftest: BAR-style dropshare failed");
     asserts(umem_free(a, mmio) == 0, "devmem selftest: device free failed");
   }
@@ -251,16 +367,16 @@ static void channel_selftest(void) {
 }
 
 // Boot-time test of the tree machinery that doesn't need running
-// threads: embryo creation, VM_MOVE down (construction) and up
-// (reap-time claim), the tree channel's KEV_CHILD_DEAD (replay path),
-// and the subtree reap cursor.
+// threads: zero-thread process creation, one-way VM_MOVE construction,
+// retained zombie registry entries, and the tree channel's KEV_CHILD_DEAD.
 static void process_selftest(void) {
   struct process *parent = process_create(nullptr);
   struct process *child = process_create(parent);
   struct process *grandchild = process_create(child);
-  asserts(child->state == PROC_EMBRYO, "process selftest: not an embryo");
+  asserts(!child->dead && atomic_load(&child->nthreads) == 0,
+          "process selftest: new child not alive and empty");
 
-  // Move a block down into the embryo: parent view gone, child view RW.
+  // Move a block down into the child: parent view gone, child view RW.
   uint8_t *blk = umem_alloc(parent, PAGE_SIZE, PAGE_R | PAGE_W);
   blk[42] = 0x42; // survives the move (same physical identity address)
   umem_lock();
@@ -283,14 +399,15 @@ static void process_selftest(void) {
   asserts(channel_scheme_create(parent, (uint64_t)tch, KSCHEME_TREE) == 0,
           "process selftest: tree channel create failed");
   process_kill_subtree(child);
-  // Only the subtree root is materialized synchronously. Its descendant
-  // is immediately dead by ancestry, hidden from live-pid lookup, and is
-  // materialized later by bounded post-order reap.
-  asserts(grandchild->state == PROC_EMBRYO && process_is_dead(grandchild),
+  // Descendant death is effective through ancestry. Zombie PID entries
+  // remain in the raw registry until exact destruction.
+  asserts(!grandchild->dead && process_is_dead(grandchild),
           "process selftest: descendant death was not lazy");
   umem_lock();
   asserts(umem_proc_lookup_locked(grandchild->pid) == nullptr,
-          "process selftest: effective-dead pid remained reachable");
+          "process selftest: dead pid visible to live lookup");
+  asserts(umem_proc_lookup_any_locked(grandchild->pid) == grandchild,
+          "process selftest: zombie pid missing from raw lookup");
   umem_unlock();
   volatile struct kring_hdr *h = (volatile struct kring_hdr *)tch;
   const struct kcqe *cq =
@@ -300,28 +417,12 @@ static void process_selftest(void) {
               cq[0].a == child->pid,
           "process selftest: no KEV_CHILD_DEAD");
 
-  // Claim the block back up out of the zombie before reaping frees it.
-  umem_lock();
-  umem_proc_lock(child);
-  b = umem_owned_locked(child, (uint64_t)blk);
-  umem_proc_unlock(child);
-  asserts(b != nullptr && umem_move_locked(b, child, parent, true) == 0,
-          "process selftest: move up failed");
-  umem_unlock();
-  asserts(user_range_ok(parent, (uint64_t)blk, PAGE_SIZE, true),
-          "process selftest: claim got no view");
-  asserts(blk[42] == 0x42, "process selftest: claim lost contents");
-
-  // Reap the zombie child, then tear down the parent (whose subtree is
-  // now just itself).
-  uint64_t rc;
-  do {
-    rc = process_reap_step(child);
-    asserts(rc == REAP_MORE || rc == REAP_DONE,
-            "process selftest: reap stalled");
-  } while (rc != REAP_DONE);
+  // Ownership transfer is construction-only. The live parent instead
+  // destroys the dead descendant's block in place.
   asserts(umem_free(parent, (uint64_t)blk) == 0,
-          "process selftest: claimed block not owned");
+          "process selftest: descendant block free failed");
+  destroy_test_process(grandchild);
+  destroy_test_process(child);
   destroy_test_process(parent);
   printf("process: selftest ok\n");
 }
@@ -492,6 +593,7 @@ efi_status_t efi_main(efi_handle_t handle, struct efi_system_table *system) {
 
   // User-memory bookkeeping (ublock registry).
   umem_init();
+  llrb_identity_selftest();
   // Futex bucket table — before the first user process can park.
   futex_init();
   capability_init();

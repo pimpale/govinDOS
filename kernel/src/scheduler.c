@@ -81,9 +81,9 @@ void scheduler_enqueue(struct thread *t) {
     struct thread *next = scheduler_pop_local_locked(scheduler);
 
     // Dispatch cull: a thread whose process died (kill, or the cascade
-    // from an ancestor) is reaped here instead of being run — this is
+    // from an ancestor) is disposed here instead of being run — this is
     // where queued-runnable victims land. Blocked victims never enter a
-    // runqueue merely to die; bounded reap detaches and frees them. Done
+    // runqueue merely to die; SYS_THREAD_DESTROY detaches and frees them. Done
     // before install so the dying AS is never re-entered.
     if (next != nullptr && process_is_dead(next->proc)) {
       next->status = THREAD_DEAD;
@@ -104,7 +104,7 @@ void scheduler_enqueue(struct thread *t) {
       spinlock_unlock(&scheduler->lock);
 
       // Idle on the kernel AS (load-bearing rule): a zombie's AS must
-      // drain off every CPU before a reap step may as_free it, and an
+      // drain off every CPU before PROC_DESTROY may as_free it, and an
       // idle CPU must never HLT holding it. IRQs are still off here, so
       // we can't migrate mid-check.
       struct cpu_state *cs = cpu_state_this();
@@ -155,7 +155,7 @@ void scheduler_enqueue(struct thread *t) {
       scheduler->current_thread = nullptr;
       atomic_store_explicit(&prev->on_cpu, false, memory_order_release);
 
-      // A thread that exited (or was fault-killed) is reaped inline —
+      // A thread that exited (or was fault-killed) is disposed inline —
       // user threads are stackless in the kernel, so this is a TCB free
       // plus, for the last thread of a live process, the process's
       // death. Only after the on_cpu release store: the save must be

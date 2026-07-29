@@ -685,9 +685,9 @@ kernel/vendor/slab/slab.h
 kernel/vendor/slab/slab_impl.h
 kernel/src/instances/slab_thread.c
 kernel/src/instances/slab_process.c
-kernel/src/instances/slab_ublock.c
 kernel/src/instances/slab_ring.c
-kernel/src/instances/slab_llrb_*.c
+kernel/src/instances/llrb_{base_block,base_edge,base_ublock,pid_edge,tid_thread}.c
+kernel/src/instances/slab_llrb_*.c  # older standalone instantiations
 kernel/src/slabs.h
 kernel/src/slabs.c
 ```
@@ -695,9 +695,10 @@ kernel/src/slabs.c
 `vendor/slab/slab.h` generates typed declarations; arena and page types stay
 private to `vendor/slab/slab_impl.h`, which generates the state transitions,
 refill, reclamation, and verification. Each fixed public type has one
-instances translation unit, matching the existing `llrb` and `vec`
-convention. Private capability and IOMMU metadata instantiate the same
-template beside their complete private structure definitions.
+instances translation unit. New LLRB indices put their node slab in the same
+implementation file, avoiding a second translation unit per index. Private
+capability and IOMMU metadata instantiate the same template beside their
+complete private structure definitions.
 
 Each implementation instantiation defines `SLAB_WHICH_CPU()` and emits one
 singleton allocator. `kernel/src/slabs.{c,h}` initializes those generated

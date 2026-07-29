@@ -11,7 +11,7 @@
 //
 // Locking recap (full hierarchy in umem.h):
 //   - CQ publication (full-check, slot write, cq_count) requires
-//     stripe(ring block). SQ drain cursor (sq_head) is g_umem-only.
+//     ring->cq_lock. SQ drain cursor (sq_head) is g_umem-only.
 
 // One description of a kernel-channel scheme's complete lifecycle. A null
 // callback means the scheme has no work for that operation. `anchor` is
@@ -57,20 +57,20 @@ static inline bool cqe_consumed(struct ring *ring, uint32_t ev_index) {
 // channel.c core, used by the scheme files
 // ---------------------------------------------------------------------------
 
-// Post one CQE; caller holds stripe(ring->block->base). False if the CQ
+// Post one CQE; caller holds ring->cq_lock. False if the CQ
 // is full (leave the event in its level state). On success the post wakes
 // exactly one thread parked on the ring's cq_count word, if any.
 bool ring_post_locked(struct ring *ring, uint64_t type, uint64_t a,
                       uint64_t b, uint64_t status);
 
-// Control-plane post: g_umem held, no stripe held. Takes the ring's stripe
+// Control-plane post: g_umem held, no CQ lock held. Takes ring->cq_lock
 // around ring_post_locked.
 bool channel_post(struct ring *ring, uint64_t type, uint64_t a, uint64_t b,
                   uint64_t status);
 
-// IRQ/data-plane post: no g_umem and no stripe held. The caller supplies
+// IRQ/data-plane post: no g_umem and no CQ lock held. The caller supplies
 // lifetime pinning (an IRQ route lock or the timer endpoint's CPU lock); this
-// takes the ring stripe.
+// takes ring->cq_lock.
 bool channel_post_data(struct ring *ring, uint64_t type, uint64_t a,
                        uint64_t b, uint64_t status, uint32_t *index_out);
 
@@ -79,7 +79,7 @@ bool channel_post_data(struct ring *ring, uint64_t type, uint64_t a,
 // ---------------------------------------------------------------------------
 
 // Post KEV_SHARE for every un-notified edge pointing at p, until the CQ
-// fills. g_umem held, no stripes (takes p's list lock).
+// fills. g_umem held, no CQ lock held (takes p's list lock).
 void shares_replay(struct ring *ring);
 
 // ---------------------------------------------------------------------------
@@ -87,7 +87,7 @@ void shares_replay(struct ring *ring);
 // ---------------------------------------------------------------------------
 
 // Post KEV_CHILD_DEAD for every un-notified dead child, until the CQ
-// fills. g_umem held, no stripes.
+// fills. g_umem held, no CQ lock held.
 void tree_replay(struct ring *ring);
 
 // ---------------------------------------------------------------------------

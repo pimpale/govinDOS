@@ -61,9 +61,6 @@ struct futex_key {
 typedef struct thread {
   uint64_t tid;
   struct process *proc; // never null
-  // Index in proc->threads. Both insertion and removal hold g_umem;
-  // swap-and-pop updates the moved TCB, making scheduler culls O(1).
-  uint32_t proc_slot;
   _Atomic enum thread_status status;
 
   // True from just before the scheduler switches into this thread until
@@ -100,19 +97,23 @@ typedef struct thread {
 // pasting, hence the typedef rather than using `thread *` directly.
 typedef thread *thread_ptr;
 
-#define VEC_DTYPE thread_ptr
-#include <vec/vec.h>
-#undef VEC_DTYPE
+#define LLRB_NAME tid_thread
+#define LLRB_KEY uint64_t
+#define LLRB_VALUE thread_ptr
+#include <llrb/llrb.h>
+#undef LLRB_VALUE
+#undef LLRB_KEY
+#undef LLRB_NAME
 
-// Lifecycle states (process.c, guarded by the umem lock). An embryo has
-// an AS and blocks but no threads; the first thread spawn seals it live;
-// death (own exit or a kill anywhere up the tree) makes it a zombie that
-// holds everything it owns until its parent reaps it.
-enum proc_state {
-  PROC_EMBRYO,
-  PROC_LIVE,
-  PROC_DEAD,
-};
+#define SLAB_NAME llrb_tid_thread_node
+#define SLAB_TYPE llrb_tid_thread_node
+#include <slab/slab.h>
+#undef SLAB_TYPE
+#undef SLAB_NAME
+
+struct llrb_pid_process;
+struct llrb_base_block;
+struct llrb_base_edge;
 
 struct process {
   // Never reused: pids are minted monotonically (2^63 outlast the
@@ -123,16 +124,17 @@ struct process {
   // identity layout (SASOS) — isolation is which tree carries PAGE_U
   // leaves for a block.
   struct address_space *as;
-  // Direct lifecycle state, guarded for writes by g_umem. Descendants of
-  // a PROC_DEAD ancestor may remain structurally EMBRYO/LIVE until bounded
-  // reap reaches them; process_is_dead() is the effective-liveness test.
-  _Atomic enum proc_state state;
+  // Direct death mark, guarded for writes by g_umem. A process starts alive
+  // even though it has no threads; its direct parent may configure it and
+  // spawn threads throughout its lifetime. Descendants of a dead ancestor
+  // are effectively dead without changing this bit; process_is_dead() is
+  // the liveness test.
+  _Atomic bool dead;
 
-  // The creation edge. Death follows children downward, reaping follows
-  // them upward, and the tree is never restructured: a dead parent's
-  // zombies are reaped by the grandparent as part of its subtree.
+  // The creation edge. Death follows children downward, destruction is
+  // post-order upward, and the tree is never restructured.
   struct process *parent; // nullptr for init and boot-test processes
-  struct vec_process_ptr *children;
+  struct llrb_pid_process *children;
 
   // KEV_CHILD_DEAD has been posted to the parent's tree channel (or the
   // parent was dying and never gets one). Clear means the event is still
@@ -144,23 +146,23 @@ struct process {
   // thread exit and external kill leave the zero-initialized value.
   uint64_t exit_status;
 
-  // Threads with un-reaped TCBs. Incremented at spawn; decremented by the
-  // scheduler's exit/cull path or by bounded reap for detached blocked TCBs.
+  // Threads with undisposed TCBs. Incremented at spawn; decremented by the
+  // scheduler's exit/cull path or exact destruction of blocked TCBs.
   // The process struct outlives every TCB.
   _Atomic uint64_t nthreads;
-  struct vec_thread_ptr *threads;
+  llrb_tid_thread *threads;
 
-  // Reap progress: the AS has been freed (step 3 done, only the struct
-  // remains).
-  bool as_freed;
-
-  // User memory (umem.c): blocks this process owns, and blocks other
-  // processes have shared with it. The two vecs are guarded by ulock —
-  // the per-process list lock, level 2 of the umem lock hierarchy
-  // (umem.h) — for ALL access, read or write.
+  // User memory (umem.c): blocks this process owns, and share edges for
+  // blocks other processes have shared with it. Both ordered indices are
+  // guarded by ulock for ALL access, read or write.
   struct svclock ulock;
-  struct vec_ublock_ptr *blocks;
-  struct vec_ublock_ptr *shared_in;
+  struct llrb_base_block *blocks;
+  struct llrb_base_edge *views;
+
+  // Intrusive queue of share edges whose KEV_SHARE level event has not yet
+  // been posted. Membership is exactly `!edge->notified`.
+  struct share_edge *unnotified_head;
+  struct share_edge *unnotified_tail;
 
   // Kernel scheme endpoints (channel.c, umem lock): the shares channel
   // (-1) and the tree channel (-3), each at most one per process,
@@ -170,9 +172,6 @@ struct process {
   struct ring *tree_ch;
   struct ring *iommu_ch;
 
-  // Capability grants created by this process. Intrusive, g_umem-only;
-  // creator reap prospectively revokes and drains this list first.
-  struct grant *created_grants;
 };
 
 #define SLAB_NAME thread

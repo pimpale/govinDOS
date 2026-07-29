@@ -6,8 +6,9 @@
 
 #include <gdosabi/kring_cap.h>
 
-#define PCI_DRIVER_START_VERSION 3
+#define PCI_DRIVER_START_VERSION 4
 #define PCI_DRIVER_MAX_BARS 6
+#define PCI_DRIVER_MAX_IRQ_ROUTES 32
 
 struct pci_driver_bar {
   uint64_t base;
@@ -23,17 +24,17 @@ struct pci_driver_start {
   uint64_t function_id;
   struct pci_driver_bar bars[PCI_DRIVER_MAX_BARS];
   _Atomic uint32_t state;
+  uint32_t n_irq_routes;
   struct cap_token iommu_token;
-  struct cap_token irq_token;
+  struct cap_token irq_wildcard;
+  struct cap_token irq_routes[PCI_DRIVER_MAX_IRQ_ROUTES];
   uint64_t service_channel;
 };
 
-#define PCI_DRIVER_IOMMU_READY 1
-#define PCI_DRIVER_IRQ_GRANTED 2
-#define PCI_DRIVER_IRQ_READY   3
-#define PCI_DRIVER_LIVE        4
-#define PCI_DRIVER_STOP        5
-#define PCI_DRIVER_DMA_STOPPED 6
+#define PCI_DRIVER_QUEUES_READY 1
+#define PCI_DRIVER_LIVE         2
+#define PCI_DRIVER_STOP         3
+#define PCI_DRIVER_DMA_STOPPED  4
 
 struct pcid_bootstrap {
   uint64_t acpi_rsdp;

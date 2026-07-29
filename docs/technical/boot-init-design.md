@@ -212,6 +212,6 @@ build are gone.
   user view drops to PAGE_R** via the existing `umem_protect` — no new
   kernel surface anywhere in the design; the whole §3 handoff is one
   `umem_alloc` + struct copy + re-flag.
-- **pe.c error paths kill but do not reap** a half-built embryo (the
+- **pe.c error paths kill but do not destroy** a half-built child (the
   zombie waits for init's reap loop). Boot-path failures are
   print-and-continue in init, panic-grade in practice.

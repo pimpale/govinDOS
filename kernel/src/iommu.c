@@ -23,10 +23,21 @@
 #define IOMMU_MAX_MAPPING_LEAVES 512
 
 struct iommu_mapping {
-  struct iommu_mapping *next;
+  struct iommu_mapping *domain_next;
+  struct iommu_mapping *domain_prev;
+  struct iommu_domain *domain;
   ublock *block;
   uint32_t permissions;
 };
+typedef struct iommu_mapping iommu_mapping;
+
+#define LLRB_NAME domid_map
+#define LLRB_KEY uint64_t
+#define LLRB_VALUE iommu_mapping
+#include <llrb/llrb.h>
+#undef LLRB_VALUE
+#undef LLRB_KEY
+#undef LLRB_NAME
 
 struct iommu_device {
   struct iommu_device *next;
@@ -44,6 +55,7 @@ struct iommu_device {
 struct iommu_domain {
   struct iommu_domain *next;
   struct ring *ring;
+  uint64_t id;
   uint64_t cookie;
   struct iommu_hw_domain hw;
   struct iommu_device *devices;
@@ -74,20 +86,9 @@ struct iommu_domain {
 #undef SLAB_TYPE
 #undef SLAB_NAME
 
-#define SLAB_NAME iommu_mapping
-#define SLAB_TYPE struct iommu_mapping
-#define SLAB_PAGE_SIZE PAGE_SIZE
-#define SLAB_CACHELINE_SIZE 64
-#define SLAB_WHICH_CPU() cpu_state_whoami()
-#include <slab/slab_impl.h>
-#undef SLAB_WHICH_CPU
-#undef SLAB_CACHELINE_SIZE
-#undef SLAB_PAGE_SIZE
-#undef SLAB_TYPE
-#undef SLAB_NAME
-
 static struct iommu_domain *g_domains;
 static uint32_t g_ndomains, g_ndevices, g_nmappings;
+static uint64_t g_next_domain_id = 1;
 static bool g_live;
 static struct spinlock g_fault_lock = SPINLOCK_INITIALIZER;
 static struct iommu_device *g_fault_devices[1u << 16];
@@ -141,6 +142,9 @@ static uint64_t domain_create(struct ring *ring, uint64_t cookie) {
     return SYSERR_NOMEM;
   }
   d->ring = ring;
+  d->id = g_next_domain_id++;
+  if (d->id == 0)
+    fatal("iommu: domain id space exhausted");
   d->cookie = cookie;
   d->next = g_domains;
   g_domains = d;
@@ -270,7 +274,8 @@ void iommu_replay(struct ring *ring) {
 
 static struct iommu_mapping *find_mapping(struct iommu_domain *d,
                                            uint64_t base) {
-  for (struct iommu_mapping *m = d->mappings; m != nullptr; m = m->next)
+  for (struct iommu_mapping *m = d->mappings; m != nullptr;
+       m = m->domain_next)
     if (m->block->base == base)
       return m;
   return nullptr;
@@ -286,8 +291,9 @@ static uint64_t map_block(struct process *p, struct iommu_domain *d,
   if (g_nmappings == IOMMU_MAX_MAPPINGS)
     return SYSERR_NOMEM;
   umem_proc_lock(p);
-  ublock *b = umem_owned_locked(p, base);
-  if (b == nullptr || b->backing != UBLOCK_RAM || b->ring != nullptr) {
+  ublock *b = umem_view_locked(p, base, 1);
+  if (b == nullptr || b->base != base || b->backing != UBLOCK_RAM ||
+      b->ring != nullptr) {
     umem_proc_unlock(p);
     return SYSERR_INVAL;
   }
@@ -296,40 +302,88 @@ static uint64_t map_block(struct process *p, struct iommu_domain *d,
     umem_proc_unlock(p);
     return SYSERR_NOMEM;
   }
-  b->dma_pins++;
   umem_proc_unlock(p);
-  struct iommu_mapping *m = slab_iommu_mapping_zalloc(sizeof(*m));
-  if (m == nullptr || !vtd_map(&d->hw, base, base, pages, permissions)) {
-    umem_proc_lock(p);
-    b->dma_pins--;
-    umem_proc_unlock(p);
-    slab_iommu_mapping_free(m);
+  llrb_domid_map_node *map_node =
+      slab_llrb_domid_map_node_malloc(sizeof(*map_node));
+  if (map_node == nullptr)
+    return SYSERR_NOMEM;
+  llrb_domid_map *new_index = nullptr;
+  if (b->dma_maps == nullptr && !llrb_domid_map_new(&new_index)) {
+    slab_llrb_domid_map_node_free(map_node);
     return SYSERR_NOMEM;
   }
-  *m = (struct iommu_mapping){.next = d->mappings,
-                              .block = b,
-                              .permissions = permissions};
+  if (!vtd_map(&d->hw, base, base, pages, permissions)) {
+    llrb_domid_map_delete(&new_index);
+    slab_llrb_domid_map_node_free(map_node);
+    return SYSERR_NOMEM;
+  }
+
+  bool new_tree = b->dma_maps == nullptr;
+  if (new_tree) {
+    b->dma_maps = new_index;
+    new_index = nullptr;
+  }
+  iommu_mapping value = {.domain_next = d->mappings,
+                         .domain = d,
+                         .block = b,
+                         .permissions = permissions};
+  if (!llrb_domid_map_insert_node(b->dma_maps, &d->id, &value, map_node)) {
+    if (new_tree) {
+      llrb_domid_map_delete(&b->dma_maps);
+      b->dma_maps = nullptr;
+    } else {
+      llrb_domid_map_delete(&new_index);
+    }
+    (void)vtd_unmap(&d->hw, base, pages);
+    slab_llrb_domid_map_node_free(map_node);
+    return SYSERR_NOMEM;
+  }
+  llrb_domid_map_delete(&new_index);
+  iommu_mapping *m;
+  asserts(llrb_domid_map_get_ref(b->dma_maps, &d->id, &m),
+          "iommu: inserted mapping missing");
+  if (d->mappings != nullptr)
+    d->mappings->domain_prev = m;
   d->mappings = m;
   g_nmappings++;
   return 0;
 }
 
+static void unlink_mapping(struct iommu_mapping *m) {
+  struct iommu_domain *d = m->domain;
+  if (m->domain_prev != nullptr)
+    m->domain_prev->domain_next = m->domain_next;
+  else
+    d->mappings = m->domain_next;
+  if (m->domain_next != nullptr)
+    m->domain_next->domain_prev = m->domain_prev;
+  ublock *b = m->block;
+  uint64_t id = d->id;
+  iommu_mapping removed;
+  asserts(llrb_domid_map_remove(b->dma_maps, &id, &removed),
+          "iommu: block mapping missing");
+  if (llrb_domid_map_len(b->dma_maps) == 0) {
+    llrb_domid_map_delete(&b->dma_maps);
+    b->dma_maps = nullptr;
+  }
+}
+
+static void unmap_mapping(struct iommu_mapping *m) {
+  uint64_t base = m->block->base;
+  uint64_t pages = 1ull << m->block->order;
+  if (!vtd_unmap(&m->domain->hw, base, pages))
+    fatal("iommu: IOTLB invalidation failed\n");
+  unlink_mapping(m);
+  g_nmappings--;
+}
+
 static uint64_t unmap_block(struct iommu_domain *d, uint64_t base) {
-  struct iommu_mapping **link = &d->mappings;
-  while (*link != nullptr) {
-    struct iommu_mapping *m = *link;
+  for (struct iommu_mapping *m = d->mappings; m != nullptr;
+       m = m->domain_next) {
     if (m->block->base == base) {
-      uint64_t pages = 1ull << m->block->order;
-      if (!vtd_unmap(&d->hw, base, pages))
-        fatal("iommu: IOTLB invalidation failed\n");
-      *link = m->next;
-      asserts(m->block->dma_pins != 0, "iommu: lost DMA pin");
-      m->block->dma_pins--;
-      slab_iommu_mapping_free(m);
-      g_nmappings--;
+      unmap_mapping(m);
       return 0;
     }
-    link = &m->next;
   }
   return SYSERR_INVAL;
 }
@@ -372,34 +426,92 @@ uint64_t iommu_exec(struct thread *curr, struct ring *ring,
 }
 
 bool iommu_endpoint_destroyable(struct ring *ring) {
-  for (struct iommu_domain *d = g_domains; d != nullptr; d = d->next)
-    if (d->ring == ring)
-      return false;
+  (void)ring;
   return true;
 }
 
 void iommu_endpoint_destroy(struct ring *ring) {
-  asserts(iommu_endpoint_destroyable(ring),
-          "iommu: endpoint destroyed with resources");
+  struct iommu_domain **link = &g_domains;
+  while (*link != nullptr) {
+    struct iommu_domain *d = *link;
+    if (d->ring != ring) {
+      link = &d->next;
+      continue;
+    }
+    while (d->devices != nullptr)
+      (void)device_detach(d, d->devices->encoded);
+    while (d->mappings != nullptr)
+      unmap_mapping(d->mappings);
+    *link = d->next;
+    vtd_domain_destroy(&d->hw);
+    slab_iommu_domain_free(d);
+    g_ndomains--;
+  }
 }
 
-bool iommu_reap_one_locked(struct process *p) {
-  struct ring *ring = p->iommu_ch;
-  if (ring == nullptr)
-    return false;
-  for (struct iommu_domain *d = g_domains; d != nullptr; d = d->next) {
-    if (d->ring != ring)
-      continue;
-    if (d->devices != nullptr) {
-      device_detach(d, d->devices->encoded);
-      return true;
-    }
-    if (d->mappings != nullptr) {
-      unmap_block(d, d->mappings->block->base);
-      return true;
-    }
-    domain_destroy(ring, d->cookie);
-    return true;
+uint64_t iommu_enum_maps(struct process *caller, uint64_t base, uint64_t buf,
+                         uint64_t cap, uint64_t after) {
+  if (cap == 0 || cap > VM_ENUM_BATCH)
+    return SYSERR_INVAL;
+  uint64_t values[VM_ENUM_BATCH], count = 0;
+  umem_lock();
+  ublock *b = umem_resource_block_locked(caller, base);
+  if (b == nullptr) {
+    umem_unlock();
+    return SYSERR_PERM;
   }
-  return false;
+  if (b->dma_maps != nullptr) {
+    llrb_domid_map_iter iter;
+    llrb_domid_map_iter_lower_bound(b->dma_maps, &after, &iter);
+    uint64_t key;
+    while (count < cap &&
+           llrb_domid_map_iter_next(&iter, &key, nullptr))
+      if (key > after)
+        values[count++] = key;
+  }
+  uint64_t rc = umem_enum_copyout_locked(caller, buf, cap, values, count);
+  umem_unlock();
+  return rc;
 }
+
+uint64_t iommu_revoke_map(struct process *caller, uint64_t base,
+                          uint64_t domain_id) {
+  umem_lock();
+  ublock *b = umem_resource_block_locked(caller, base);
+  if (b == nullptr) {
+    umem_unlock();
+    return SYSERR_PERM;
+  }
+  iommu_mapping *m = nullptr;
+  if (b->dma_maps != nullptr)
+    (void)llrb_domid_map_get_ref(b->dma_maps, &domain_id, &m);
+  if (m != nullptr) {
+    unmap_mapping(m);
+    umem_unlock();
+    return 0;
+  }
+  umem_unlock();
+  return SYSERR_INVAL;
+}
+
+// The block-side tree owns each mapping inline; its node slab lives beside
+// the tree instantiation so the pair remains one implementation unit.
+#define LLRB_NAME domid_map
+#define LLRB_KEY uint64_t
+#define LLRB_VALUE iommu_mapping
+#define LLRB_COMPARE(a, b) (((*a) > (*b)) - ((*a) < (*b)))
+#define LLRB_NODE_MALLOC(size) slab_llrb_domid_map_node_malloc(size)
+#define LLRB_NODE_FREE(ptr) slab_llrb_domid_map_node_free(ptr)
+#include <llrb/llrb_impl.h>
+
+#define SLAB_NAME llrb_domid_map_node
+#define SLAB_TYPE llrb_domid_map_node
+#define SLAB_PAGE_SIZE PAGE_SIZE
+#define SLAB_CACHELINE_SIZE 64
+#define SLAB_WHICH_CPU() cpu_state_whoami()
+#include <slab/slab_impl.h>
+#undef SLAB_WHICH_CPU
+#undef SLAB_CACHELINE_SIZE
+#undef SLAB_PAGE_SIZE
+#undef SLAB_TYPE
+#undef SLAB_NAME

@@ -17,7 +17,7 @@
 // The bucket table (futex-design.md §3). Plain spinlocks, not svclocks:
 // no futex path is ever held across as_flush, and the wake paths run in
 // interrupt context, where a shootdown-servicing lock is forbidden.
-// Lock order: list locks (p->ulock) and stripes rank above buckets;
+// Lock order: list locks (p->ulock) and ring CQ locks rank above buckets;
 // buckets rank above the per-CPU timer locks and the scheduler lock.
 //
 // Interim paging discipline: until page-table pages are retired after

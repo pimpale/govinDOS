@@ -17,7 +17,7 @@
 // exceptions (SYS_FUTEX_WAIT, SYS_YIELD) park the calling user thread —
 // anything long-running is a registration + event on a channel
 // (ipc-process-design.md §2), and anything long-lived in teardown is the
-// parent's reap loop (§4).
+// parent's explicit destruction choreography (§4).
 
 // Numbers are grouped by ability: identity/time, then memory, then
 // sharing, then futexes, then process/thread lifecycle.
@@ -35,17 +35,16 @@
 // principle — these verbs create and destroy blocks (and the views that
 // make them accessible), they don't position anything. vm_protect
 // re-flags a page-aligned sub-range of a block in the caller's own view
-// (or, with a pid, an own embryo's view — the parent applying W^X to the
-// image it wrote); prot 0 makes it inaccessible. vm_share maps a whole
+// (or, with a pid, a direct child's view); prot 0 makes it inaccessible.
+// vm_share maps a whole
 // owned block into another process (positive target) or turns it into a
-// kernel channel (negative scheme id); the owner freeing the block (or
-// dying + being reaped) revokes every view. vm_dropshare is the sharer's
-// own drop of a shared-in view; vm_unshare is the owner's per-edge
-// revocation of one sharer. vm_move transfers ownership along tree edges
-// only: down into an own embryo, up out of an own zombie child.
+// kernel channel (negative scheme id). Free refuses while views remain;
+// vm_dropshare is the viewer's own removal and vm_unshare is the owner's
+// exact per-edge revocation. vm_move transfers ownership down into a direct
+// child; that authority remains after the child starts running.
 //
 // vm_free is a single bounded transaction: it fails SYSERR_EXIST while
-// anything is still attached (sharers, DMA pins, thread pins). Parked
+// anything is still attached (sharers, DMA mappings, thread pins). Parked
 // futex waiters are NOT an attachment — the kernel never wakes waiters
 // on revocation (futex-design.md §5); teardown choreography is
 // userspace's (close sentinel -> wake -> peers dropshare -> free).
@@ -62,10 +61,17 @@
 // GRANT_DEVMEM token as a device-backed ublock (flags must be a subset
 // of the grant flags).
 #define SYS_VM_SHARE      9  // (base, target, prot)    -> 0 (target signed)
-#define SYS_VM_DROPSHARE  10 // (base)                  -> 0 (sharer drops its view)
+#define SYS_VM_DROPSHARE  10 // (base, pid)             -> 0 (pid 0 = self)
 #define SYS_VM_UNSHARE    11 // (base, pid)             -> 0 (owner revokes one edge)
 #define SYS_VM_MOVE       12 // (base, pid)             -> 0
 #define SYS_VM_MAP_DEVICE 13 // (token_ptr, token_len, flags) -> 0
+#define SYS_VM_SHARERS    14 // (base, buf, cap, after) -> count
+#define SYS_VM_BLOCKS     15 // (pid, buf, cap, after)  -> count
+#define SYS_VM_VIEWS      16 // (pid, buf, cap, after)  -> count
+#define SYS_VM_DMA_MAPS   17 // (base, buf, cap, after) -> count
+#define SYS_VM_DMA_REVOKE 18 // (base, domain_id)       -> 0
+
+#define VM_ENUM_BATCH 128u
 
 // Address-keyed waiting (futex-design.md). WAKE resolves addr to a block
 // the caller has a view of; if that block is a kernel channel this is the
@@ -77,9 +83,9 @@
 // SYS_GETTIME-domain nanosecond value, 0 = none. REQUEUE moves up to
 // min(count, FUTEX_REQUEUE_BATCH) waiters from `from` to `to` in FIFO
 // order if the word at `from` equals expected, and returns how many.
-#define SYS_FUTEX_WAKE    14 // (addr, count)                      -> nwoken
-#define SYS_FUTEX_WAIT    15 // (addr, expected, wake_addr, deadline) -> 0 | SYSERR_*
-#define SYS_FUTEX_REQUEUE 16 // (from, to, expected, count)        -> nmoved | SYSERR_*
+#define SYS_FUTEX_WAKE    19 // (addr, count)                      -> nwoken
+#define SYS_FUTEX_WAIT    20 // (addr, expected, wake_addr, deadline) -> 0 | SYSERR_*
+#define SYS_FUTEX_REQUEUE 21 // (from, to, expected, count)        -> nmoved | SYSERR_*
 
 // Maximum waiters detached by one FUTEX_WAKE / moved by one FUTEX_REQUEUE
 // call. Kernel work and runqueue publication are therefore bounded; the
@@ -87,25 +93,24 @@
 #define FUTEX_WAKE_BATCH 16u
 #define FUTEX_REQUEUE_BATCH 16u
 
-// Process trees (ipc-process-design.md §5): parent-driven creation
-// (embryo -> VM_MOVE/VM_PROTECT -> first THREAD_SPAWN seals), recursive
-// kill, and the parent-driven reap loop that replaces all deferred
-// kernel teardown.
-#define SYS_PROC_CREATE      17 // ()                        -> pid (embryo)
-#define SYS_THREAD_SPAWN     18 // (pid, start_ptr, start_size) -> tid
-#define SYS_THREAD_BASES_SET 19 // (fsbase, gsbase)          -> 0
-#define SYS_THREAD_EXIT      20 // ()                        -> never returns (current thread)
-#define SYS_PROC_KILL        21 // (pid)                     -> 0 (own descendant; subtree dies)
-#define SYS_PROC_REAP        22 // (pid)                     -> REAP_* | SYSERR_AGAIN (own dead child)
-#define SYS_PROC_EXIT        23 // (status)                  -> never returns
+// Process trees (ipc-process-design.md §5): parent-driven creation and live
+// child management, recursive kill, enumeration-driven resource teardown,
+// and exact process destruction.
+#define SYS_PROC_CREATE       22 // ()                -> pid (alive, no threads)
+#define SYS_THREAD_SPAWN      23 // (pid, start_ptr, start_size) -> tid
+#define SYS_THREAD_BASES_SET  24 // (fsbase, gsbase)           -> 0
+#define SYS_THREAD_EXIT       25 // ()                         -> never returns
+#define SYS_PROC_KILL         26 // (pid)                      -> 0
+#define SYS_THREADS           27 // (pid, buf, cap, after)     -> count
+#define SYS_THREAD_DESTROY    28 // (pid, tid)                 -> 0
+#define SYS_PROC_CHILDREN     29 // (pid, buf, cap, after)     -> count
+#define SYS_PROC_DESTROY      30 // (pid) -> PROC_DESTROY_* | SYSERR_*
+#define SYS_PROC_EXIT         31 // (status)                   -> never returns
 
-#define SYS_MAX              24
+#define SYS_MAX               32
 
-// SYS_PROC_REAP results: one more bounded step done / the subtree is
-// fully gone. SYSERR_AGAIN means culling/drain hasn't caught up — call
-// again.
-#define REAP_DONE 0
-#define REAP_MORE 1
+#define PROC_DESTROY_DONE 0
+#define PROC_DESTROY_MORE 1
 
 // vm_alloc prot bits (user-facing; translated to paging flags internally).
 #define VM_PROT_READ  1u

@@ -1,5 +1,6 @@
 #include "pe.h"
 
+#include <stdbool.h>
 #include <string.h>
 
 #include "sys.h"
@@ -99,6 +100,110 @@ static uint64_t fail(const char *why) {
   print(why);
   print("\n");
   return 0;
+}
+
+static bool destroy_process(uint64_t pid, uint64_t *items) {
+  for (;;) {
+    uint64_t n = sys_proc_children(pid, items, 1, 0);
+    if (sys_iserr(n))
+      return false;
+    if (n == 0)
+      break;
+    for (uint64_t i = 0; i < n; i++)
+      if (!destroy_process(items[i], items))
+        return false;
+  }
+
+  for (;;) {
+    uint64_t n = sys_threads(pid, items, 1, 0);
+    if (sys_iserr(n))
+      return false;
+    if (n == 0)
+      break;
+    for (uint64_t i = 0; i < n; i++) {
+      for (;;) {
+        uint64_t rc = sys_thread_destroy(pid, items[i]);
+        if (rc == 0 || rc == SYSERR_INVAL)
+          break;
+        if (rc != SYSERR_AGAIN)
+          return false;
+        sys_yield();
+      }
+    }
+  }
+
+  for (;;) {
+    uint64_t n = sys_vm_views(pid, items, 1, 0);
+    if (sys_iserr(n))
+      return false;
+    if (n == 0)
+      break;
+    for (uint64_t i = 0; i < n; i++) {
+      uint64_t rc = sys_vm_dropshare(items[i], pid);
+      if (rc != 0 && rc != SYSERR_INVAL)
+        return false;
+    }
+  }
+
+  for (;;) {
+    uint64_t n = sys_vm_blocks(pid, items, 1, 0);
+    if (sys_iserr(n))
+      return false;
+    if (n == 0)
+      break;
+    for (uint64_t i = 0; i < n; i++) {
+      uint64_t base = items[i];
+      for (;;) {
+        uint64_t ns = sys_vm_sharers(base, items, VM_ENUM_BATCH, 0);
+        if (sys_iserr(ns))
+          return false;
+        if (ns == 0)
+          break;
+        for (uint64_t j = 0; j < ns; j++) {
+          uint64_t rc = sys_vm_unshare(base, items[j]);
+          if (rc != 0 && rc != SYSERR_INVAL)
+            return false;
+        }
+      }
+      for (;;) {
+        uint64_t nm = sys_vm_dma_maps(base, items, VM_ENUM_BATCH, 0);
+        if (sys_iserr(nm))
+          return false;
+        if (nm == 0)
+          break;
+        for (uint64_t j = 0; j < nm; j++) {
+          uint64_t rc = sys_vm_dma_revoke(base, items[j]);
+          if (rc != 0 && rc != SYSERR_INVAL)
+            return false;
+        }
+      }
+      uint64_t rc = sys_vm_free(base);
+      if (rc != 0)
+        return false;
+    }
+  }
+
+  for (;;) {
+    uint64_t rc = sys_proc_destroy(pid);
+    if (rc == PROC_DESTROY_DONE)
+      return true;
+    if (rc == PROC_DESTROY_MORE)
+      continue;
+    if (rc != SYSERR_AGAIN)
+      return false;
+    sys_yield();
+  }
+}
+
+bool pe_destroy(uint64_t pid) {
+  uint64_t scratch =
+      sys_vm_alloc(VM_ENUM_BATCH * sizeof(uint64_t),
+                   VM_PROT_READ | VM_PROT_WRITE);
+  if (sys_iserr(scratch))
+    return false;
+  bool ok = destroy_process(pid, (uint64_t *)scratch);
+  (void)sys_vm_free(scratch);
+  return ok;
 }
 
 static bool range_inside(uint64_t base, uint64_t bytes, uint64_t address,
@@ -216,7 +321,7 @@ uint64_t pe_spawn_resources(const uint8_t *image, uint64_t len, uint64_t arg,
       (const void *)((const uint8_t *)opt + coff->opt_size);
   uint64_t image_size = page_ceil(opt->size_of_image);
 
-  // One block for the whole image, written here, moved to the embryo
+  // One block for the whole image, written here, moved to the child
   // below. VM_ALLOC zeroes, so the VirtualSize > raw_size tail (.bss) is
   // already right.
   uint64_t base = sys_vm_alloc(image_size, VM_PROT_READ | VM_PROT_WRITE);

@@ -3,12 +3,9 @@
 #include <stdatomic.h>
 
 #include "channel.h"
-#include "capability.h"
 #include "cpu_state.h"
 #include "debug.h"
 #include "futex.h"
-#include "iommu.h"
-#include "irq_scheme.h"
 #include "paging.h"
 #include "scheduler.h"
 #include "stdlib/stdio.h"
@@ -35,8 +32,6 @@ static struct thread *process_spawn_thread_locked(struct process *p,
                                                   ublock *completion_block,
                                                   uint64_t completion_event);
 
-#define REAP_TCB_BATCH 256
-
 void process_set_init(struct process *p) {
   asserts(g_init == nullptr, "process: init set twice");
   g_init = p;
@@ -55,14 +50,16 @@ struct process *process_create(struct process *parent) {
   // punches kthread-stack guards into it. Isolation is which tree
   // carries PAGE_U leaves, enforced by the per-process CR3.
   p->as = as_clone(g_as_kernel);
-  p->state = PROC_EMBRYO;
   p->parent = parent;
-  vec_process_ptr_new(&p->children);
-  vec_thread_ptr_new(&p->threads);
+  asserts(llrb_pid_process_new(&p->children),
+          "process: children tree alloc failed");
+  asserts(llrb_tid_thread_new(&p->threads),
+          "process: thread tree alloc failed");
   umem_process_register(p); // enters the live-pid index
   if (parent != nullptr) {
     umem_lock();
-    vec_process_ptr_push(parent->children, &p);
+    asserts(llrb_pid_process_insert(parent->children, &p->pid, &p),
+            "process: child insertion failed");
     umem_unlock();
   }
   return p;
@@ -87,16 +84,13 @@ static struct thread *process_spawn_thread_locked(struct process *p,
                                                   ublock *completion_block,
                                                   uint64_t completion_event) {
   asserts(!process_is_dead(p), "process: spawning into the dead");
-  // First spawn seals the embryo: parent authority (VM_MOVE in,
-  // parent-set protections) drops to normal peer.
-  p->state = PROC_LIVE;
   // Construct privately, install every process/ABI field, then enqueue as
   // the final publication. The old order queued first and let a fast exit on
-  // another CPU race remove_thread_ref before proc_slot/vector insertion.
+  // another CPU race remove_thread_ref before thread-index insertion.
   struct thread *t = uthread_spawn(p, entry, stack_pointer, arg, fs_base,
                                    gs_base, completion_block, completion_event);
-  t->proc_slot = vec_thread_ptr_len(p->threads);
-  vec_thread_ptr_push(p->threads, &t);
+  asserts(llrb_tid_thread_insert(p->threads, &t->tid, &t),
+          "process: thread insertion failed");
   atomic_fetch_add(&p->nthreads, 1);
   scheduler_enqueue(t);
   return t;
@@ -108,7 +102,7 @@ static struct thread *process_spawn_thread_locked(struct process *p,
 
 bool process_is_dead(const struct process *p) {
   for (; p != nullptr; p = p->parent) {
-    if (atomic_load_explicit(&p->state, memory_order_acquire) == PROC_DEAD) {
+    if (atomic_load_explicit(&p->dead, memory_order_acquire)) {
       return true;
     }
   }
@@ -116,17 +110,10 @@ bool process_is_dead(const struct process *p) {
 }
 
 static void remove_thread_ref(struct process *p, const struct thread *t) {
-  uint32_t i = t->proc_slot;
-  uint32_t n = vec_thread_ptr_len(p->threads);
-  asserts(i < n, "process: bad thread slot");
-  struct thread *at, *last;
-  vec_thread_ptr_get(p->threads, i, &at);
-  vec_thread_ptr_get(p->threads, n - 1, &last);
-  asserts(at == t, "process: thread slot mismatch");
-  vec_thread_ptr_swap_and_pop(p->threads, i);
-  if (i != n - 1) {
-    last->proc_slot = i;
-  }
+  struct thread *removed;
+  asserts(llrb_tid_thread_remove(p->threads, &t->tid, &removed) &&
+              removed == t,
+          "process: thread index mismatch");
 }
 
 // Post KEV_CHILD_DEAD for `child` to its parent's tree channel, or leave
@@ -147,19 +134,7 @@ static void mark_dead_locked(struct process *p) {
     return;
   }
   asserts(p != g_init, "init died");
-  p->state = PROC_DEAD;
-  umem_proc_unregister_locked(p);
-}
-
-// Reap materializes effective death one process at a time. Interior
-// descendants do not notify their also-dead parents.
-static void materialize_dead_locked(struct process *p) {
-  if (p->state == PROC_DEAD) {
-    return;
-  }
-  asserts(process_is_dead(p), "process: materializing the live");
-  p->state = PROC_DEAD;
-  umem_proc_unregister_locked(p);
+  p->dead = true;
 }
 
 void process_kill_subtree(struct process *p) {
@@ -175,9 +150,10 @@ void process_thread_exited(struct thread *t) {
   // This hook is reached only after scheduler_loop release-stored on_cpu=false.
   // Therefore an acquiring joiner may reclaim the departed thread's stack and
   // TLS immediately after observing this publication.
-  if (!process_is_dead(p) && t->completion_block != nullptr) {
+  if (t->completion_block != nullptr) {
     channel_thread_complete_locked(p, t->completion_block,
-                                   t->completion_event);
+                                   t->completion_event, !process_is_dead(p));
+    t->completion_block = nullptr;
   }
   remove_thread_ref(p, t);
   arch_thread_destroy(t);
@@ -192,139 +168,21 @@ void process_thread_exited(struct thread *t) {
   umem_unlock();
 }
 
-// ---------------------------------------------------------------------------
-// Reaping: one bounded step per call, deepest zombie first
-// ---------------------------------------------------------------------------
-
-static uint64_t reap_step_locked(struct process *target,
-                                 struct umem_release *rel) {
-  asserts(target->state == PROC_DEAD, "reap: target not dead");
-
-  // Post-order cursor: nothing ever reparents, so the dead subtree is
-  // closed, and descending first-child-first always terminates at a
-  // childless zombie. Reaping it eventually unlinks it from its parent,
-  // which is how the cursor advances.
-  struct process *z = target;
-  while (vec_process_ptr_len(z->children) > 0) {
-    vec_process_ptr_get(z->children, 0, &z);
-    asserts(process_is_dead(z), "reap: live process inside dead subtree");
+// Reaper authority is a strict descendant path whose every intervening
+// process is effectively dead. A live child is therefore a hard boundary:
+// its parent cannot skip through it to manage a dead grandchild.
+bool process_reaper_authorized_locked(const struct process *caller,
+                                      const struct process *target) {
+  if (caller == target || !process_is_dead(target))
+    return false;
+  for (const struct process *at = target; at != nullptr && at != caller;
+       at = at->parent) {
+    if (!process_is_dead(at))
+      return false;
+    if (at->parent == caller)
+      return true;
   }
-  materialize_dead_locked(z);
-
-  if (cap_reap_one_locked(z)) {
-    return REAP_MORE;
-  }
-
-  if (iommu_reap_one_locked(z)) {
-    return REAP_MORE;
-  }
-  if (irq_reap_one_locked(z)) {
-    return REAP_MORE;
-  }
-
-  if (umem_reap_one_block_locked(z, rel)) {
-    return REAP_MORE; // caller runs umem_release_finish after unlocking
-  }
-  if (umem_reap_one_view_locked(z)) {
-    return REAP_MORE;
-  }
-  // Free a fixed batch of blocked TCBs from the vector tail. A
-  // RUNNABLE/RUNNING/DEAD tail remains scheduler-owned and is left
-  // alone. A parked thread's futex node holds a thread pointer, so the
-  // TCB may be freed only by a reap that wins the PARKED -> CLAIMED
-  // claim and removes the node first; a CLAIMED or MOVING thread belongs
-  // to someone else for the moment, and off-CPU-and-blocked alone is no
-  // longer a licence to free (futex-design.md §5, §6).
-  uint32_t ntcbs = 0;
-  while (ntcbs < REAP_TCB_BATCH && vec_thread_ptr_len(z->threads) > 0) {
-    uint32_t i = vec_thread_ptr_len(z->threads) - 1;
-    struct thread *t;
-    vec_thread_ptr_get(z->threads, i, &t);
-    if (atomic_load_explicit(&t->on_cpu, memory_order_acquire) ||
-        atomic_load_explicit(&t->status, memory_order_acquire) !=
-            THREAD_BLOCKED) {
-      break;
-    }
-    enum futex_state ws =
-        atomic_load_explicit(&t->wake_state, memory_order_acquire);
-    if (ws == FUTEX_PARKED) {
-      if (!futex_try_claim(t)) {
-        break; // a waker or expiry owns it; retry contract reports progress
-      }
-      futex_reap_claimed(t);
-    } else if (ws != FUTEX_REAPABLE) {
-      // CLAIMED/MOVING (or a not-yet-published park): in someone else's
-      // hands right now — the existing SYSERR_AGAIN retry covers it.
-      break;
-    }
-    remove_thread_ref(z, t);
-    arch_thread_destroy(t);
-    slab_thread_free(t);
-    atomic_fetch_sub(&z->nthreads, 1);
-    ntcbs++;
-  }
-  if (ntcbs != 0) {
-    return REAP_MORE;
-  }
-  if (atomic_load(&z->nthreads) != 0) {
-    // Killed threads that haven't been culled yet (running until their
-    // next kernel entry, or queued until dispatch). Their TCBs and this
-    // struct must outlive them.
-    return SYSERR_AGAIN;
-  }
-  if (!z->as_freed) {
-    // Three drains gate the AS free, all of the same shape. Pins: an
-    // in-flight block release may still be flushing this AS outside
-    // g_umem (umem_release_finish); each pin lasts one lock-free flush
-    // round, and once z's lists are empty no new pin can target z->as.
-    if (as_has_pins(z->as)) {
-      return SYSERR_AGAIN;
-    }
-    // No CPU may still have the page tree loaded. Idle CPUs switch to
-    // g_as_kernel and dispatch switches per-thread, so with the threads
-    // culled this drains promptly (a CPU-bound hostile thread is forced
-    // through its death checkpoint by the preemption timer within one
-    // quantum, so the nthreads gate above clears in bounded time).
-    for (size_t i = 0; i < g_cpu_state_table_len; i++) {
-      if (g_cpu_state_table[i].current_as == z->as) {
-        return SYSERR_AGAIN;
-      }
-    }
-    as_free(z->as);
-    z->as = nullptr;
-    z->as_freed = true;
-    return REAP_MORE;
-  }
-
-  // All resources gone: unlink and free the metadata in one shot.
-  bool done = z == target;
-  if (z->parent != nullptr) {
-    for (uint32_t i = 0; i < vec_process_ptr_len(z->parent->children); i++) {
-      struct process *c;
-      vec_process_ptr_get(z->parent->children, i, &c);
-      if (c == z) {
-        vec_process_ptr_swap_and_pop(z->parent->children, i);
-        break;
-      }
-    }
-  }
-  umem_reap_finish_locked(z);
-  vec_process_ptr_delete(&z->children);
-  vec_thread_ptr_delete(&z->threads);
-  slab_process_free(z);
-  return done ? REAP_DONE : REAP_MORE;
-}
-
-uint64_t process_reap_step(struct process *target) {
-  struct umem_release rel = {0};
-  umem_lock();
-  uint64_t rc = reap_step_locked(target, &rel);
-  umem_unlock();
-  // The flush round + buddy return of a freed block run with no locks
-  // held — the reap syscall's bounded step includes them, the rest of
-  // the machine doesn't.
-  umem_release_finish(&rel);
-  return rc;
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -377,9 +235,8 @@ uint64_t proc_sys_thread_spawn(struct thread *curr, uint64_t pid,
   umem_lock();
   struct process *me = curr->proc;
   struct process *target = umem_proc_lookup_locked(pid);
-  bool authority = target == me ||
-                   (target != nullptr && target->parent == me &&
-                    target->state == PROC_EMBRYO);
+  bool authority =
+      target == me || (target != nullptr && target->parent == me);
   if (!authority ||
       !user_page_has(target, start.entry, PAGE_U | PAGE_R | PAGE_X) ||
       start.stack_pointer == 0 ||
@@ -393,8 +250,8 @@ uint64_t proc_sys_thread_spawn(struct thread *curr, uint64_t pid,
   umem_proc_lock(target);
   bool start_ok = true;
   if (start.completion_event != 0) {
-    // Join completion is process-private. Cross-process first-thread
-    // lifetime is represented by the tree channel instead.
+    // Join completion is process-private. A parent tracks child lifetime
+    // through the tree channel instead.
     completion_block =
         target == me
             ? umem_view_locked(target, start.completion_event, sizeof(uint32_t))
@@ -404,7 +261,7 @@ uint64_t proc_sys_thread_spawn(struct thread *curr, uint64_t pid,
                completion_block->owner == target &&
                completion_block->backing == UBLOCK_RAM &&
                completion_block->ring == nullptr &&
-               vec_share_edge_len(completion_block->sharers) == 0 &&
+               llrb_pid_edge_len(completion_block->sharers) == 0 &&
                user_range_ok(target, start.completion_event, sizeof(uint32_t),
                              true) &&
                *(volatile _Atomic uint32_t *)start.completion_event ==
@@ -459,41 +316,168 @@ uint64_t proc_sys_kill(struct thread *curr, uint64_t pid) {
   return 0;
 }
 
-// Find `pid` among `me`'s children (zombies included — they left the
-// live-pid index at death but stay tree-linked until reaped).
-static struct process *find_child_locked(struct process *me, uint64_t pid) {
-  for (uint32_t i = 0; i < vec_process_ptr_len(me->children); i++) {
-    struct process *c;
-    vec_process_ptr_get(me->children, i, &c);
-    if (c->pid == pid) {
-      return c;
-    }
-  }
-  return nullptr;
+static struct process *resource_subject_locked(struct process *caller,
+                                               uint64_t pid) {
+  if (pid == 0 || pid == caller->pid)
+    return caller;
+  struct process *target = umem_proc_lookup_any_locked(pid);
+  return target != nullptr &&
+                 process_reaper_authorized_locked(caller, target)
+             ? target
+             : nullptr;
 }
 
-uint64_t proc_sys_reap(struct thread *curr, uint64_t pid) {
-  struct umem_release rel = {0};
+uint64_t proc_sys_threads(struct thread *curr, uint64_t pid, uint64_t buf,
+                          uint64_t cap, uint64_t after) {
+  if (cap == 0 || cap > VM_ENUM_BATCH)
+    return SYSERR_INVAL;
+  uint64_t values[VM_ENUM_BATCH];
+  uint64_t count = 0;
   umem_lock();
-  struct process *child = find_child_locked(curr->proc, pid);
-  if (child == nullptr || child->state != PROC_DEAD) {
+  struct process *target = resource_subject_locked(curr->proc, pid);
+  if (target == nullptr) {
+    umem_unlock();
+    return SYSERR_PERM;
+  }
+  llrb_tid_thread_iter iter;
+  llrb_tid_thread_iter_lower_bound(target->threads, &after, &iter);
+  uint64_t key;
+  while (count < cap && llrb_tid_thread_iter_next(&iter, &key, nullptr))
+    if (key > after)
+      values[count++] = key;
+  uint64_t rc =
+      umem_enum_copyout_locked(curr->proc, buf, cap, values, count);
+  umem_unlock();
+  return rc;
+}
+
+uint64_t proc_sys_children(struct thread *curr, uint64_t pid, uint64_t buf,
+                           uint64_t cap, uint64_t after) {
+  if (cap == 0 || cap > VM_ENUM_BATCH)
+    return SYSERR_INVAL;
+  uint64_t values[VM_ENUM_BATCH];
+  uint64_t count = 0;
+  umem_lock();
+  struct process *target = resource_subject_locked(curr->proc, pid);
+  if (target == nullptr) {
+    umem_unlock();
+    return SYSERR_PERM;
+  }
+  llrb_pid_process_iter iter;
+  llrb_pid_process_iter_lower_bound(target->children, &after, &iter);
+  uint64_t key;
+  while (count < cap &&
+         llrb_pid_process_iter_next(&iter, &key, nullptr))
+    if (key > after)
+      values[count++] = key;
+  uint64_t rc =
+      umem_enum_copyout_locked(curr->proc, buf, cap, values, count);
+  umem_unlock();
+  return rc;
+}
+
+uint64_t proc_sys_thread_destroy(struct thread *curr, uint64_t pid,
+                                 uint64_t tid) {
+  umem_lock();
+  struct process *target = resource_subject_locked(curr->proc, pid);
+  if (target == nullptr ||
+      (target != curr->proc && !process_is_dead(target))) {
+    umem_unlock();
+    return SYSERR_PERM;
+  }
+  struct thread *victim;
+  if (!llrb_tid_thread_get(target->threads, &tid, &victim)) {
     umem_unlock();
     return SYSERR_INVAL;
   }
-  uint64_t rc = reap_step_locked(child, &rel);
+  if (atomic_load_explicit(&victim->on_cpu, memory_order_acquire) ||
+      atomic_load_explicit(&victim->status, memory_order_acquire) !=
+          THREAD_BLOCKED) {
+    umem_unlock();
+    return SYSERR_AGAIN;
+  }
+  enum futex_state ws =
+      atomic_load_explicit(&victim->wake_state, memory_order_acquire);
+  if (ws == FUTEX_PARKED) {
+    if (!futex_try_claim(victim)) {
+      umem_unlock();
+      return SYSERR_AGAIN;
+    }
+    futex_reap_claimed(victim);
+  } else if (ws != FUTEX_REAPABLE) {
+    umem_unlock();
+    return SYSERR_AGAIN;
+  }
+  if (victim->completion_block != nullptr) {
+    channel_thread_complete_locked(target, victim->completion_block,
+                                   victim->completion_event, false);
+    victim->completion_block = nullptr;
+  }
+  remove_thread_ref(target, victim);
+  arch_thread_destroy(victim);
+  slab_thread_free(victim);
+  atomic_fetch_sub(&target->nthreads, 1);
   umem_unlock();
-  umem_release_finish(&rel);
-  return rc;
+  return 0;
+}
+
+uint64_t proc_sys_destroy(struct thread *curr, uint64_t pid) {
+  umem_lock();
+  struct process *target = umem_proc_lookup_any_locked(pid);
+  if (target == nullptr ||
+      !process_reaper_authorized_locked(curr->proc, target)) {
+    umem_unlock();
+    return SYSERR_PERM;
+  }
+  umem_proc_lock(target);
+  bool has_memory = llrb_base_block_len(target->blocks) != 0 ||
+                    llrb_base_edge_len(target->views) != 0;
+  umem_proc_unlock(target);
+  if (has_memory || llrb_pid_process_len(target->children) != 0 ||
+      llrb_tid_thread_len(target->threads) != 0) {
+    umem_unlock();
+    return SYSERR_EXIST;
+  }
+  if (target->as != nullptr) {
+    if (as_has_pins(target->as)) {
+      umem_unlock();
+      return SYSERR_AGAIN;
+    }
+    for (size_t i = 0; i < g_cpu_state_table_len; i++) {
+      if (g_cpu_state_table[i].current_as == target->as) {
+        umem_unlock();
+        return SYSERR_AGAIN;
+      }
+    }
+    as_free(target->as);
+    target->as = nullptr;
+    umem_unlock();
+    return PROC_DESTROY_MORE;
+  }
+  struct process *parent = target->parent;
+  struct process *removed;
+  asserts(llrb_pid_process_remove(parent->children, &target->pid, &removed) &&
+              removed == target,
+          "process: child missing during destroy");
+  umem_proc_unregister_locked(target);
+  umem_process_finish_locked(target);
+  llrb_pid_process_delete(&target->children);
+  llrb_tid_thread_delete(&target->threads);
+  slab_process_free(target);
+  umem_unlock();
+  return PROC_DESTROY_DONE;
 }
 
 uint64_t proc_sys_vm_move(struct thread *curr, uint64_t base, uint64_t pid) {
   struct process *me = curr->proc;
   umem_lock();
 
-  // Down: construction — into your own embryo.
+  // A direct parent retains configuration authority for the child's
+  // lifetime. Page-table changes are safe while either endpoint runs:
+  // umem_move_locked performs the mapping transition and shootdown under
+  // g_umem.
   struct process *target = umem_proc_lookup_locked(pid);
-  if (target != nullptr && target->parent == me &&
-      target->state == PROC_EMBRYO) {
+  if (target != nullptr && target->parent == me) {
     umem_proc_lock(me);
     ublock *b = umem_owned_locked(me, base);
     umem_proc_unlock(me); // b stays pinned by g_umem
@@ -506,34 +490,17 @@ uint64_t proc_sys_vm_move(struct thread *curr, uint64_t base, uint64_t pid) {
     return rc;
   }
 
-  // Up: reap-time claim — out of your own zombie child (post-mortem
-  // inspection and exec-image recycling are libraries built on this).
-  struct process *child = find_child_locked(me, pid);
-  if (child != nullptr && child->state == PROC_DEAD) {
-    umem_proc_lock(child);
-    ublock *b = umem_owned_locked(child, base);
-    umem_proc_unlock(child);
-    if (b == nullptr || b->ring != nullptr) {
-      umem_unlock();
-      return SYSERR_INVAL;
-    }
-    uint64_t rc = umem_move_locked(b, child, me, !child->as_freed);
-    umem_unlock();
-    return rc;
-  }
-
   umem_unlock();
   return SYSERR_INVAL;
 }
 
 uint64_t proc_sys_vm_protect_for(struct thread *curr, uint64_t base,
                                  uint64_t len, uint64_t prot, uint64_t pid) {
-  // g_umem pins the looked-up embryo across the protect (which itself
-  // only takes the target's list lock).
+  // g_umem pins the live direct child across the protect (which itself
+  // takes the target's list lock and performs the required shootdown).
   umem_lock();
   struct process *target = umem_proc_lookup_locked(pid);
-  if (target == nullptr || target->parent != curr->proc ||
-      target->state != PROC_EMBRYO) {
+  if (target == nullptr || target->parent != curr->proc) {
     umem_unlock();
     return SYSERR_INVAL;
   }

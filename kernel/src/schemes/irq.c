@@ -24,7 +24,6 @@ struct irq_route {
   uint32_t ev_index;
   uint32_t gsi;
   enum irq_trigger_mode mode;
-  struct process *target;
   uint16_t generation;
   bool present;
   bool allocated;
@@ -171,6 +170,12 @@ static uint64_t release(struct ring *ring, uint64_t gsi) {
     x86_ioapic_mask(route->gsi);
   route->ring = nullptr;
   route->posted = false;
+  if (!route->present) {
+    route->generation++;
+    if (route->generation == 0)
+      route->generation++;
+    route->allocated = false;
+  }
   spinlock_unlock(&route->lock);
 
   struct irq_route **link = &ring->irq_claims;
@@ -180,10 +185,6 @@ static uint64_t release(struct ring *ring, uint64_t gsi) {
   *link = route->next_claim;
   route->next_claim = nullptr;
   ring->nclaims--;
-  if (!route->present) {
-    route->allocated = false;
-    route->target = nullptr;
-  }
   return 0;
 }
 
@@ -204,14 +205,15 @@ static uint64_t ack(struct ring *ring, uint64_t gsi, uint64_t seq) {
   return 0;
 }
 
-static uint64_t allocate_msi_on_ring(struct thread *curr, struct ring *ring,
-                                     struct ksqe *sqe) {
+static uint64_t allocate_msi_on_ring(struct ring *ring, struct ksqe *sqe) {
   grant *parent;
   uint64_t rc = cap_verify_ring_locked(ring, sqe->a, sqe->b,
                                        KCAP_GRANT_IRQ_ROUTE, &parent);
   if (rc != 0 || sqe->c > ring->block->bytes ||
       CAP_TOKEN_SIZE > ring->block->bytes - sqe->c)
     return rc != 0 ? rc : SYSERR_INVAL;
+  if (2 * (ring->nclaims + 1) > ring->nslots)
+    return SYSERR_NOMEM;
   for (uint32_t i = IRQ_ROUTE_COUNT; i-- > 0;) {
     struct irq_route *route = &g_routes[i];
     if (route->present || route->allocated)
@@ -225,46 +227,51 @@ static uint64_t allocate_msi_on_ring(struct thread *curr, struct ring *ring,
     if (route->generation == 0)
       route->generation++;
     route->allocated = true;
-    route->target = curr->proc; // allocation lifetime owner, not bind policy
     route->mode = IRQ_TRIGGER_EDGE;
+    route->cookie = route_id(route);
     route->raised = 0;
     route->acked = 0;
     route->posted = false;
     route->spurious_logged = false;
+    route->ring = ring;
+    route->next_claim = ring->irq_claims;
+    ring->irq_claims = route;
+    ring->nclaims++;
     uint32_t id = route_id(route);
-    uint32_t data = VECTOR_DEVICE_BASE + i;
     struct cap_token token;
-    rc = cap_create_irq_route_locked(curr->proc, parent, route, &token);
+    rc = cap_create_irq_route_locked(parent, route, &token);
     if (rc != 0) {
+      ring->irq_claims = route->next_claim;
+      route->next_claim = nullptr;
+      ring->nclaims--;
+      route->ring = nullptr;
       route->allocated = false;
-      route->target = nullptr;
+      route->generation++;
+      if (route->generation == 0)
+        route->generation++;
       spinlock_unlock(&route->lock);
       return rc;
     }
     memcpy((void *)(ring->block->base + sqe->c), &token, sizeof(token));
-    sqe->a = 0xFEE00000ull | ((uint64_t)g_bsp_apic_id << 12);
-    sqe->b = KIRQ_MSI_PACK(id, data);
+    sqe->a = id;
     spinlock_unlock(&route->lock);
     return 0;
   }
   return SYSERR_NOMEM;
 }
 
-static uint64_t bind_msi(struct ring *ring, struct irq_route *route,
-                         uint64_t cookie) {
-  if (route == nullptr || route->present ||
-      2 * (ring->nclaims + 1) > ring->nslots)
+static uint64_t msi_address(struct irq_route *route, struct ksqe *sqe) {
+  if (route == nullptr || route->present)
     return SYSERR_INVAL;
   spinlock_lock(&route->lock);
-  if (!route->allocated || route->ring != nullptr) {
+  if (!route->allocated) {
     spinlock_unlock(&route->lock);
-    return SYSERR_PERM;
+    return SYSERR_INVAL;
   }
-  route->cookie = cookie;
-  route->ring = ring;
-  route->next_claim = ring->irq_claims;
-  ring->irq_claims = route;
-  ring->nclaims++;
+  uint32_t id = route_id(route);
+  uint32_t data = VECTOR_DEVICE_BASE + route->gsi;
+  sqe->a = 0xFEE00000ull | ((uint64_t)g_bsp_apic_id << 12);
+  sqe->b = KIRQ_MSI_PACK(id, data);
   spinlock_unlock(&route->lock);
   return 0;
 }
@@ -283,16 +290,13 @@ uint64_t irq_exec(struct thread *curr, struct ring *ring,
   case KIRQ_ACK:
     return ack(ring, sqe->a, sqe->b);
   case KIRQ_MSI:
-    return allocate_msi_on_ring(curr, ring, sqe);
-  case KIRQ_BIND: {
+    return allocate_msi_on_ring(ring, sqe);
+  case KIRQ_MSI_ADDR: {
     grant *g;
     uint64_t rc = cap_verify_ring_locked(ring, sqe->a, sqe->b,
                                          KCAP_GRANT_IRQ_ROUTE, &g);
     if (rc != 0) return rc;
-    struct irq_route *route = cap_irq_route(g);
-    rc = bind_msi(ring, route, sqe->c);
-    if (rc == 0) sqe->a = route_id(route);
-    return rc;
+    return msi_address(cap_irq_route(g), sqe);
   }
   default:
     return SYSERR_NOSYS;
@@ -317,28 +321,15 @@ void irq_endpoint_destroy(struct ring *ring) {
       x86_ioapic_mask(route->gsi);
     route->ring = nullptr;
     route->posted = false;
-    spinlock_unlock(&route->lock);
     ring->irq_claims = route->next_claim;
     route->next_claim = nullptr;
     if (!route->present) {
       route->allocated = false;
-      route->target = nullptr;
+      route->generation++;
+      if (route->generation == 0)
+        route->generation++;
     }
     ring->nclaims--;
-  }
-}
-
-bool irq_reap_one_locked(struct process *p) {
-  for (uint32_t i = 0; i < IRQ_ROUTE_COUNT; i++) {
-    struct irq_route *route = &g_routes[i];
-    spinlock_lock(&route->lock);
-    if (route->allocated && route->target == p && route->ring == nullptr) {
-      route->allocated = false;
-      route->target = nullptr;
-      spinlock_unlock(&route->lock);
-      return true;
-    }
     spinlock_unlock(&route->lock);
   }
-  return false;
 }

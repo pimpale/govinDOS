@@ -28,13 +28,10 @@ struct grant {
     struct { struct irq_route *route; uint32_t id; } irq;
     struct { uint32_t requester; } iommu;
   };
-  struct process *creator;
   grant *parent;
   grant *first_child;
   grant *next_sibling;
   grant *prev_sibling;
-  grant *creator_next;
-  grant *creator_prev;
 };
 
 #define SLAB_NAME grant
@@ -131,8 +128,7 @@ uint64_t cap_verify_ring_locked(struct ring *ring, uint64_t off, uint64_t len,
   return resolve_ring(ring, off, len, true, type, out);
 }
 
-static grant *grant_new(struct process *creator, grant *parent, uint8_t type,
-                        bool wildcard) {
+static grant *grant_new(grant *parent, uint8_t type, bool wildcard) {
   if (parent != nullptr && parent->depth >= KCAP_MAX_DEPTH) return nullptr;
   grant *g = slab_grant_zalloc(sizeof(*g));
   if (g == nullptr) return nullptr;
@@ -141,16 +137,12 @@ static grant *grant_new(struct process *creator, grant *parent, uint8_t type,
   g->type = type;
   g->depth = parent == nullptr ? 0 : parent->depth + 1;
   g->wildcard = wildcard;
-  g->creator = creator;
   g->parent = parent;
   if (parent != nullptr) {
     g->next_sibling = parent->first_child;
     if (g->next_sibling != nullptr) g->next_sibling->prev_sibling = g;
     parent->first_child = g;
   }
-  g->creator_next = creator->created_grants;
-  if (g->creator_next != nullptr) g->creator_next->creator_prev = g;
-  creator->created_grants = g;
   if (!llrb_grant_id_insert(g_grants, &g->id, &g))
     fatal("capability: grant index insertion failed");
   return g;
@@ -163,24 +155,13 @@ static void grant_delete_leaf(grant *g) {
     else g->parent->first_child = g->next_sibling;
     if (g->next_sibling != nullptr) g->next_sibling->prev_sibling = g->prev_sibling;
   }
-  if (g->creator_prev != nullptr) g->creator_prev->creator_next = g->creator_next;
-  else g->creator->created_grants = g->creator_next;
-  if (g->creator_next != nullptr) g->creator_next->creator_prev = g->creator_prev;
   grant *removed = nullptr;
   asserts(llrb_grant_id_remove(g_grants, &g->id, &removed) && removed == g,
           "capability: grant index removal failed");
   slab_grant_free(g);
 }
 
-static bool can_revoke(struct process *caller, const grant *target) {
-  for (const grant *at = target; at != nullptr; at = at->parent)
-    if (at->creator == caller) return true;
-  return false;
-}
-
-static uint64_t revoke_step(struct process *caller, grant *target,
-                            bool check_authority) {
-  if (check_authority && !can_revoke(caller, target)) return SYSERR_PERM;
+static uint64_t revoke_step(grant *target) {
   target->dead = true;
   grant *leaf = target;
   while (leaf->first_child != nullptr) leaf = leaf->first_child;
@@ -193,14 +174,13 @@ static bool add_overflows(uint64_t base, uint64_t len, uint64_t *end) {
   return len == 0 || __builtin_add_overflow(base, len, end);
 }
 
-static uint64_t subgrant(struct process *creator,
-                         const struct kcap_subgrant_req *req, grant *parent,
+static uint64_t subgrant(const struct kcap_subgrant_req *req, grant *parent,
                          struct cap_token *token) {
   if (req->reserved != 0 || req->reserved2 != 0 ||
       (req->present & ~7u) != 0)
     return SYSERR_INVAL;
   if (parent->depth >= KCAP_MAX_DEPTH) return SYSERR_NOMEM;
-  grant *child = grant_new(creator, parent, parent->type, false);
+  grant *child = grant_new(parent, parent->type, false);
   if (child == nullptr) return SYSERR_NOMEM;
   uint64_t rc = 0;
   if (parent->type == KCAP_GRANT_DEVMEM) {
@@ -256,7 +236,7 @@ uint64_t cap_exec(struct thread *curr, struct ring *ring, struct ksqe *sqe) {
                                          &parent);
     if (rc != 0) return rc;
     struct cap_token out;
-    rc = subgrant(curr->proc, &req, parent, &out);
+    rc = subgrant(&req, parent, &out);
     if (rc == 0) {
       memcpy((void *)(ring->block->base + sqe->c), &out, sizeof(out));
       sqe->a = out.grant_id_le;
@@ -270,7 +250,7 @@ uint64_t cap_exec(struct thread *curr, struct ring *ring, struct ksqe *sqe) {
     memcpy(&token, (const void *)(ring->block->base + sqe->a), sizeof(token));
     grant *target;
     uint64_t rc = token_resolve(&token, false, 0, &target);
-    return rc == 0 ? revoke_step(curr->proc, target, true) : rc;
+    return rc == 0 ? revoke_step(target) : rc;
   }
   if (sqe->op == KCAP_QUERY) {
     if (!ring_range(ring, sqe->a, sizeof(struct kcap_query_req)) ||
@@ -331,7 +311,7 @@ void capability_selftest(struct process *init,
       .p2 = VM_DEVICE_READ,
       .present = KCAP_PARAM_P0 | KCAP_PARAM_P1 | KCAP_PARAM_P2};
   struct cap_token token;
-  asserts(subgrant(init, &req, root, &token) == 0,
+  asserts(subgrant(&req, root, &token) == 0,
           "capability selftest: zero-base subgrant failed");
   struct cap_token anchor_token = token;
   grant *anchor;
@@ -340,19 +320,19 @@ void capability_selftest(struct process *init,
   grant *parent = anchor;
   req = (struct kcap_subgrant_req){0};
   for (uint32_t depth = 2; depth <= KCAP_MAX_DEPTH; depth++) {
-    asserts(subgrant(init, &req, parent, &token) == 0,
+    asserts(subgrant(&req, parent, &token) == 0,
             "capability selftest: bounded chain creation failed");
     asserts(token_resolve(&token, true, KCAP_GRANT_DEVMEM, &parent) == 0,
             "capability selftest: chain token rejected");
   }
-  asserts(subgrant(init, &req, parent, &token) == SYSERR_NOMEM,
+  asserts(subgrant(&req, parent, &token) == SYSERR_NOMEM,
           "capability selftest: depth-65 grant accepted");
-  uint64_t rc = revoke_step(init, anchor, true);
+  uint64_t rc = revoke_step(anchor);
   asserts(rc == SYSERR_AGAIN &&
               token_resolve(&anchor_token, true, KCAP_GRANT_DEVMEM, &ignored) ==
                   SYSERR_DEAD,
           "capability selftest: revoke was not immediately effective");
-  do { rc = revoke_step(init, anchor, true); } while (rc == SYSERR_AGAIN);
+  do { rc = revoke_step(anchor); } while (rc == SYSERR_AGAIN);
   asserts(rc == 0, "capability selftest: retry cleanup failed");
   umem_unlock();
   printf("capability: token/depth/revoke selftest ok\n");
@@ -361,19 +341,13 @@ void capability_selftest(struct process *init,
 void capability_bootstrap(struct process *init, struct cap_token *devmem,
                           struct cap_token *irq, struct cap_token *iommu) {
   umem_lock();
-  grant *d = grant_new(init, nullptr, KCAP_GRANT_DEVMEM, true);
-  grant *q = grant_new(init, nullptr, KCAP_GRANT_IRQ_ROUTE, true);
-  grant *m = grant_new(init, nullptr, KCAP_GRANT_IOMMU_DEV, true);
+  (void)init;
+  grant *d = grant_new(nullptr, KCAP_GRANT_DEVMEM, true);
+  grant *q = grant_new(nullptr, KCAP_GRANT_IRQ_ROUTE, true);
+  grant *m = grant_new(nullptr, KCAP_GRANT_IOMMU_DEV, true);
   asserts(d && q && m, "capability: root grant allocation failed");
   token_write(d, devmem); token_write(q, irq); token_write(m, iommu);
   umem_unlock();
-}
-
-bool cap_reap_one_locked(struct process *p) {
-  grant *g = p->created_grants;
-  if (g == nullptr) return false;
-  (void)revoke_step(p, g, false);
-  return true;
 }
 
 struct irq_route *cap_irq_route(const grant *g) {
@@ -383,12 +357,11 @@ struct irq_route *cap_irq_route(const grant *g) {
 }
 uint32_t cap_iommu_requester(const grant *g) { return g->iommu.requester; }
 
-uint64_t cap_create_irq_route_locked(struct process *creator, grant *parent,
-                                     struct irq_route *route,
+uint64_t cap_create_irq_route_locked(grant *parent, struct irq_route *route,
                                      struct cap_token *out) {
   if (parent->type != KCAP_GRANT_IRQ_ROUTE || parent->dead ||
-      (!parent->wildcard && parent->irq.route != route)) return SYSERR_PERM;
-  grant *g = grant_new(creator, parent, KCAP_GRANT_IRQ_ROUTE, false);
+      !parent->wildcard) return SYSERR_PERM;
+  grant *g = grant_new(parent, KCAP_GRANT_IRQ_ROUTE, false);
   if (g == nullptr) return SYSERR_NOMEM;
   g->irq.route = route;
   g->irq.id = irq_route_id_locked(route);

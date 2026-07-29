@@ -48,10 +48,6 @@ void capability_selftest(struct process *init,
 // Ring scheme -2. Called under g_umem by the common channel executor.
 uint64_t cap_exec(struct thread *curr, struct ring *ring, struct ksqe *sqe);
 
-// One prospective-revocation/reclamation step for a dying creator. Called
-// under g_umem; true means one bounded step was performed.
-bool cap_reap_one_locked(struct process *p);
-
 // Verify a token held inside a kernel ring block. Caller holds g_umem.
 uint64_t cap_verify_ring_locked(struct ring *ring, uint64_t off, uint64_t len,
                                 uint8_t type, grant **out);
@@ -61,8 +57,7 @@ uint32_t cap_iommu_requester(const grant *g);
 
 // KIRQ_MSI materializes a concrete route grant beneath a verified parent.
 // Caller holds g_umem.
-uint64_t cap_create_irq_route_locked(struct process *creator, grant *parent,
-                                     struct irq_route *route,
+uint64_t cap_create_irq_route_locked(grant *parent, struct irq_route *route,
                                      struct cap_token *out);
 
 // Token-gated SYS_VM_MAP_DEVICE backend.

@@ -18,7 +18,7 @@
 // There is no session object and no IPC registry: kernel-side state is
 // a notified bit per share edge and one ring endpoint per kernel
 // channel — the ring/edge state under g_umem (hierarchy in umem.h), CQ
-// publication under the block's stripe, endpoints torn down by the umem
+// publication under the ring-local lock, endpoints torn down by the umem
 // revoke path (channel_ring_destroy).
 
 // The kernel ring ABI — kring_hdr/ksqe/kcqe layout in gdos/kring.h, one
@@ -34,13 +34,14 @@
 
 // Kernel-channel endpoint. Lives on the ublock (b->ring); owner-only.
 // CQ publication (cq_count, CQ slots, the full-check) happens under
-// stripe(block->base). sq_head is g_umem-only: drains are its sole touchers.
-// Holding the stripe does not by itself license posting for shares/tree:
+// cq_lock. sq_head is g_umem-only: drains are its sole touchers.
+// Holding cq_lock does not by itself license posting for shares/tree:
 // their posts must stay atomic with level-state flips
 // (notified/death_notified) that live under g_umem.
 struct scheme_ops;
 
 struct ring {
+  struct svclock cq_lock;
   const struct scheme_ops *ops;
   struct ublock *block;
   uint32_t nslots;
@@ -79,7 +80,7 @@ uint64_t channel_ring_drain(struct thread *curr, uint64_t address);
 // A share edge b -> target was just created: post KEV_SHARE to the
 // target's shares channel if it has one with a free slot (sets the
 // edge's notified bit), else leave it clear for replay. Caller must NOT
-// hold a stripe (the post takes the ring block's stripe).
+// hold cq_lock (the post takes it).
 void channel_edge_notify(ublock *b, struct share_edge *e);
 
 // `child` just died: post KEV_CHILD_DEAD to the parent's tree channel if
@@ -90,18 +91,18 @@ void channel_child_dead_notify(struct process *parent, struct process *child);
 // The block is being revoked: destroy its kernel-channel endpoint, if
 // any (unhook the scheme anchor, run the scheme's destroy, free the
 // ring). Idempotent; a no-op for plain blocks. Caller holds g_umem and
-// not the stripe. Parked futex waiters are never notified — recovery is
+// not cq_lock. Parked futex waiters are never notified — recovery is
 // the waiter's deadline (futex-design.md §5).
 void channel_ring_destroy(ublock *b);
 
-// Voluntary VM_FREE must not destroy a stateful endpoint until its scheme
-// resources are gone. Reap performs the scheme cleanup first.
+// A scheme may veto VM_FREE until its resources are gone; schemes whose
+// block lifetime owns all state instead force-clean it in their destroy op.
 bool channel_block_destroyable(ublock *b);
 
-// Publish a thread's post-deschedule completion and wake one waiter on
-// the completion word. Caller holds g_umem; the TCB owns one thread_pins
-// reference on `block`. The reference is consumed here.
+// Consume a TCB's completion registration exactly once. Normal live
+// thread exit publishes the completion word; forced disposal during
+// process teardown only drops the pin.
 void channel_thread_complete_locked(struct process *p, ublock *block,
-                                    uint64_t event);
+                                    uint64_t event, bool publish);
 
 #endif // channel_h_INCLUDED

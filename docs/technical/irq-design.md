@@ -26,12 +26,12 @@ dispatch branch), `packages/gdoslib-dev/kring.c` (driver-side wrappers).
   `SYS_BLOCK_WAIT` like any other kernel channel. Redox's `irq:` scheme
   is the precedent for the shape;
   govindos already has the transport.
-- **The IRQ handler posts the CQE itself — borrowed context, stripe
+- **The IRQ handler posts the CQE itself — borrowed context, ring-CQ
   plane only.** There is no kernel thread and nothing to defer to, and
   none is needed: interrupts only ever arrive in IF=1 contexts (ring 3
   or the scheduler's idle window — `spinlock_lock` runs IRQs-off and
   IA32_FMASK masks IF for the whole syscall path), so the handler
-  holds no locks on entry and may take stripe/scheduler spinlocks. It
+  holds no locks on entry and may take ring-CQ/scheduler spinlocks. It
   must **never take `g_umem`** (a shootdown-servicing lock; a handler
   spinning on it IRQs-off can be the very shootdown target its holder
   is waiting on). The post is architecturally a data-plane producer —
@@ -227,14 +227,14 @@ only in IF=1 contexts — ring 3, or the scheduler loop's idle/dispatch
 windows — because `spinlock_lock` is cli-first and the syscall path
 runs entirely under IA32_FMASK's IF mask. So the handler enters
 holding nothing, and every spinlock holder machine-wide is IRQs-off
-and bounded: the handler may take stripes and the scheduler lock (the
+and bounded: the handler may take a ring CQ lock and the scheduler lock (the
 preempt path already does the latter). The one forbidden lock is
 `g_umem` — it is a shootdown-servicing svclock, and a handler spinning
 IRQs-off on it can be the shootdown target its holder waits on.
 
-The stripe plane suffices:
+The ring-local plane suffices:
 
-- `ring_post_locked` needs stripe(ring block) only.
+- `ring_post_locked` needs `ring->cq_lock` only.
 - If the ring's owner is parked, the post wakes the slot
   (`thread_unblock`: scheduler lock, legal here).
 
@@ -245,11 +245,10 @@ handler resolves vector → route, takes the route lock, reads
 `route->ring`, and holds the route lock across the whole post: that
 pin is what keeps the ring and its block alive without `g_umem`,
 exactly the way a slot observation pins a reg today. Lock order:
-**route lock < stripes** everywhere (handler: route → stripe(s);
-control plane: g_umem → route → stripes). Wake-state (`raised`,
-`posted`) lives under the route lock — the route is its stripe-analog;
-the CQ bytes themselves are published under the ring's stripe as for
-every scheme.
+**route lock < ring CQ lock** everywhere (handler: route → CQ;
+control plane: g_umem → route → CQ). Wake-state (`raised`, `posted`)
+lives under the route lock; the CQ bytes themselves are published under
+the ring-local lock for every scheme.
 
 **Teardown.** The ring keeps its claim list (g_umem-only state, like
 `regs`). `channel_block_torn` gains a `-4` arm: for each claim, take
@@ -284,7 +283,7 @@ irq_deliver(vector):
   if route->mode == LEVEL: ioapic_mask(route)
   route->raised++
   if !route->posted:
-    stripe-post KEV_IRQ{cookie, raised}; ranked group delivery
+    ring-post KEV_IRQ{cookie, raised}
     route->posted = true on success   // CQ full: leave for replay
   unlock(route)
   x86_lapic_eoi()
