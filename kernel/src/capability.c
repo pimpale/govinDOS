@@ -7,7 +7,7 @@
 #include "debug.h"
 #include "irq_scheme.h"
 #include "paging.h"
-#include "sha256.h"
+#include "random.h"
 #include "stdlib/stdio.h"
 #include "stdlib/stdlib.h"
 #include "stdlib/string.h"
@@ -16,6 +16,7 @@
 #include "umem.h"
 
 #include <gdosabi/syscall.h>
+#include <siphash/siphash.h>
 
 struct grant {
   uint64_t id;
@@ -48,35 +49,20 @@ struct grant {
 
 static llrb_grant_id *g_grants;
 static uint64_t g_next_grant_id = 1;
-static uint8_t g_boot_key[32];
+static uint8_t g_boot_key[16];
 static const uint8_t g_mac_domain[] = "govindos-cap-v1";
 
-static bool random64(uint64_t *out) {
-  uint32_t a, b, c, d;
-  __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
-                   : "a"(1), "c"(0));
-  if (!(c & (1u << 30))) return false;
-  for (uint32_t i = 0; i < 16; i++) {
-    unsigned char ok;
-    __asm__ volatile("rdrand %0; setc %1" : "=r"(*out), "=qm"(ok));
-    if (ok) return true;
-  }
-  return false;
-}
-
-static void token_mac(const struct cap_token *token, uint8_t out[32]) {
+static void token_mac(const struct cap_token *token, uint8_t out[16]) {
   uint8_t input[sizeof(g_mac_domain) - 1 + 16];
   memcpy(input, g_mac_domain, sizeof(g_mac_domain) - 1);
   memcpy(input + sizeof(g_mac_domain) - 1, token, 16);
-  hmac_sha256(g_boot_key, sizeof(g_boot_key), input, sizeof(input), out);
+  siphash128(input, sizeof(input), g_boot_key, out);
 }
 
 static void token_write(const grant *g, struct cap_token *out) {
   *out = (struct cap_token){.version = CAP_TOKEN_VERSION,
                              .grant_id_le = g->id};
-  uint8_t mac[32];
-  token_mac(out, mac);
-  memcpy(out->mac, mac, sizeof(out->mac));
+  token_mac(out, out->mac);
 }
 
 static bool constant_equal(const uint8_t *a, const uint8_t *b, size_t len) {
@@ -91,7 +77,7 @@ static uint64_t token_resolve(const struct cap_token *token, bool need_live,
     return SYSERR_INVAL;
   for (size_t i = 0; i < sizeof(token->reserved); i++)
     if (token->reserved[i] != 0) return SYSERR_INVAL;
-  uint8_t mac[32];
+  uint8_t mac[16];
   token_mac(token, mac);
   if (!constant_equal(token->mac, mac, sizeof(token->mac)))
     return SYSERR_PERM;
@@ -278,64 +264,12 @@ uint64_t cap_exec(struct thread *curr, struct ring *ring, struct ksqe *sqe) {
 }
 
 void capability_init(void) {
-  static const uint8_t abc_digest[32] = {
-      0xba,0x78,0x16,0xbf,0x8f,0x01,0xcf,0xea,0x41,0x41,0x40,0xde,0x5d,0xae,
-      0x22,0x23,0xb0,0x03,0x61,0xa3,0x96,0x17,0x7a,0x9c,0xb4,0x10,0xff,0x61,
-      0xf2,0x00,0x15,0xad};
-  struct sha256_ctx sha;
-  uint8_t digest[32];
-  sha256_init(&sha); sha256_update(&sha, "abc", 3); sha256_final(&sha, digest);
-  asserts(constant_equal(digest, abc_digest, sizeof(digest)),
-          "capability: SHA-256 selftest failed");
   asserts(llrb_grant_id_new(&g_grants), "capability: index alloc failed");
   for (uint32_t i = 0; i < sizeof(g_boot_key) / 8; i++) {
     uint64_t random;
     asserts(random64(&random), "capability: CPU random source unavailable");
     memcpy(g_boot_key + 8 * i, &random, sizeof(random));
   }
-}
-
-void capability_selftest(struct process *init,
-                         const struct cap_token *devmem_root) {
-  umem_lock();
-  grant *root;
-  asserts(token_resolve(devmem_root, true, KCAP_GRANT_DEVMEM, &root) == 0,
-          "capability selftest: root token rejected");
-  struct cap_token bad = *devmem_root;
-  bad.mac[0] ^= 1;
-  grant *ignored;
-  asserts(token_resolve(&bad, true, KCAP_GRANT_DEVMEM, &ignored) == SYSERR_PERM,
-          "capability selftest: forged token accepted");
-
-  struct kcap_subgrant_req req = {.p0 = 0, .p1 = PAGE_SIZE,
-      .p2 = VM_DEVICE_READ,
-      .present = KCAP_PARAM_P0 | KCAP_PARAM_P1 | KCAP_PARAM_P2};
-  struct cap_token token;
-  asserts(subgrant(&req, root, &token) == 0,
-          "capability selftest: zero-base subgrant failed");
-  struct cap_token anchor_token = token;
-  grant *anchor;
-  asserts(token_resolve(&token, true, KCAP_GRANT_DEVMEM, &anchor) == 0,
-          "capability selftest: child token rejected");
-  grant *parent = anchor;
-  req = (struct kcap_subgrant_req){0};
-  for (uint32_t depth = 2; depth <= KCAP_MAX_DEPTH; depth++) {
-    asserts(subgrant(&req, parent, &token) == 0,
-            "capability selftest: bounded chain creation failed");
-    asserts(token_resolve(&token, true, KCAP_GRANT_DEVMEM, &parent) == 0,
-            "capability selftest: chain token rejected");
-  }
-  asserts(subgrant(&req, parent, &token) == SYSERR_NOMEM,
-          "capability selftest: depth-65 grant accepted");
-  uint64_t rc = revoke_step(anchor);
-  asserts(rc == SYSERR_AGAIN &&
-              token_resolve(&anchor_token, true, KCAP_GRANT_DEVMEM, &ignored) ==
-                  SYSERR_DEAD,
-          "capability selftest: revoke was not immediately effective");
-  do { rc = revoke_step(anchor); } while (rc == SYSERR_AGAIN);
-  asserts(rc == 0, "capability selftest: retry cleanup failed");
-  umem_unlock();
-  printf("capability: token/depth/revoke selftest ok\n");
 }
 
 void capability_bootstrap(struct process *init, struct cap_token *devmem,

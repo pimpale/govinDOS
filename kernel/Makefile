@@ -19,6 +19,7 @@ CFLAGS := \
 	-Iarchsrc/x86_64 \
 	-Ivendor \
 	-Isrc/stdlib \
+	-Iselftest \
 	-I../abi
 
 LDFLAGS := \
@@ -28,8 +29,10 @@ LDFLAGS := \
 	-entry:efi_main
 
 # All kernel C sources, discovered automatically. New .c files are
-# picked up on the next make with no Makefile edit.
-CSRCS   := $(shell find src archsrc vendor -name '*.c')
+# picked up on the next make with no Makefile edit. selftest/boot holds
+# the boot-time in-kernel selftests; the rest of selftest/ is hosted
+# suites that must never enter the image.
+CSRCS   := $(shell find src archsrc vendor selftest/boot -name '*.c')
 
 # COFF assembly. Non-recursive on purpose: archsrc/x86_64/blobs/ holds
 # flat-binary sources that must NOT be assembled as win64 objects.

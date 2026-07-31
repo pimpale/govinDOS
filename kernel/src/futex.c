@@ -5,14 +5,17 @@
 
 #include "channel.h"
 #include "debug.h"
-#include "hash.h"
 #include "process.h"
+#include "random.h"
 #include "spinlock.h"
+#include "stdlib/string.h"
 #include "syscall.h"
 #include "thread.h"
 #include "timer.h"
 #include "uaccess.h"
 #include "umem.h"
+
+#include <siphash/siphash.h>
 
 // The bucket table (futex-design.md §3). Plain spinlocks, not svclocks:
 // no futex path is ever held across as_flush, and the wake paths run in
@@ -37,16 +40,27 @@ struct futex_bucket {
 
 static struct futex_bucket g_futex[FUTEX_NBUCKETS];
 
+// Boot-random SipHash key: userspace picks the addresses being hashed, so
+// an unkeyed hash would let it flood a chosen bucket.
+static uint8_t g_futex_key[16];
+
 // Global monotonic park sequence: the FIFO tiebreaker within an address.
 static _Atomic uint64_t g_futex_seq = 1;
 
 static struct futex_bucket *bucket_of(uint64_t addr) {
   // Hash the word index; low bits alone would put every word of one
   // block in one bucket.
-  return &g_futex[hash_fib(addr / 4, FUTEX_NBUCKETS_LOG2)];
+  uint64_t word = addr / 4;
+  return &g_futex[siphash(&word, sizeof(word), g_futex_key) >>
+                  (64 - FUTEX_NBUCKETS_LOG2)];
 }
 
 void futex_init(void) {
+  for (uint32_t i = 0; i < sizeof(g_futex_key) / 8; i++) {
+    uint64_t random;
+    asserts(random64(&random), "futex: CPU random source unavailable");
+    memcpy(g_futex_key + 8 * i, &random, sizeof(random));
+  }
   for (uint32_t i = 0; i < FUTEX_NBUCKETS; i++) {
     spinlock_init(&g_futex[i].lock);
     asserts(llrb_futex_new(&g_futex[i].waiters),

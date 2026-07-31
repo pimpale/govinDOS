@@ -79,7 +79,7 @@ designed but deferred (§9).
   at one choke point. No caveat chains, no in-token predicates, no
   chain-walk verification: a token is a fixed 32-byte record and the
   kernel's attacker-facing parser is a bounds check plus one
-  constant-time HMAC. Chosen for v1 simplicity; offline attenuation is
+  constant-time MAC. Chosen for v1 simplicity; offline attenuation is
   deferred, not rejected (§9), and the wire format reserves room for it.
 - **Every narrowing is its own anchor.** Re-issuance makes revocation
   granularity perfect — each delegated narrowing is individually
@@ -196,8 +196,7 @@ Grant types v1 mirror the hardware authority gaps:
 token = { version u8, nres u8 (must be 0; reserved for future caveat
           count, §9), reserved[6] (must be zero), grant_id_le u64 }
         ‖ mac[16]                                  // 32 bytes, fixed
-mac   = first_16_bytes(HMAC-SHA-256(k_boot,
-                                    "govindos-cap-v1" ‖ hdr))
+mac   = SipHash-2-4-128(k_boot, "govindos-cap-v1" ‖ hdr)
 ```
 
 A token is a bearer reference to one grant — nothing more. The kernel
@@ -205,7 +204,7 @@ writes them (bootinfo, `KCAP_SUBGRANT`, `KIRQ_MSI`); userspace only
 copies them. Verification: fixed-size bounds check, recompute the MAC
 under the per-boot key `k_boot`, constant-time compare, check the grant
 and all its ancestors live. The ancestor walk is bounded by the depth-64
-limit. One HMAC, no
+limit. One MAC, no
 parsing loop — this is the entire attacker-facing surface.
 
 Effective authority is the grant's params, full stop. To hand someone
@@ -464,7 +463,7 @@ semantics; servers that need more bind to peers or expire aggressively.
   trusted issuers can leak anchors and exhaust grant memory.
 - **Offline attenuation (macaroon caveat chains).** Designed during this
   document's second revision, deferred in favor of re-issuance-only:
-  tokens grow HMAC-chained caveat records (`mac_i = MAC(mac_{i-1},
+  tokens grow MAC-chained caveat records (`mac_i = MAC(mac_{i-1},
   caveat_i)` — the parent MAC keys the child link, so holders attenuate
   offline and can never widen), evaluated conjunctively against the
   anchor's params from a closed vocabulary (range/flags/gsi/rid/pid).
@@ -491,8 +490,8 @@ semantics; servers that need more bind to peers or expire aggressively.
 
 1. Intrusive grant tree under `g_umem`
    (create/link/dead-mark/ancestor-liveness, id→grant llrb); token
-   write/verify (fixed record, one HMAC) + `k_boot`;
-   selftests including the SHA-256 vector, forged tokens, zero-base
+   write/verify (fixed record, one MAC) + `k_boot`;
+   selftests including the SipHash vector, forged tokens, zero-base
    narrowing, the depth boundary, and prospective retry revocation.
 2. Root grants + bootinfo token section.
 3. Scheme -2: SUBGRANT (⊆ enforcement and depth bound) / QUERY /

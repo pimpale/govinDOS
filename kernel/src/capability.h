@@ -42,8 +42,6 @@ void capability_init(void);
 void capability_bootstrap(struct process *init, struct cap_token *devmem,
                           struct cap_token *irq,
                           struct cap_token *iommu);
-void capability_selftest(struct process *init,
-                         const struct cap_token *devmem_root);
 
 // Ring scheme -2. Called under g_umem by the common channel executor.
 uint64_t cap_exec(struct thread *curr, struct ring *ring, struct ksqe *sqe);
